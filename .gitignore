@@ -1,0 +1,40 @@
+# 日志文件
+logs/
+*.log
+
+# 环境变量隔离
+.env
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# Python 缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 临时执行沙盒脚本 (绝对禁止被 Git 追踪，防止污染仓库记录)
+_run_*.py
+workspace/_run_*.py
+
+# Agent 自动生成的产出项目 (防无限 Git 套娃)
+output_project/
+projects/
+
+# 上下文文件上传隔离沙盒
+uploads/
+
+# Node.js 与前端构建产物
+frontend/node_modules/
+frontend/dist/
+frontend/.eslintcache
+
+# 操作系统自动生成文件
+.DS_Store
+Thumbs.db
+
+# 个人开发与临时文件
+规划.txt
+logs.txt

@@ -1,0 +1,63 @@
+"""
+游戏配置文件
+定义游戏常量，如窗口尺寸、颜色、帧率、网格大小等
+"""
+
+# 窗口设置
+WINDOW_WIDTH = 800
+WINDOW_HEIGHT = 600
+WINDOW_TITLE = "贪吃蛇游戏"
+
+# 游戏帧率
+FPS = 60
+
+# 网格设置
+GRID_SIZE = 20  # 每个网格单元的像素大小
+GRID_WIDTH = WINDOW_WIDTH // GRID_SIZE  # 网格宽度（单位：格子）
+GRID_HEIGHT = WINDOW_HEIGHT // GRID_SIZE  # 网格高度（单位：格子）
+
+# 颜色定义 (RGB值)
+BLACK = (0, 0, 0)
+WHITE = (255, 255, 255)
+RED = (255, 0, 0)
+GREEN = (0, 255, 0)
+BLUE = (0, 0, 255)
+YELLOW = (255, 255, 0)
+PURPLE = (128, 0, 128)
+CYAN = (0, 255, 255)
+ORANGE = (255, 165, 0)
+GRAY = (128, 128, 128)
+
+# 蛇相关设置
+SNAKE_COLOR = GREEN
+SNAKE_HEAD_COLOR = YELLOW
+INITIAL_SNAKE_LENGTH = 3
+SNAKE_SPEED = 10  # 蛇移动速度（格子/秒）
+
+# 食物相关设置
+FOOD_COLOR = RED
+FOOD_SIZE = GRID_SIZE
+
+# 游戏状态相关
+GAME_OVER_COLOR = RED
+TEXT_COLOR = WHITE
+SCORE_COLOR = CYAN
+
+# 方向定义
+UP = 'UP'
+DOWN = 'DOWN'
+LEFT = 'LEFT'
+RIGHT = 'RIGHT'
+
+# 游戏难度级别
+EASY_SPEED = 5
+MEDIUM_SPEED = 10
+HARD_SPEED = 15
+
+# 字体设置
+DEFAULT_FONT_SIZE = 24
+SCORE_FONT_SIZE = 32
+GAME_OVER_FONT_SIZE = 48
+
+# 边界碰撞检测缓冲区
+BOUNDARY_BUFFER = 1

@@ -1,0 +1,12 @@
+# === Core ===
+python-dotenv
+openai
+
+# === Web Server (server.py) ===
+fastapi
+uvicorn[standard]
+pydantic
+websockets
+watchdog
+python-multipart
+pandas
