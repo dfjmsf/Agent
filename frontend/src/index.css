@@ -88,6 +88,59 @@ body {
   flex-shrink: 0;
 }
 
+.project-selector-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: rgba(0, 0, 0, 0.4);
+  padding: 6px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--border-color);
+  margin-left: 30px;
+}
+
+.project-label {
+  font-family: 'Inter', sans-serif;
+  font-size: 13px;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.project-select {
+  background: rgba(15, 16, 20, 0.8);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #fff;
+  font-family: 'Fira Code', monospace;
+  font-size: 13px;
+  padding: 6px 12px;
+  border-radius: 6px;
+  outline: none;
+  cursor: pointer;
+}
+
+.project-select:focus {
+  border-color: var(--color-manager);
+}
+
+.btn-new-project {
+  background: rgba(177, 74, 237, 0.15);
+  border: 1px solid var(--color-manager);
+  color: var(--color-manager);
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-family: 'Inter', sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-new-project:hover {
+  background: var(--color-manager);
+  color: #fff;
+  box-shadow: 0 0 10px rgba(177, 74, 237, 0.4);
+}
+
 .main-content-row {
   display: flex;
   flex-direction: row;

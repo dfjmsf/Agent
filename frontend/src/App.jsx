@@ -23,6 +23,10 @@ function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [tasks, setTasks] = useState([]);
   const [activeTask, setActiveTask] = useState("");
+  
+  // Project Management States
+  const [projectsList, setProjectsList] = useState([]);
+  const [currentProjectId, setCurrentProjectId] = useState("default_project");
 
   // States targeted at specific panes
   const [coderCode, setCoderCode] = useState("// 正在聆听架构师指令...\n");
@@ -48,22 +52,72 @@ function App() {
 
   useEffect(() => {
     connectWebSocket();
-    fetchProjectFiles(); // Fetch immediately on load
+    fetchProjectsList(); // Fetch list first
 
     return () => {
       if (ws.current) ws.current.close();
     };
   }, []);
 
-  const fetchProjectFiles = async () => {
+  // Sync when project changes
+  useEffect(() => {
+    if (currentProjectId !== "default_project" || projectsList.length > 0) {
+      fetchProjectFiles(currentProjectId);
+      setTasks([]);
+      setCoderCode("// 正在聆听架构师指令...\n");
+      setReviewerLogs([]);
+      setActiveTask("");
+      setArtifactCode("// 点击左侧目录树中的文件查看内容...");
+    }
+  }, [currentProjectId]);
+
+  const fetchProjectsList = async () => {
     try {
-      const res = await fetch("http://127.0.0.1:8000/api/project/files");
+      const res = await fetch("http://127.0.0.1:8000/api/projects");
+      if (res.ok) {
+        const data = await res.json();
+        setProjectsList(data);
+        if (data.length > 0 && currentProjectId === "default_project") {
+          setCurrentProjectId(data[0]);
+        }
+      }
+    } catch (e) {
+      console.error("Failed to fetch projects list", e);
+    }
+  };
+
+  const fetchProjectFiles = async (projectId = currentProjectId) => {
+    try {
+      const res = await fetch(`http://127.0.0.1:8000/api/project/files?project_id=${projectId}`);
       if (res.ok) {
         const data = await res.json();
         setProjectFiles(data);
       }
     } catch (e) {
       console.error("Failed to fetch project files", e);
+    }
+  };
+
+  const handleNewProject = async () => {
+    const pName = "新建项目";
+    
+    try {
+      const res = await fetch("http://127.0.0.1:8000/api/project/new", {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_name: pName })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const newId = data.project_id;
+        setProjectsList(prev => [newId, ...prev]);
+        setCurrentProjectId(newId);
+        appendLog("System", "success", `成功开辟新宇宙: ${newId}`);
+      } else {
+        appendLog("System", "error", "新建宇宙失败：服务器响应错误");
+      }
+    } catch (e) {
+      appendLog("System", "error", `新建宇宙网络异常: ${e.message}`);
     }
   };
 
@@ -94,7 +148,7 @@ function App() {
       const res = await fetch("http://127.0.0.1:8000/api/project/run", {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ code: artifactCode, stdin_data: stdinInput || null })
+        body: JSON.stringify({ code: artifactCode, project_id: currentProjectId, stdin_data: stdinInput || null })
       });
 
       if (res.ok) {
@@ -209,19 +263,23 @@ function App() {
       appendLog("Reviewer", "success", "✓ 审核通过！合并入主分支。");
       setActiveRole("Manager"); // Return control
     }
-    else if (action_type === 'review_fail') {
-      appendLog("Reviewer", "error", `✗ 打回原稿！原因: ${payload.feedback}`);
-      setActiveRole("Coder"); // Give control back
+    else if (action_type === 'project_renamed') {
+      const { old_id, new_id } = payload;
+      setProjectsList(prev => prev.map(p => (p === old_id ? new_id : p)));
+      if (currentProjectId === old_id) {
+        setCurrentProjectId(new_id);
+      }
+      appendLog("System", "success", content);
     }
     else if (action_type === 'file_tree_update') {
-      fetchProjectFiles();
+      fetchProjectFiles(currentProjectId);
     }
     else if (action_type === 'success' || action_type === 'error') {
       setIsGenerating(false);
       appendLog("System", action_type === 'success' ? "success" : "error", content);
       setActiveRole(null);
       if (action_type === 'success') {
-        fetchProjectFiles(); // Promptly fetch after success
+        fetchProjectFiles(currentProjectId); // Promptly fetch after success
       }
     }
     else {
@@ -257,7 +315,7 @@ function App() {
         headers: {
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ prompt: finalPrompt })
+        body: JSON.stringify({ prompt: finalPrompt, project_id: currentProjectId })
       });
       if (!res.ok) {
         throw new Error("API Connection Failed");
@@ -312,6 +370,19 @@ function App() {
         animate={{ y: 0, opacity: 1 }}
       >
         <div className="title">PROJECT.A.G.E.N.T</div>
+        <div className="project-selector-wrapper">
+          <span className="project-label">当前宇宙:</span>
+          <select 
+            value={currentProjectId} 
+            onChange={(e) => setCurrentProjectId(e.target.value)}
+            className="project-select"
+          >
+            {projectsList.map(p => <option key={p} value={p}>{p}</option>)}
+            {projectsList.length === 0 && currentProjectId === 'default_project' && <option value="default_project">default_project</option>}
+            {projectsList.length === 0 && currentProjectId !== 'default_project' && <option value={currentProjectId}>{currentProjectId}</option>}
+          </select>
+          <button className="btn-new-project" onClick={handleNewProject}>+ 新建宇宙</button>
+        </div>
       </motion.div>
 
       <div className="main-content-row">

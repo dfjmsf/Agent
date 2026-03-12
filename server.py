@@ -12,12 +12,14 @@ from pydantic import BaseModel
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import time
+import re
+from datetime import datetime
 
 # 确保能找到 core 和 agents 模块
 sys.path.append(str(os.path.dirname(os.path.abspath(__file__))))
 
 from agents.manager import ManagerAgent
-from core.state_manager import global_state
+from core.state_manager import global_state_manager
 from core.ws_broadcaster import global_broadcaster
 
 # 设置基础的控制台日志输出格式
@@ -81,9 +83,13 @@ async def shutdown_event():
     observer.stop()
     observer.join()
 
-class ProjectRequest(BaseModel):
+class NewProjectReq(BaseModel):
+    project_name: str
+
+class GenerateReq(BaseModel):
     prompt: str
     out_dir: Optional[str] = None
+    project_id: str = "default_project"
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -95,14 +101,13 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         global_broadcaster.disconnect(websocket)
 
-def run_project_thread(prompt: str, out_dir: str):
+def run_project_thread(prompt: str, out_dir: str, project_id: str):
     """
     由于我们的 Agent 系统是同步阻塞写的，将其放入隔离的线程中运行。
-    但是它内部依旧可以调用 global_broadcaster.emit_sync 推给 asyncio 队列。
     """
-    logger.info("后台协程：开始启动 Manager 同步阻塞流程...")
+    logger.info(f"后台协程：开始启动 Manager 同步阻塞流程 (Project: {project_id})...")
 
-    manager = ManagerAgent()
+    manager = ManagerAgent(project_id=project_id)
     try:
         success, final_dir = manager.run_project(prompt, out_dir or None)
         if not success:
@@ -110,12 +115,28 @@ def run_project_thread(prompt: str, out_dir: str):
     except Exception as e:
         global_broadcaster.emit_sync("System", "error", f"项目生成异常：{str(e)}")
 
+@app.post("/api/project/new")
+async def create_new_project(req: NewProjectReq):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = re.sub(r'[^\w\-\u4e00-\u9fa5]', '_', req.project_name)
+    if not safe_name.strip('_'):
+        safe_name = "新建项目"
+    folder_name = f"{timestamp}_{safe_name}"
+    
+    projects_dir = os.path.join(os.path.dirname(__file__), "projects")
+    os.makedirs(projects_dir, exist_ok=True)
+    
+    new_dir = os.path.join(projects_dir, folder_name)
+    os.makedirs(new_dir, exist_ok=True)
+    
+    return {"project_id": folder_name}
+
 @app.post("/api/generate")
-async def start_generation(req: ProjectRequest, bg_tasks: BackgroundTasks):
+async def start_generation(req: GenerateReq, bg_tasks: BackgroundTasks):
     """
     前端点击生成后的触发端点。通过后台任务启动庞大的大模型同步阻塞流水线。
     """
-    t = threading.Thread(target=run_project_thread, args=(req.prompt, req.out_dir))
+    t = threading.Thread(target=run_project_thread, args=(req.prompt, req.out_dir, req.project_id))
     t.start()
     return {"status": "started", "message": "Multi-Agent System Activated in Background Thread"}
 
@@ -180,21 +201,33 @@ async def upload_context_file(file: UploadFile = File(...)):
 
 # --- Mini-VSCode Artifact Explorer APIs ---
 
-@app.get("/api/project/files")
-async def get_project_files():
-    """
-    获取最近生成的一个项目的物理目录结构
-    """
+@app.get("/api/projects")
+async def get_all_projects_list():
+    """获取所有存在的项目列表"""
     base_projects_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects")
     if not os.path.exists(base_projects_dir):
-        return {"name": "projects", "type": "directory", "children": []}
+        return []
+    projects = [d for d in os.listdir(base_projects_dir) if os.path.isdir(os.path.join(base_projects_dir, d))]
+    # Sort by modification time descending
+    projects.sort(key=lambda x: os.path.getmtime(os.path.join(base_projects_dir, x)), reverse=True)
+    return projects
+
+@app.get("/api/project/files")
+async def get_project_files(project_id: str):
+    """
+    获取指定 project_id 项目的物理目录结构。
+    为了防止 VFS 内存和磁盘不同步，先强制 flush 脏数据。
+    """
+    # 无状态，需要读取文件树前，强制确保刚改完的 dirty 内存刷回磁盘
+    vfs = global_state_manager.get_vfs(project_id)
+    base_projects_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects")
+    project_dir = os.path.join(base_projects_dir, project_id)
     
-    # 找到最新生成的项目目录
-    projects = [os.path.join(base_projects_dir, d) for d in os.listdir(base_projects_dir) if os.path.isdir(os.path.join(base_projects_dir, d))]
-    if not projects:
-        return {"name": "projects", "type": "directory", "children": []}
+    if vfs.is_dirty:
+        vfs.commit_to_disk(project_dir)
     
-    latest_project = max(projects, key=os.path.getmtime)
+    if not os.path.exists(project_dir):
+        return {"name": project_id, "type": "directory", "children": []}
     
     def build_tree(dir_path):
         tree = {"name": os.path.basename(dir_path), "path": dir_path, "type": "directory", "children": []}
@@ -209,7 +242,7 @@ async def get_project_files():
             logger.error(f"Error reading directory {dir_path}: {e}")
         return tree
 
-    return build_tree(latest_project)
+    return build_tree(project_dir)
 
 @app.get("/api/project/file")
 async def get_project_file(path: str):
@@ -239,16 +272,16 @@ async def get_project_file(path: str):
 class RunRequest(BaseModel):
     code: str
     stdin_data: Optional[str] = None
+    project_id: str = "default_project"
 
 @app.post("/api/project/run")
 async def run_project_code(req: RunRequest):
     """
-    使用 Reviewer 沙盒安全执行前端传来的代码
+    使用 Reviewer 阅后即焚沙盒安全执行前端传来的代码，强制绑定 project_id
     """
     try:
-        from tools.sandbox import PythonSandbox
-        sandbox = PythonSandbox()
-        result = sandbox.execute_code(req.code, stdin_data=req.stdin_data)
+        from tools.sandbox import sandbox_env
+        result = sandbox_env.execute_code(req.code, req.project_id, stdin_data=req.stdin_data)
         
         # sandbox.execute_code returns a dict
         return {

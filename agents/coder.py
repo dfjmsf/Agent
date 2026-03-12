@@ -4,7 +4,7 @@ import logging
 from typing import Optional, Dict, Any, List
 from core.llm_client import default_llm
 from core.prompt import Prompts
-from core.state_manager import global_state
+from core.state_manager import global_state_manager
 from core.ws_broadcaster import global_broadcaster
 
 logger = logging.getLogger("CoderAgent")
@@ -14,8 +14,9 @@ class CoderAgent:
     编码 Agent (Coder)
     专职：接收一个确定的任务目标和当前虚拟文件系统的上下文，只输出极简、纯净的代码文本。
     """
-    def __init__(self):
+    def __init__(self, project_id: str = "default_project"):
         self.model = os.getenv("MODEL_CODER", "qwen3-coder-plus")
+        self.project_id = project_id
 
     def _clean_markdown(self, raw_text: str) -> str:
         """
@@ -43,7 +44,8 @@ class CoderAgent:
             feedback: (可选) 如果是重试环节，Reviewer 传回来的报错和建议
         """
         # 1. 获取全局上下文内存目录
-        vfs_dict = global_state.get_all_vfs()
+        vfs = global_state_manager.get_vfs(self.project_id)
+        vfs_dict = vfs.get_all_vfs()
         
         # 将当前的虚拟树转换为可视化的提示词文本
         vfs_context = []
@@ -89,7 +91,7 @@ class CoderAgent:
         clean_code = self._clean_markdown(raw_code)
         
         # 将刚才生成的草稿保存进虚拟文件系统
-        global_state.save_draft(target_file, clean_code)
+        vfs.save_draft(target_file, clean_code)
         
         logger.info(f"✅ Coder 编撰完成 ({len(clean_code)} bytes)")
         global_broadcaster.emit_sync("Coder", "coding_done", f"{target_file} 编写完毕", {"code": clean_code})

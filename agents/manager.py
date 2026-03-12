@@ -5,10 +5,12 @@ import logging
 from typing import List, Dict, Any, Optional, Tuple
 from core.llm_client import default_llm
 from core.prompt import Prompts
-from core.state_manager import global_state
+from core.state_manager import global_state_manager
 from core.ws_broadcaster import global_broadcaster
 from agents.coder import CoderAgent
 from agents.reviewer import ReviewerAgent
+from core.db import append_to_history, get_recent_history
+from core.memory import recall, memorize
 
 logger = logging.getLogger("ManagerAgent")
 
@@ -19,11 +21,12 @@ class ManagerAgent:
     主控 Agent (Manager)
     专职：需求拆解、任务派发、循环调度、熔断控制。
     """
-    def __init__(self):
+    def __init__(self, project_id: str = "default_project"):
         self.model = os.getenv("MODEL_PLANNER", "qwen3-max")
         self.llm_client = default_llm
-        self.coder = CoderAgent()
-        self.reviewer = ReviewerAgent()
+        self.project_id = project_id
+        self.coder = CoderAgent(project_id)
+        self.reviewer = ReviewerAgent(project_id)
 
     def plan_tasks(self, user_requirement: str) -> dict:
         """
@@ -31,7 +34,30 @@ class ManagerAgent:
         """
         logger.info("🧠 Manager 正在思考架构并拆解任务...")
         
-        system_prompt = Prompts.MANAGER_SYSTEM
+        # 1. 查询结构化短期记忆 (Sliding Window History)
+        recent_history = get_recent_history(project_id=self.project_id, limit=5)
+        history_str = "\n".join([f"[{h.role}]: {h.content[:100]}..." for h in recent_history]) if recent_history else "无近期对话。"
+        
+        # 2. 查询长期经验记忆 (RAG)
+        past_experience = recall(user_requirement, n_results=3, project_id=self.project_id)
+        experience_str = "\n".join(past_experience) if past_experience else "无相关历史经验。"
+
+        # 3. 构造环境变量声明 (防止后续循环乱改项目名并提供结构化视野)
+        is_new_project = "新建项目" in self.project_id or self.project_id == "default_project"
+        if is_new_project:
+            env_context = "【项目环境】\n这是基于主人的首个请求刚刚创建的全新宇宙草稿。请为它起一个酷炫、精简的纯英文字符串作为 JSON 中的 `project_name` 字段。"
+        else:
+            vfs = global_state_manager.get_vfs(self.project_id)
+            existing_files = list(vfs.get_all_vfs().keys())
+            file_tree = "\n".join([f"- {f}" for f in existing_files]) if existing_files else "目录暂空。"
+            env_context = (
+                f"【项目环境】\n当前项目宇宙已永久命名并固化为: `{self.project_id}`\n"
+                f"你 MUST 且只能将 JSON 里的 `project_name` 固定为 `{self.project_id}`，绝对不允许修改项目名！！！\n"
+                f"【已有文件架构】:\n{file_tree}\n"
+                f"这是当前项目内存里的所有文件，你可以在此基础上规划对旧文件的修改（覆盖），或者指派增加全新的子模块文件。"
+            )
+
+        system_prompt = Prompts.MANAGER_SYSTEM + f"\n\n【近期对话上下文】\n{history_str}\n\n【RAG 检索到的过往血泪经验】\n{experience_str}\n\n{env_context}"
         user_prompt = f"主人的开发需求：\n{user_requirement}\n请严格按照 JSON Schema 输出。"
         
         try:
@@ -82,11 +108,12 @@ class ManagerAgent:
         logger.info(f"\n🚀 开始执行任务 [{task_id}]: {target_file}")
         global_broadcaster.emit_sync("Manager", "task_start", f"开始分发执行任务: {target_file}", {"task": task})
 
+        vfs = global_state_manager.get_vfs(self.project_id)
         feedback = None
-        global_state.reset_retry(task_id)
+        vfs.reset_retry(task_id)
         
         while True:
-            current_retry = global_state.get_retry_count(task_id)
+            current_retry = vfs.get_retry_count(task_id)
             
             # 1. 熔断机制判定
             if current_retry >= MAX_RETRIES:
@@ -105,7 +132,7 @@ class ManagerAgent:
                 global_broadcaster.emit_sync("Manager", "task_retry", f"子任务 {task_id} 正在进行第 {current_retry} 次重试", {"attempt": current_retry})
             
             self.coder.generate_code(target_file, description, feedback)
-            global_broadcaster.emit_sync("Manager", "vfs_update", f"VFS 文件树更新暂存目标: {target_file}", {"vfs": global_state.vfs})
+            global_broadcaster.emit_sync("Manager", "vfs_update", f"VFS 文件树更新暂存目标: {target_file}", {"vfs": vfs.get_all_vfs()})
             
             # 3. Reviewer 测试与审查沙盒执行
             is_pass, reviewer_feedback = self.reviewer.evaluate_draft(target_file, description)
@@ -115,7 +142,7 @@ class ManagerAgent:
                 return True
             else:
                 feedback = reviewer_feedback
-                global_state.increment_retry(task_id)
+                vfs.increment_retry(task_id)
                 logger.warning(f"🔨 任务 [{task_id}] 审查未通过，退回重写 (Current Retries: {current_retry + 1}/{MAX_RETRIES})")
         
         return False
@@ -151,16 +178,62 @@ class ManagerAgent:
         返回:
             (success: bool, final_dir: str) — 是否全部成功 + 最终落盘路径
         """
-        # 1. 清空上一轮残留状态
-        global_state.clear_state()
+        # 1. 记录入结构化记忆库
+        append_to_history(role="user", content=user_requirement, project_id=self.project_id)
+        
+        # 2. 清空上一轮残留状态
+        vfs = global_state_manager.get_vfs(self.project_id)
+        vfs.clear_state()
         global_broadcaster.emit_sync("System", "start_project", "系统重置并启动新项目生成...")
 
-        # 2. 任务拆解
+        # 3. 任务拆解
         plan = self.plan_tasks(user_requirement)
+        append_to_history(role="manager", content=json.dumps(plan, ensure_ascii=False), project_id=self.project_id)
 
-        # 3. 解析输出目录
+        # 4. 解析输出目录并执行动态重命名
         project_name = plan.get('project_name', 'Unnamed_Project').replace(" ", "_")
-        final_dir = self._resolve_output_dir(project_name, out_dir)
+        
+        if "新建项目" in self.project_id or "default_project" == self.project_id:
+            old_project_id = self.project_id
+            parts = old_project_id.split("_", 2)
+            timestamp = f"{parts[0]}_{parts[1]}" if len(parts) >= 2 else time.strftime("%Y%m%d_%H%M%S")
+            import re
+            safe_proj_name = re.sub(r'[^\w\-\u4e00-\u9fa5]', '_', project_name)
+            new_project_id = f"{timestamp}_{safe_proj_name}"
+            
+            base_projects_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "projects"))
+            old_dir = os.path.join(base_projects_dir, old_project_id)
+            new_dir = os.path.join(base_projects_dir, new_project_id)
+            
+            if os.path.exists(old_dir) and old_dir != new_dir:
+                try:
+                    os.rename(old_dir, new_dir)
+                    # 更新所有作用域的 project_id
+                    self.project_id = new_project_id
+                    self.coder.project_id = new_project_id
+                    self.reviewer.project_id = new_project_id
+                    global_state_manager.rename_vfs(old_project_id, new_project_id)
+                    
+                    from core.db import rename_project_history
+                    rename_project_history(old_project_id, new_project_id)
+                    
+                    global_broadcaster.emit_sync("System", "project_renamed", f"项目正式主题生成，宇宙已重命名为: {safe_proj_name}", {
+                        "old_id": old_project_id,
+                        "new_id": new_project_id
+                    })
+                except Exception as e:
+                    logger.error(f"动态重命名项目时出错: {e}")
+                    new_project_id = old_project_id
+            else:
+                new_project_id = old_project_id
+        else:
+            new_project_id = self.project_id
+
+        if out_dir:
+            final_dir = os.path.abspath(out_dir)
+        else:
+            final_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "projects", new_project_id))
+            
         os.makedirs(final_dir, exist_ok=True)
         logger.info(f"📌 项目代码最终将落盘至: {final_dir}")
 
@@ -182,10 +255,33 @@ class ManagerAgent:
                 global_broadcaster.emit_sync("System", "error", f"💥 核心任务 {task.get('task_id')} 连续熔断。项目腰斩！")
                 return False, final_dir
 
-        # 5. 全部通过，落盘
-        logger.info("\n🏆 所有任务均已通过 Reviewer 测试并打上 PASS 印章！")
-        global_state.commit_to_disk(final_dir)
+        # 6. 全部通过，执行反思闭环 (Reflect & Memorize)
+        logger.info("\n🏆 所有任务均已通过 Reviewer 测试！开始触发全局反思...")
+        self._reflect_and_memorize(user_requirement, plan)
+        
+        vfs.commit_to_disk(final_dir)
+        global_state_manager.remove_vfs(self.project_id) # 结束后释放内存
         logger.info(f"✨ 项目交付完成: {final_dir}")
         global_broadcaster.emit_sync("System", "success", f"✨ 项目完美生成于！{final_dir}", {"final_path": final_dir})
 
         return True, final_dir
+
+    def _reflect_and_memorize(self, user_req: str, plan: dict):
+        """成功后，调用 qwen3.5-flash 对整个过程进行反思，提炼精髓存入 ChromaDB"""
+        logger.info("🧠 正在萃取开发经验存入长期记忆...")
+        global_broadcaster.emit_sync("System", "info", "🧠 所有测试通过！大模型正在回溯思考，萃取核心技术经验并打入长时记忆库，请稍候...")
+        
+        msg = [
+            {"role": "system", "content": "你是一个资深架构师。请根据用户原始需求和最终的执行计划，提炼出1到2条极具价值的技术经验或项目规约。字数严格控制在 100 字以内，直接输出干货。"},
+            {"role": "user", "content": f"原始需求: {user_req}\n执行策略: {json.dumps(plan, ensure_ascii=False)}"}
+        ]
+        try:
+            resp = self.llm_client.chat_completion(msg, model="qwen3.5-flash")
+            distilled_knowledge = resp.content.strip()
+            memorize(
+                distilled_knowledge, 
+                metadata={"source": "post_project_reflection", "project_name": plan.get('project_name')},
+                project_id=self.project_id
+            )
+        except Exception as e:
+            logger.warning(f"经验复盘总结失败: {e}")

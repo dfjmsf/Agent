@@ -45,14 +45,13 @@ class LLMClient:
         TOTAL_PROMPT_TOKENS += prompt_tokens
         TOTAL_COMPLETION_TOKENS += completion_tokens
         
+        request_total = prompt_tokens + completion_tokens
         total_session_tokens = TOTAL_PROMPT_TOKENS + TOTAL_COMPLETION_TOKENS
         
-        if total_session_tokens > TOKEN_WARNING_LIMIT:
-            logger.error(f"🚨 [TOKEN 告警] 当前任务消耗的 Tokens ({total_session_tokens}) 已超过警告阈值 ({TOKEN_WARNING_LIMIT})！")
-            # 注：实际的内存上下文压缩逻辑将在 engine 引擎层处理
+        if request_total > TOKEN_WARNING_LIMIT:
+            logger.warning(f"🚨 [单次巨量 Token 告警] 本次请求竟然消耗了 {request_total} Tokens，极可能存在死循环大文件注入！")
             
-        logger.debug(f"单次消耗: +{prompt_tokens} (提问), +{completion_tokens} (回答)。"
-                     f"全局累计: {total_session_tokens} tokens。")
+        logger.info(f"🪙 [Token开销] 本次请求: {request_total} | 后端进程总累计: {total_session_tokens}")
 
     def chat_completion(
         self, 

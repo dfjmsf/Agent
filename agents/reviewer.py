@@ -4,8 +4,8 @@ import logging
 from typing import Dict, Any, Tuple
 from core.llm_client import default_llm
 from core.prompt import Prompts
-from core.state_manager import global_state
-from tools.sandbox import sandbox_env, WORKSPACE_DIR
+from core.state_manager import global_state_manager
+from tools.sandbox import sandbox_env
 from core.ws_broadcaster import global_broadcaster
 
 logger = logging.getLogger("ReviewerAgent")
@@ -15,8 +15,9 @@ class ReviewerAgent:
     审查与执行 Agent (Reviewer)
     专职：编写测试脚本 -> 调用沙盒 -> 拿到结果 -> 给出 PASS 或是具体报错信息。
     """
-    def __init__(self):
+    def __init__(self, project_id: str = "default_project"):
         self.model = os.getenv("MODEL_REVIEWER", "qwen3-max")
+        self.project_id = project_id
 
     def _execute_sandbox_tool(self, tool_call) -> str:
         """解析 LLM 传来的工具请求，并在物理沙盒中执行"""
@@ -28,9 +29,9 @@ class ReviewerAgent:
             global_broadcaster.emit_sync("Reviewer", "sandbox_start", "Reviewer 正在将其验证脚本压入沙盒容器...", {"test_code": test_code})
             # 【重要闭环】在运行测试前，必须确保当前 VFS 中的所有草稿文件
             # 已经被物理写入了 Sandbox 的目录下，否则测试脚本里的 import 会报错。
-            global_state.sync_to_sandbox(WORKSPACE_DIR)
+            # 这部分现在由 Ephemeral Sandbox 内部的 temporary_directory 处理了。
             
-            result = sandbox_env.execute_code(test_code)
+            result = sandbox_env.execute_code(test_code, self.project_id)
             
             # 格式化沙盒返回结果给大模型看
             global_broadcaster.emit_sync("Reviewer", "sandbox_end", f"沙盒测试完毕，退出码 {result.get('returncode', 'Unknown')}", {"result": result})
@@ -47,7 +48,8 @@ class ReviewerAgent:
             is_pass (bool): 是否审查通过
             feedback (str): 如果没通过，具体的修改建议和报错；如果通过，则为空或简短评语。
         """
-        code_draft = global_state.get_draft(target_file)
+        vfs = global_state_manager.get_vfs(self.project_id)
+        code_draft = vfs.get_draft(target_file)
         if not code_draft:
             return False, "VFS 中没有找到该文件的代码草稿"
 
