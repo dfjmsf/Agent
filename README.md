@@ -1,7 +1,7 @@
 <!-- markdownlint-disable MD033 MD041 -->
 <div align="center">
 
-# 🌌 ASTrea
+# 🌌 𝔸𝕊𝕋𝕣𝕖𝕒
 **The Autonomous Multi-Agent AI Software Engineer System**
 
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11+-blue.svg?logo=python)](https://www.python.org/)

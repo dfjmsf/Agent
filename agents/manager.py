@@ -11,6 +11,7 @@ from agents.coder import CoderAgent
 from agents.reviewer import ReviewerAgent
 from core.db import append_to_history, get_recent_history
 from core.memory import recall, memorize
+import threading
 
 logger = logging.getLogger("ManagerAgent")
 
@@ -267,21 +268,27 @@ class ManagerAgent:
         return True, final_dir
 
     def _reflect_and_memorize(self, user_req: str, plan: dict):
-        """成功后，调用 qwen3.5-flash 对整个过程进行反思，提炼精髓存入 ChromaDB"""
-        logger.info("🧠 正在萃取开发经验存入长期记忆...")
-        global_broadcaster.emit_sync("System", "info", "🧠 所有测试通过！大模型正在回溯思考，萃取核心技术经验并打入长时记忆库，请稍候...")
+        """成功后，调用 qwen3-max 对整个过程进行反思，提炼精髓存入 ChromaDB (后台异步执行)"""
         
-        msg = [
-            {"role": "system", "content": "你是一个资深架构师。请根据用户原始需求和最终的执行计划，提炼出1到2条极具价值的技术经验或项目规约。字数严格控制在 100 字以内，直接输出干货。"},
-            {"role": "user", "content": f"原始需求: {user_req}\n执行策略: {json.dumps(plan, ensure_ascii=False)}"}
-        ]
-        try:
-            resp = self.llm_client.chat_completion(msg, model="qwen3.5-flash")
-            distilled_knowledge = resp.content.strip()
-            memorize(
-                distilled_knowledge, 
-                metadata={"source": "post_project_reflection", "project_name": plan.get('project_name')},
-                project_id=self.project_id
-            )
-        except Exception as e:
-            logger.warning(f"经验复盘总结失败: {e}")
+        def _background_task():
+            logger.info("🧠 正在后台线程中萃取开发经验存入长期记忆...")
+            
+            msg = [
+                {"role": "system", "content": "你是一个资深架构师。请根据用户原始需求和最终的执行计划，提炼出1到2条极具价值的技术经验或项目规约。字数严格控制在 100 字以内，直接输出干货。"},
+                {"role": "user", "content": f"原始需求: {user_req}\n执行策略: {json.dumps(plan, ensure_ascii=False)}"}
+            ]
+            try:
+                resp = self.llm_client.chat_completion(msg, model="qwen3-max")
+                distilled_knowledge = resp.content.strip()
+                memorize(
+                    distilled_knowledge, 
+                    metadata={"source": "post_project_reflection", "project_name": plan.get('project_name')},
+                    project_id=self.project_id
+                )
+                logger.info("✨ [后台任务] 经验复盘与长时记忆写入完毕！")
+            except Exception as e:
+                logger.warning(f"✨ [后台任务] 经验复盘总结失败: {e}")
+                
+        # 抛入后台执行，不阻塞前台项目完成的 WebSocket
+        global_broadcaster.emit_sync("System", "info", "🧠 所有测试通过！大模型正在后台默默回溯思考，总结并打入长时记忆库...")
+        threading.Thread(target=_background_task, daemon=True).start()

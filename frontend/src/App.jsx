@@ -23,7 +23,7 @@ function App() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [tasks, setTasks] = useState([]);
   const [activeTask, setActiveTask] = useState("");
-  
+
   // Project Management States
   const [projectsList, setProjectsList] = useState([]);
   const [currentProjectId, setCurrentProjectId] = useState("default_project");
@@ -36,6 +36,12 @@ function App() {
 
   const ws = useRef(null);
   const logsEndRef = useRef(null);
+
+  // Create a ref to avoid stale closures in WebSocket callbacks
+  const currentProjectIdRef = useRef(currentProjectId);
+  useEffect(() => {
+    currentProjectIdRef.current = currentProjectId;
+  }, [currentProjectId]);
 
   // --- Artifact Explorer States ---
   const [projectFiles, setProjectFiles] = useState(null);
@@ -100,7 +106,7 @@ function App() {
 
   const handleNewProject = async () => {
     const pName = "新建项目";
-    
+
     try {
       const res = await fetch("http://127.0.0.1:8000/api/project/new", {
         method: 'POST',
@@ -266,20 +272,20 @@ function App() {
     else if (action_type === 'project_renamed') {
       const { old_id, new_id } = payload;
       setProjectsList(prev => prev.map(p => (p === old_id ? new_id : p)));
-      if (currentProjectId === old_id) {
+      if (currentProjectIdRef.current === old_id || currentProjectIdRef.current === 'default_project') {
         setCurrentProjectId(new_id);
       }
       appendLog("System", "success", content);
     }
     else if (action_type === 'file_tree_update') {
-      fetchProjectFiles(currentProjectId);
+      fetchProjectFiles(currentProjectIdRef.current);
     }
     else if (action_type === 'success' || action_type === 'error') {
       setIsGenerating(false);
       appendLog("System", action_type === 'success' ? "success" : "error", content);
       setActiveRole(null);
       if (action_type === 'success') {
-        fetchProjectFiles(currentProjectId); // Promptly fetch after success
+        fetchProjectFiles(currentProjectIdRef.current); // Promptly fetch after success
       }
     }
     else {
@@ -303,7 +309,7 @@ function App() {
 
     let finalPrompt = prompt;
     if (attachedFiles.length > 0) {
-      const contextStr = attachedFiles.map(f => 
+      const contextStr = attachedFiles.map(f =>
         `【挂载的安全上下文文件】\n文件绝对路径: ${f.path}\n数据结构预览 (局部): \n${f.preview}\n`
       ).join('\n---------------------\n');
       finalPrompt = `${contextStr}\n\n用户需求:\n${prompt}`;
@@ -344,10 +350,10 @@ function App() {
         if (res.ok) {
           const data = await res.json();
           if (data.error) {
-             appendLog("System", "error", `上传失败: ${data.error}`);
+            appendLog("System", "error", `上传失败: ${data.error}`);
           } else {
-             setAttachedFiles(prev => [...prev, data]);
-             appendLog("System", "success", `文件已挂载：获得 Schema 视图`);
+            setAttachedFiles(prev => [...prev, data]);
+            appendLog("System", "success", `文件已挂载：获得 Schema 视图`);
           }
         } else {
           appendLog("System", "error", `上传接口报错 HTTP ${res.status}`);
@@ -369,11 +375,11 @@ function App() {
         initial={{ y: -50, opacity: 0 }}
         animate={{ y: 0, opacity: 1 }}
       >
-        <div className="title">PROJECT.A.G.E.N.T</div>
+        <div className="title">ASTrea.A.G.E.N.T</div>
         <div className="project-selector-wrapper">
           <span className="project-label">当前宇宙:</span>
-          <select 
-            value={currentProjectId} 
+          <select
+            value={currentProjectId}
             onChange={(e) => setCurrentProjectId(e.target.value)}
             className="project-select"
           >
@@ -511,24 +517,24 @@ function App() {
               }}
               disabled={isGenerating}
             />
-            
+
             <div className="input-actions-row">
-              <input 
-                type="file" 
-                ref={fileInputRef} 
-                style={{display: "none"}} 
-                onChange={handleFileUpload} 
-                multiple 
+              <input
+                type="file"
+                ref={fileInputRef}
+                style={{ display: "none" }}
+                onChange={handleFileUpload}
+                multiple
               />
-              <button 
-                className="btn-attach" 
-                onClick={() => fileInputRef.current?.click()} 
+              <button
+                className="btn-attach"
+                onClick={() => fileInputRef.current?.click()}
                 disabled={isGenerating}
                 title="挂载数据 / 文本资料"
               >
                 <Paperclip size={18} />
               </button>
-              
+
               <button
                 className="btn-generate"
                 style={{ flex: 1 }}
