@@ -116,3 +116,132 @@ Coder 刚刚写完了一份代码草案。你必须审查它。
             }
         }
     ]
+
+    # ----------------------------------------------------
+    # 4. CODER FIX MODE - 差量编辑模式
+    # ----------------------------------------------------
+    CODER_FIX_SYSTEM = """你是一位极致严谨的后端开发工程师（Coder Agent），当前处于【修复模式】。
+你之前写的代码被 Reviewer 退回了。你需要精准定位 bug 并使用 `edit_file` 工具进行最小化修复。
+
+【强制规则】
+1. 必须使用 `edit_file` 工具来修改代码，不要输出完整文件！
+2. 每个 edit 包含 `search`（要替换的原始代码片段）和 `replace`（修复后的代码）。
+3. `search` 必须是文件中已存在的精确代码片段（包含空格和缩进），确保能精准匹配。
+4. 只修改需要修复的部分，不要改动正确的代码！
+5. 如果需要修改多处，在 edits 数组中列出多个 edit 对象。
+
+【当前文件内容】
+文件: {target_file}
+```
+{current_code}
+```
+
+【Reviewer 的报错与建议】
+{feedback}
+
+请使用 `edit_file` 工具进行精准修复。
+"""
+
+    CODER_EDIT_TOOL_SCHEMA = [
+        {
+            "type": "function",
+            "function": {
+                "name": "edit_file",
+                "description": "对当前目标文件进行精准的局部修改。使用 search/replace 模式定位并替换代码片段。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "edits": {
+                            "type": "array",
+                            "description": "一组精准的代码修改指令",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "search": {
+                                        "type": "string",
+                                        "description": "要被替换的原始代码片段。必须与文件中的内容完全一致（包括缩进和空白）。"
+                                    },
+                                    "replace": {
+                                        "type": "string",
+                                        "description": "替换后的新代码内容。"
+                                    }
+                                },
+                                "required": ["search", "replace"]
+                            }
+                        }
+                    },
+                    "required": ["edits"]
+                }
+            }
+        }
+    ]
+
+    # ----------------------------------------------------
+    # 5. EXPLORER TOOLS - 文件系统探索 (Phase 1 预留)
+    # ----------------------------------------------------
+    EXPLORER_TOOL_SCHEMA = [
+        {
+            "type": "function",
+            "function": {
+                "name": "list_directory",
+                "description": "列出指定目录下的所有文件和子目录。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "要列出内容的目录相对路径，默认为项目根目录 '.'"
+                        }
+                    },
+                    "required": []
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "读取指定文件的内容，可选指定行范围。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "要读取的文件相对路径"
+                        },
+                        "start_line": {
+                            "type": "integer",
+                            "description": "起始行号（1-indexed），不指定则从头开始"
+                        },
+                        "end_line": {
+                            "type": "integer",
+                            "description": "结束行号（1-indexed, inclusive），不指定则读到末尾"
+                        }
+                    },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_in_files",
+                "description": "在项目文件中搜索包含指定关键字的行。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "搜索关键字或正则表达式"
+                        },
+                        "file_pattern": {
+                            "type": "string",
+                            "description": "文件名过滤模式，如 '*.py'。不指定则搜索所有文件"
+                        }
+                    },
+                    "required": ["query"]
+                }
+            }
+        }
+    ]
+

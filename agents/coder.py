@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import logging
 from typing import Optional, Dict, Any, List
 from core.llm_client import default_llm
@@ -14,6 +15,9 @@ class CoderAgent:
     """
     编码 Agent (Coder)
     专职：接收一个确定的任务目标和当前虚拟文件系统的上下文，只输出极简、纯净的代码文本。
+    支持两种模式：
+      - 首次生成：直接输出完整代码
+      - 修复模式：使用 edit_file Function Calling 做差量编辑（匹配失败自动 fallback 全量覆写）
     """
     def __init__(self, project_id: str = "default_project"):
         self.model = os.getenv("MODEL_CODER", "qwen3-coder-plus")
@@ -25,46 +29,24 @@ class CoderAgent:
         大模型很容易忽略要求，加上 ```python 前后缀。
         如果包含，我们必须把它剥离出来，否则丢进沙盒直接报 SyntaxError。
         """
-        # 尝试匹配 ```python ... ``` 之间的内容
         pattern = re.compile(r"```(?:python|py)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
         match = pattern.search(raw_text)
         if match:
             return match.group(1).strip()
         
-        # 如果没有前缀，但是最后一行是 ```，也要剥离
         lines = [line for line in raw_text.split("\n") if not line.strip().startswith("```")]
         return "\n".join(lines).strip()
 
-    def generate_code(self, target_file: str, description: str, feedback: Optional[str] = None) -> str:
-        """
-        生成或修复代码
-        
-        参数:
-            target_file: 正在写的文件名
-            description: 具体的任务描述
-            feedback: (可选) 如果是重试环节，Reviewer 传回来的报错和建议
-        """
-        # 1. 获取全局上下文内存目录
-        vfs = global_state_manager.get_vfs(self.project_id)
-        vfs_dict = vfs.get_all_vfs()
-        
-        # 将当前的虚拟树转换为可视化的提示词文本
-        vfs_context = []
-        for file_path, content in vfs_dict.items():
-            if file_path != target_file:  # 不把老草稿喂进去，免得它产生依赖疑惑
-                # 为了节省 Token, 只展示前 30 行预览和定义，或者全量（对于小文件）
-                preview = content[:800] + "\n...[省略]" if len(content) > 800 else content
-                vfs_context.append(f"--- [现存文件: {file_path}] ---\n{preview}\n")
-                
-        vfs_str = "".join(vfs_context) if vfs_context else "当前项目是空的，你是写的第一个文件。"
-
-        # 1.5. 召回历史经验 (RAG 长期记忆)
-        past_tips = recall(f"{target_file} {description}", n_results=2, project_id=self.project_id, caller="Coder")
+    def _build_memory_hint(self, target_file: str, description: str) -> str:
+        """构建长短期记忆提示"""
         memory_hint = ""
+        
+        # RAG 长期记忆
+        past_tips = recall(f"{target_file} {description}", n_results=2, project_id=self.project_id, caller="Coder")
         if past_tips:
             memory_hint = "\n\n【历史踩坑经验 (RAG 长期记忆)】\n" + "\n".join([f"- {tip}" for tip in past_tips])
-
-        # 1.6. 读取短期记忆中的"反面教材"（最近的失败轮次）
+        
+        # 短期记忆 — 反面教材
         recent_fails = get_recent_events(
             project_id=self.project_id, limit=3,
             event_types=["round_fail"], caller="Coder"
@@ -72,44 +54,163 @@ class CoderAgent:
         if recent_fails:
             fail_hints = "\n".join([f"[失败案例 #{i+1}] {e.content[:300]}" for i, e in enumerate(recent_fails)])
             memory_hint += f"\n\n【近期失败教训 (短期记忆)】\n{fail_hints}\n请务必避免重蹈覆辙！"
+        
+        return memory_hint
 
-        # 2. 组装输入
+    def _generate_full(self, target_file: str, description: str, vfs, memory_hint: str) -> str:
+        """首次生成：输出完整代码文件"""
+        vfs_dict = vfs.get_all_vfs()
+        vfs_context = []
+        for file_path, content in vfs_dict.items():
+            if file_path != target_file:
+                preview = content[:800] + "\n...[省略]" if len(content) > 800 else content
+                vfs_context.append(f"--- [现存文件: {file_path}] ---\n{preview}\n")
+                
+        vfs_str = "".join(vfs_context) if vfs_context else "当前项目是空的，你是写的第一个文件。"
+
         system_content = Prompts.CODER_SYSTEM.format(
             target_file=target_file,
             description=description,
             vfs_context=vfs_str
         ) + memory_hint
         
-        # 3. 如果有 Reviewer 退回的 Feedback，说明现在是"修复模式"
         user_prompt = "请开始编写该文件的代码。只输出这一个文件的代码内容。"
-        if feedback:
-            user_prompt = f"【🚨 紧急修复要求】你之前生成的代码被 Reviewer 测试出错了！\n以下是沙盒运行报错或审查人的建议：\n\n{feedback}\n\n请修复上述 bug，并重新输出该文件的完整纯净代码！不能偷懒只输出片段！"
 
         messages = [
             {"role": "system", "content": system_content},
             {"role": "user", "content": user_prompt}
         ]
 
-        logger.info(f"💻 Coder 正在疯狂编码中... 目标文件: {target_file}")
-        attempt = 1
-        global_broadcaster.emit_sync("Coder", "coding_start", f"正在为 {target_file} 编写代码", {"target": target_file})
-        
-        # 4. 请求大模型
         response_msg = default_llm.chat_completion(
             messages=messages,
             model=self.model,
             temperature=0.2
         )
         
-        raw_code = response_msg.content
-        
-        # 5. 清洗并暂存
-        clean_code = self._clean_markdown(raw_code)
-        
-        # 将刚才生成的草稿保存进虚拟文件系统
+        clean_code = self._clean_markdown(response_msg.content)
         vfs.save_draft(target_file, clean_code)
         
-        logger.info(f"✅ Coder 编撰完成 ({len(clean_code)} bytes)")
-        global_broadcaster.emit_sync("Coder", "coding_done", f"{target_file} 编写完毕", {"code": clean_code})
-        
+        logger.info(f"✅ Coder 全量生成完成 ({len(clean_code)} bytes)")
         return clean_code
+
+    def _fix_with_editor(self, target_file: str, description: str, feedback: str, vfs, memory_hint: str) -> str:
+        """
+        修复模式：使用 edit_file Function Calling 做差量编辑。
+        如果 LLM 不使用工具或 edits 匹配失败，自动 fallback 到全量覆写。
+        """
+        current_code = vfs.get_draft(target_file) or ""
+        
+        system_content = Prompts.CODER_FIX_SYSTEM.format(
+            target_file=target_file,
+            current_code=current_code,
+            feedback=feedback
+        ) + memory_hint
+
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": "请使用 edit_file 工具精准修复上述 bug。"}
+        ]
+
+        logger.info(f"🔧 Coder [Editor 模式] 正在差量修复: {target_file}")
+        global_broadcaster.emit_sync("Coder", "edit_start", f"正在差量修复 {target_file}", {"target": target_file})
+
+        response_msg = default_llm.chat_completion(
+            messages=messages,
+            model=self.model,
+            temperature=0.1,
+            tools=Prompts.CODER_EDIT_TOOL_SCHEMA
+        )
+
+        # 检查 LLM 是否使用了 edit_file 工具
+        if response_msg.tool_calls:
+            for tool_call in response_msg.tool_calls:
+                if tool_call.function.name == "edit_file":
+                    try:
+                        args = json.loads(tool_call.function.arguments)
+                        edits = args.get("edits", [])
+                        
+                        if edits:
+                            success, msg = vfs.apply_edits(target_file, edits)
+                            if success:
+                                updated_code = vfs.get_draft(target_file)
+                                logger.info(f"🔧 [Editor] 差量编辑成功: {msg}")
+                                global_broadcaster.emit_sync("Coder", "edit_done", f"差量修复完成: {msg}", {"code": updated_code})
+                                return updated_code
+                            else:
+                                logger.warning(f"⚠️ [Editor] 差量编辑部分失败: {msg}，尝试 fallback")
+                    except (json.JSONDecodeError, KeyError, TypeError) as e:
+                        logger.warning(f"⚠️ [Editor] 工具参数解析失败: {e}，fallback 全量覆写")
+
+        # Fallback: 全量覆写
+        logger.warning(f"⚠️ [Editor] Fallback 全量覆写模式")
+        return self._fallback_full_rewrite(target_file, description, feedback, vfs, memory_hint)
+
+    def _fallback_full_rewrite(self, target_file: str, description: str, feedback: str, vfs, memory_hint: str) -> str:
+        """降级方案：和原来一样全量重写"""
+        vfs_dict = vfs.get_all_vfs()
+        vfs_context = []
+        for file_path, content in vfs_dict.items():
+            if file_path != target_file:
+                preview = content[:800] + "\n...[省略]" if len(content) > 800 else content
+                vfs_context.append(f"--- [现存文件: {file_path}] ---\n{preview}\n")
+        vfs_str = "".join(vfs_context) if vfs_context else "当前项目是空的。"
+
+        system_content = Prompts.CODER_SYSTEM.format(
+            target_file=target_file,
+            description=description,
+            vfs_context=vfs_str
+        ) + memory_hint
+
+        user_prompt = f"【🚨 紧急修复要求】你之前生成的代码被 Reviewer 测试出错了！\n以下是沙盒运行报错或审查人的建议：\n\n{feedback}\n\n请修复上述 bug，并重新输出该文件的完整纯净代码！不能偷懒只输出片段！"
+
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_prompt}
+        ]
+
+        response_msg = default_llm.chat_completion(
+            messages=messages,
+            model=self.model,
+            temperature=0.2
+        )
+        
+        clean_code = self._clean_markdown(response_msg.content)
+        vfs.save_draft(target_file, clean_code)
+        
+        logger.info(f"✅ Coder Fallback 全量重写完成 ({len(clean_code)} bytes)")
+        return clean_code
+
+    def generate_code(self, target_file: str, description: str, feedback: Optional[str] = None) -> str:
+        """
+        生成或修复代码（统一入口）
+        
+        判定模式：
+        1. feedback≠None → Reviewer 退回修复（Editor Tools 差量编辑）
+        2. 文件已存在于 VFS → 跨任务修改已有文件（Editor Tools 差量编辑）
+        3. 文件不存在 → 首次生成（全量输出）
+        """
+        vfs = global_state_manager.get_vfs(self.project_id)
+        memory_hint = self._build_memory_hint(target_file, description)
+        existing_code = vfs.get_draft(target_file)
+        
+        if feedback:
+            mode = "Reviewer退回修复"
+            edit_instruction = feedback
+        elif existing_code:
+            mode = "跨任务修改已有文件"
+            edit_instruction = f"【任务要求】\n{description}"
+        else:
+            mode = "首次生成"
+            edit_instruction = None
+        
+        logger.info(f"💻 Coder 正在编码... 目标文件: {target_file}, 模式: {mode}")
+        global_broadcaster.emit_sync("Coder", "coding_start", f"[{mode}] 正在为 {target_file} 编写代码", {"target": target_file})
+        
+        if edit_instruction:
+            result = self._fix_with_editor(target_file, description, edit_instruction, vfs, memory_hint)
+        else:
+            result = self._generate_full(target_file, description, vfs, memory_hint)
+        
+        global_broadcaster.emit_sync("Coder", "coding_done", f"{target_file} 编写完毕", {"code": result})
+        return result
+

@@ -100,7 +100,7 @@ class ManagerAgent:
             logger.error(f"Manager 拆解任务时发生异常: {e}")
             return {"project_name": "Error_Project", "architecture_summary": "API异常", "tasks": []}
 
-    def execute_tdd_loop(self, task: Dict[str, Any]) -> bool:
+    def execute_tdd_loop(self, task: Dict[str, Any], final_dir: str = None) -> bool:
         """
         核心的 TDD (Test-Driven Development) 开发与审查闭环
         返回: 是否成功解决该 Task
@@ -113,6 +113,18 @@ class ManagerAgent:
         global_broadcaster.emit_sync("Manager", "task_start", f"开始分发执行任务: {target_file}", {"task": task})
 
         vfs = global_state_manager.get_vfs(self.project_id)
+        
+        # 如果 VFS 中没有该文件，检查磁盘是否已有（跨请求修改场景）
+        if vfs.get_draft(target_file) is None and final_dir:
+            disk_path = os.path.join(final_dir, target_file)
+            if os.path.isfile(disk_path):
+                try:
+                    with open(disk_path, "r", encoding="utf-8") as f:
+                        existing_code = f.read()
+                    vfs.save_draft(target_file, existing_code)
+                    logger.info(f"📂 从磁盘预加载已有文件到 VFS: {target_file} ({len(existing_code)} bytes)")
+                except Exception as e:
+                    logger.warning(f"⚠️ 磁盘文件预加载失败: {target_file} - {e}")
         feedback = None
         vfs.reset_retry(task_id)
         
@@ -267,7 +279,7 @@ class ManagerAgent:
 
         for idx, task in enumerate(tasks):
             logger.info(f"\n[{idx+1}/{len(tasks)}] ========================")
-            success = self.execute_tdd_loop(task)
+            success = self.execute_tdd_loop(task, final_dir=final_dir)
 
             if not success:
                 logger.critical(f"💥 核心任务 {task.get('task_id')} 彻底失败。整个项目编译被强行终止以防止 Token 被无效消耗。")

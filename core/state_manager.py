@@ -8,12 +8,12 @@ logger = logging.getLogger("StateManager")
 
 
 class VirtualFileSystem:
-    def __init__(self, project_id: str):
+    def __init__(self, project_id: str, mode: str = "create", base_path: str = None):
         self.project_id = project_id
-        self._lock = threading.Lock()  # 线程安全锁
-        # 虚拟文件系统: {相对文件路径: 代码字符串}
+        self.mode = mode              # "create"(从零生成) | "edit"(已有项目)
+        self.base_path = base_path    # "edit"模式下的磁盘根路径
+        self._lock = threading.Lock()
         self.vfs: Dict[str, str] = {}
-        # 任务重试记录: {任务ID/文件名: 失败重试次数}
         self.retries: Dict[str, int] = {}
 
         self.is_dirty: bool = False
@@ -31,10 +31,22 @@ class VirtualFileSystem:
         logger.debug(f"[{self.project_id}] 已暂存草稿: {filepath}")
 
     def get_draft(self, filepath: str) -> Optional[str]:
-        """获取代码草稿"""
+        """获取代码草稿。edit 模式下优先从 VFS 内存取，fallback 从磁盘读取。"""
         with self._lock:
             self._update_access()
-            return self.vfs.get(filepath)
+            content = self.vfs.get(filepath)
+            if content is not None:
+                return content
+            # edit 模式下，如果内存中没有，尝试从磁盘读取
+            if self.mode == "edit" and self.base_path:
+                abs_path = os.path.join(self.base_path, filepath)
+                if os.path.isfile(abs_path):
+                    try:
+                        with open(abs_path, "r", encoding="utf-8") as f:
+                            return f.read()
+                    except Exception:
+                        pass
+            return None
 
     def get_all_vfs(self) -> Dict[str, str]:
         """获取当前整个项目的虚拟代码状态 (返回浅拷贝防止外部并发修改)"""
@@ -62,6 +74,57 @@ class VirtualFileSystem:
         with self._lock:
             self._update_access()
             return self.retries.get(task_id, 0)
+
+    def apply_edits(self, filepath: str, edits: list) -> tuple:
+        """
+        差量编辑：对指定文件执行 search/replace 操作。
+        
+        Args:
+            filepath: 相对文件路径
+            edits: [{"search": "原始片段", "replace": "替换内容"}, ...]
+        
+        Returns:
+            (success: bool, message: str)
+        """
+        with self._lock:
+            self._update_access()
+            content = self.vfs.get(filepath)
+            
+            # 如果 VFS 中没有，尝试从磁盘读取（edit 模式）
+            if content is None and self.mode == "edit" and self.base_path:
+                abs_path = os.path.join(self.base_path, filepath)
+                if os.path.isfile(abs_path):
+                    try:
+                        with open(abs_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                    except Exception as e:
+                        return False, f"磁盘读取失败: {e}"
+            
+            if content is None:
+                return False, f"文件不存在: {filepath}"
+            
+            applied = 0
+            failed = []
+            for i, edit in enumerate(edits):
+                search = edit.get("search", "")
+                replace = edit.get("replace", "")
+                if not search:
+                    failed.append(f"edit[{i}]: search 为空")
+                    continue
+                if search in content:
+                    content = content.replace(search, replace, 1)
+                    applied += 1
+                else:
+                    failed.append(f"edit[{i}]: 未找到匹配 '{search[:50]}...'")
+            
+            if applied > 0:
+                self.vfs[filepath] = content
+                self.is_dirty = True
+                logger.info(f"🔧 [{self.project_id}] apply_edits({filepath}): {applied} 成功, {len(failed)} 失败")
+            
+            if failed:
+                return applied > 0, f"应用 {applied} 处编辑, {len(failed)} 处失败: {'; '.join(failed)}"
+            return True, f"全部 {applied} 处编辑应用成功"
 
     def commit_to_disk(self, target_dir: str) -> None:
         """
@@ -121,19 +184,18 @@ class StateManager:
         if not os.path.exists(self.projects_root):
             os.makedirs(self.projects_root)
 
-    def get_vfs(self, project_id: str) -> VirtualFileSystem:
+    def get_vfs(self, project_id: str, mode: str = "create", base_path: str = None) -> VirtualFileSystem:
         """提取指定事务(项目)的轻量草稿箱。防串扰核心。"""
         with self._pool_lock:
             if project_id in self.vfs_pool:
                 return self.vfs_pool[project_id]
 
-            # 超界时执行 LRU 淘汰
             if len(self.vfs_pool) >= self.max_projects:
                 self._evict_lru()
 
-            new_vfs = VirtualFileSystem(project_id)
+            new_vfs = VirtualFileSystem(project_id, mode=mode, base_path=base_path)
             self.vfs_pool[project_id] = new_vfs
-            logger.info(f"✨ 放入池中: 项目 ({project_id})。当前活跃VFS数: {len(self.vfs_pool)}")
+            logger.info(f"✨ 放入池中: 项目 ({project_id}) mode={mode}。当前活跃VFS数: {len(self.vfs_pool)}")
             return new_vfs
 
     def _evict_lru(self):
