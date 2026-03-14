@@ -39,7 +39,7 @@ class ManagerAgent:
         logger.info("🧠 Manager 正在思考架构并拆解任务...")
         
         # 1. 查询结构化短期记忆 (Sliding Window History)
-        recent_events = get_recent_events(project_id=self.project_id, limit=10)
+        recent_events = get_recent_events(project_id=self.project_id, limit=10, caller="Manager")
         history_str = "\n".join([f"[{e.role}/{e.event_type}]: {e.content[:100]}..." for e in recent_events]) if recent_events else "无近期对话。"
         
         # 2. 查询长期经验记忆 (RAG)
@@ -138,24 +138,27 @@ class ManagerAgent:
             self.coder.generate_code(target_file, description, feedback)
             global_broadcaster.emit_sync("Manager", "vfs_update", f"VFS 文件树更新暂存目标: {target_file}", {"vfs": vfs.get_all_vfs()})
 
-            # 记录 Coder 输出
+            # 获取 Coder 输出的代码（暂不写入记忆，等 Reviewer 测试后统一记录）
             code_draft = vfs.get_draft(target_file) or ""
-            append_event("coder", "code", code_draft[:2000], project_id=self.project_id,
-                         metadata={"target_file": target_file, "retry": current_retry})
             
             # 3. Reviewer 测试与审查沙盒执行
             is_pass, reviewer_feedback = self.reviewer.evaluate_draft(target_file, description)
             
+            # 4. 统一写入一条带 verdict 标签的 tdd_round 事件（正面/反面教材）
+            verdict = "pass" if is_pass else "fail"
+            event_content = (
+                f"[{verdict.upper()}] 任务 {task_id} | 文件: {target_file} | 重试: {current_retry}\n"
+                f"--- 代码片段 ---\n{code_draft[:1500]}\n"
+                f"--- 审查结果 ---\n{reviewer_feedback[:500] if reviewer_feedback else '审查通过'}"
+            )
+            append_event("tdd", f"round_{verdict}", event_content, project_id=self.project_id,
+                         metadata={"task_id": task_id, "target_file": target_file,
+                                   "retry": current_retry, "verdict": verdict})
+
             if is_pass:
-                # 记录测试通过事件
-                append_event("reviewer", "test_pass", f"任务 {task_id} 审查通过", project_id=self.project_id,
-                             metadata={"task_id": task_id, "target_file": target_file})
                 logger.info(f"🎉 任务 [{task_id}] 审查通过！完全符合要求。")
                 return True
             else:
-                # 记录测试失败事件
-                append_event("reviewer", "test_fail", reviewer_feedback[:2000], project_id=self.project_id,
-                             metadata={"task_id": task_id, "target_file": target_file, "retry": current_retry})
                 feedback = reviewer_feedback
                 vfs.increment_retry(task_id)
                 logger.warning(f"🔨 任务 [{task_id}] 审查未通过，退回重写 (Current Retries: {current_retry + 1}/{MAX_RETRIES})")
@@ -289,11 +292,11 @@ class ManagerAgent:
         """成功后，调用 qwen3-max 对整个过程进行反思，提炼精髓存入 PG 长期记忆 (后台异步执行)"""
         
         # 收集本次 TDD 循环的关键事件作为反思素材
-        recent_events = get_recent_events(project_id=self.project_id, limit=20)
+        recent_events = get_recent_events(project_id=self.project_id, limit=20, caller="Manager/Reflect")
         events_summary = "\n".join([
             f"[{e.role}/{e.event_type}]: {e.content[:150]}..."
             for e in recent_events
-            if e.event_type in ('code', 'test_pass', 'test_fail', 'circuit_break')
+            if e.event_type in ('round_pass', 'round_fail', 'circuit_break')
         ]) or "无详细事件日志。"
         
         def _background_task():

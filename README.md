@@ -88,7 +88,7 @@ QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 
 # 模型矩阵分配 (分工合作)
 MODEL_PLANNER=qwen3-max        # 需要极致的架构理解力
-MODEL_CODER=qwen3-coder-max    # 需要代码生成的专业性
+MODEL_CODER=qwen3-coder-plus    # 需要代码生成的专业性
 MODEL_REVIEWER=qwen3-max       # 需要火眼金睛查错排错
 
 # Token 消费告警线 (单次请求)

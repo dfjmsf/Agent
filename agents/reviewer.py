@@ -7,7 +7,7 @@ from core.prompt import Prompts
 from core.state_manager import global_state_manager
 from tools.sandbox import sandbox_env
 from core.ws_broadcaster import global_broadcaster
-from core.database import recall
+from core.database import recall, get_recent_events
 
 logger = logging.getLogger("ReviewerAgent")
 
@@ -62,6 +62,15 @@ class ReviewerAgent:
         memory_hint = ""
         if past_tips:
             memory_hint = "\n\n【历史测试经验 (RAG 长期记忆)】\n" + "\n".join([f"- {tip}" for tip in past_tips])
+
+        # 读取短期记忆中近期失败轮次，提示 Reviewer 重点关注之前出过的问题
+        recent_fails = get_recent_events(
+            project_id=self.project_id, limit=3,
+            event_types=["round_fail"], caller="Reviewer"
+        )
+        if recent_fails:
+            fail_hints = "\n".join([f"[历史失败 #{i+1}] {e.content[:300]}" for i, e in enumerate(recent_fails)])
+            memory_hint += f"\n\n【近期失败记录 (短期记忆)】\n{fail_hints}\n请在测试中重点验证这些问题是否已修复！"
 
         system_prompt = Prompts.REVIEWER_SYSTEM + memory_hint
         user_content = f"【当前要审查的文件】: {target_file}\n【业务需求描述】: {description}\n【Coder提交的代码内容】:\n```python\n{code_draft}\n```\n\n请立即使用 `sandbox_execute` 工具生成并执行一段测试脚本！测试脚本应 import 该文件中的类/函数进行黑盒测试。如果无法 import（比如该文件是入口配置），请写一段语法检查即可。"

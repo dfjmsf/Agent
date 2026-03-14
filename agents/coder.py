@@ -6,7 +6,7 @@ from core.llm_client import default_llm
 from core.prompt import Prompts
 from core.state_manager import global_state_manager
 from core.ws_broadcaster import global_broadcaster
-from core.database import recall
+from core.database import recall, get_recent_events
 
 logger = logging.getLogger("CoderAgent")
 
@@ -63,6 +63,15 @@ class CoderAgent:
         memory_hint = ""
         if past_tips:
             memory_hint = "\n\n【历史踩坑经验 (RAG 长期记忆)】\n" + "\n".join([f"- {tip}" for tip in past_tips])
+
+        # 1.6. 读取短期记忆中的"反面教材"（最近的失败轮次）
+        recent_fails = get_recent_events(
+            project_id=self.project_id, limit=3,
+            event_types=["round_fail"], caller="Coder"
+        )
+        if recent_fails:
+            fail_hints = "\n".join([f"[失败案例 #{i+1}] {e.content[:300]}" for i, e in enumerate(recent_fails)])
+            memory_hint += f"\n\n【近期失败教训 (短期记忆)】\n{fail_hints}\n请务必避免重蹈覆辙！"
 
         # 2. 组装输入
         system_content = Prompts.CODER_SYSTEM.format(
