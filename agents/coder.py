@@ -6,6 +6,7 @@ from core.llm_client import default_llm
 from core.prompt import Prompts
 from core.state_manager import global_state_manager
 from core.ws_broadcaster import global_broadcaster
+from core.database import recall
 
 logger = logging.getLogger("CoderAgent")
 
@@ -57,12 +58,18 @@ class CoderAgent:
                 
         vfs_str = "".join(vfs_context) if vfs_context else "当前项目是空的，你是写的第一个文件。"
 
+        # 1.5. 召回历史经验 (RAG 长期记忆)
+        past_tips = recall(f"{target_file} {description}", n_results=2, project_id=self.project_id, caller="Coder")
+        memory_hint = ""
+        if past_tips:
+            memory_hint = "\n\n【历史踩坑经验 (RAG 长期记忆)】\n" + "\n".join([f"- {tip}" for tip in past_tips])
+
         # 2. 组装输入
         system_content = Prompts.CODER_SYSTEM.format(
             target_file=target_file,
             description=description,
             vfs_context=vfs_str
-        )
+        ) + memory_hint
         
         # 3. 如果有 Reviewer 退回的 Feedback，说明现在是"修复模式"
         user_prompt = "请开始编写该文件的代码。只输出这一个文件的代码内容。"

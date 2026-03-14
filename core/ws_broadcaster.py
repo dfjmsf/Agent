@@ -1,28 +1,46 @@
 import asyncio
 import json
+import threading
 from typing import List
+
 
 class WebSocketBroadcaster:
     def __init__(self):
+        self._lock = threading.Lock()
         self.active_connections: List = []
         self.main_loop = None
 
     async def connect(self, websocket):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        with self._lock:
+            self.active_connections.append(websocket)
 
     def disconnect(self, websocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+        with self._lock:
+            if websocket in self.active_connections:
+                self.active_connections.remove(websocket)
 
     async def broadcast(self, message: dict):
         # Convert message to json string
         text_data = json.dumps(message, ensure_ascii=False)
-        for connection in self.active_connections:
+
+        # 获取当前连接快照，避免长时间持锁
+        with self._lock:
+            connections = list(self.active_connections)
+
+        dead_connections = []
+        for connection in connections:
             try:
                 await connection.send_text(text_data)
             except Exception:
-                pass
+                dead_connections.append(connection)
+
+        # 自动清理发送失败的死连接
+        if dead_connections:
+            with self._lock:
+                for conn in dead_connections:
+                    if conn in self.active_connections:
+                        self.active_connections.remove(conn)
 
     def emit_sync(self, agent_role: str, action_type: str, content: str, payload: dict = None):
         """
@@ -34,7 +52,7 @@ class WebSocketBroadcaster:
             "content": content,
             "payload": payload or {}
         }
-        
+
         # 尝试使用我们通过 FastAPI startup 保存的主事件循环
         if hasattr(self, 'main_loop') and self.main_loop:
             asyncio.run_coroutine_threadsafe(self.broadcast(msg), self.main_loop)
@@ -45,5 +63,7 @@ class WebSocketBroadcaster:
             except RuntimeError:
                 pass
 
+
 # 全局单例广播器
 global_broadcaster = WebSocketBroadcaster()
+

@@ -7,6 +7,7 @@ from core.prompt import Prompts
 from core.state_manager import global_state_manager
 from tools.sandbox import sandbox_env
 from core.ws_broadcaster import global_broadcaster
+from core.database import recall
 
 logger = logging.getLogger("ReviewerAgent")
 
@@ -56,7 +57,13 @@ class ReviewerAgent:
         logger.info(f"🛡️ Reviewer 正在审查文件: {target_file}")
         global_broadcaster.emit_sync("Reviewer", "review_start", f"开始审查目标文件: {target_file}", {"target": target_file, "code": code_draft})
 
-        system_prompt = Prompts.REVIEWER_SYSTEM
+        # 召回历史测试经验 (RAG 长期记忆)
+        past_tips = recall(f"测试 {target_file} {description}", n_results=2, project_id=self.project_id, caller="Reviewer")
+        memory_hint = ""
+        if past_tips:
+            memory_hint = "\n\n【历史测试经验 (RAG 长期记忆)】\n" + "\n".join([f"- {tip}" for tip in past_tips])
+
+        system_prompt = Prompts.REVIEWER_SYSTEM + memory_hint
         user_content = f"【当前要审查的文件】: {target_file}\n【业务需求描述】: {description}\n【Coder提交的代码内容】:\n```python\n{code_draft}\n```\n\n请立即使用 `sandbox_execute` 工具生成并执行一段测试脚本！测试脚本应 import 该文件中的类/函数进行黑盒测试。如果无法 import（比如该文件是入口配置），请写一段语法检查即可。"
 
         messages = [

@@ -2,6 +2,7 @@ import os
 import json
 import time
 import logging
+import threading
 from typing import List, Dict, Any, Optional, Tuple
 from core.llm_client import default_llm
 from core.prompt import Prompts
@@ -9,9 +10,11 @@ from core.state_manager import global_state_manager
 from core.ws_broadcaster import global_broadcaster
 from agents.coder import CoderAgent
 from agents.reviewer import ReviewerAgent
-from core.db import append_to_history, get_recent_history
-from core.memory import recall, memorize
-import threading
+from core.database import (
+    append_event, get_recent_events, rename_project_events,
+    recall, memorize,
+    create_project_meta, update_project_status, rename_project_meta,
+)
 
 logger = logging.getLogger("ManagerAgent")
 
@@ -36,11 +39,11 @@ class ManagerAgent:
         logger.info("🧠 Manager 正在思考架构并拆解任务...")
         
         # 1. 查询结构化短期记忆 (Sliding Window History)
-        recent_history = get_recent_history(project_id=self.project_id, limit=5)
-        history_str = "\n".join([f"[{h.role}]: {h.content[:100]}..." for h in recent_history]) if recent_history else "无近期对话。"
+        recent_events = get_recent_events(project_id=self.project_id, limit=10)
+        history_str = "\n".join([f"[{e.role}/{e.event_type}]: {e.content[:100]}..." for e in recent_events]) if recent_events else "无近期对话。"
         
         # 2. 查询长期经验记忆 (RAG)
-        past_experience = recall(user_requirement, n_results=3, project_id=self.project_id)
+        past_experience = recall(user_requirement, n_results=3, project_id=self.project_id, caller="Manager")
         experience_str = "\n".join(past_experience) if past_experience else "无相关历史经验。"
 
         # 3. 构造环境变量声明 (防止后续循环乱改项目名并提供结构化视野)
@@ -134,14 +137,25 @@ class ManagerAgent:
             
             self.coder.generate_code(target_file, description, feedback)
             global_broadcaster.emit_sync("Manager", "vfs_update", f"VFS 文件树更新暂存目标: {target_file}", {"vfs": vfs.get_all_vfs()})
+
+            # 记录 Coder 输出
+            code_draft = vfs.get_draft(target_file) or ""
+            append_event("coder", "code", code_draft[:2000], project_id=self.project_id,
+                         metadata={"target_file": target_file, "retry": current_retry})
             
             # 3. Reviewer 测试与审查沙盒执行
             is_pass, reviewer_feedback = self.reviewer.evaluate_draft(target_file, description)
             
             if is_pass:
+                # 记录测试通过事件
+                append_event("reviewer", "test_pass", f"任务 {task_id} 审查通过", project_id=self.project_id,
+                             metadata={"task_id": task_id, "target_file": target_file})
                 logger.info(f"🎉 任务 [{task_id}] 审查通过！完全符合要求。")
                 return True
             else:
+                # 记录测试失败事件
+                append_event("reviewer", "test_fail", reviewer_feedback[:2000], project_id=self.project_id,
+                             metadata={"task_id": task_id, "target_file": target_file, "retry": current_retry})
                 feedback = reviewer_feedback
                 vfs.increment_retry(task_id)
                 logger.warning(f"🔨 任务 [{task_id}] 审查未通过，退回重写 (Current Retries: {current_retry + 1}/{MAX_RETRIES})")
@@ -179,8 +193,9 @@ class ManagerAgent:
         返回:
             (success: bool, final_dir: str) — 是否全部成功 + 最终落盘路径
         """
-        # 1. 记录入结构化记忆库
-        append_to_history(role="user", content=user_requirement, project_id=self.project_id)
+        # 1. 记录用户需求到事件流
+        append_event("user", "prompt", user_requirement, project_id=self.project_id)
+        create_project_meta(self.project_id)
         
         # 2. 清空上一轮残留状态
         vfs = global_state_manager.get_vfs(self.project_id)
@@ -189,7 +204,7 @@ class ManagerAgent:
 
         # 3. 任务拆解
         plan = self.plan_tasks(user_requirement)
-        append_to_history(role="manager", content=json.dumps(plan, ensure_ascii=False), project_id=self.project_id)
+        append_event("manager", "plan", json.dumps(plan, ensure_ascii=False), project_id=self.project_id)
 
         # 4. 解析输出目录并执行动态重命名
         project_name = plan.get('project_name', 'Unnamed_Project').replace(" ", "_")
@@ -215,8 +230,8 @@ class ManagerAgent:
                     self.reviewer.project_id = new_project_id
                     global_state_manager.rename_vfs(old_project_id, new_project_id)
                     
-                    from core.db import rename_project_history
-                    rename_project_history(old_project_id, new_project_id)
+                    rename_project_events(old_project_id, new_project_id)
+                    rename_project_meta(old_project_id, new_project_id, safe_proj_name)
                     
                     global_broadcaster.emit_sync("System", "project_renamed", f"项目正式主题生成，宇宙已重命名为: {safe_proj_name}", {
                         "old_id": old_project_id,
@@ -254,6 +269,8 @@ class ManagerAgent:
             if not success:
                 logger.critical(f"💥 核心任务 {task.get('task_id')} 彻底失败。整个项目编译被强行终止以防止 Token 被无效消耗。")
                 global_broadcaster.emit_sync("System", "error", f"💥 核心任务 {task.get('task_id')} 连续熔断。项目腰斩！")
+                append_event("system", "circuit_break", f"任务 {task.get('task_id')} 熔断", project_id=self.project_id)
+                update_project_status(self.project_id, "failed")
                 return False, final_dir
 
         # 6. 全部通过，执行反思闭环 (Reflect & Memorize)
@@ -261,30 +278,52 @@ class ManagerAgent:
         self._reflect_and_memorize(user_requirement, plan)
         
         vfs.commit_to_disk(final_dir)
-        global_state_manager.remove_vfs(self.project_id) # 结束后释放内存
+        global_state_manager.remove_vfs(self.project_id)  # 结束后释放内存
+        update_project_status(self.project_id, "success")
         logger.info(f"✨ 项目交付完成: {final_dir}")
         global_broadcaster.emit_sync("System", "success", f"✨ 项目完美生成于！{final_dir}", {"final_path": final_dir})
 
         return True, final_dir
 
     def _reflect_and_memorize(self, user_req: str, plan: dict):
-        """成功后，调用 qwen3-max 对整个过程进行反思，提炼精髓存入 ChromaDB (后台异步执行)"""
+        """成功后，调用 qwen3-max 对整个过程进行反思，提炼精髓存入 PG 长期记忆 (后台异步执行)"""
+        
+        # 收集本次 TDD 循环的关键事件作为反思素材
+        recent_events = get_recent_events(project_id=self.project_id, limit=20)
+        events_summary = "\n".join([
+            f"[{e.role}/{e.event_type}]: {e.content[:150]}..."
+            for e in recent_events
+            if e.event_type in ('code', 'test_pass', 'test_fail', 'circuit_break')
+        ]) or "无详细事件日志。"
         
         def _background_task():
             logger.info("🧠 正在后台线程中萃取开发经验存入长期记忆...")
             
             msg = [
-                {"role": "system", "content": "你是一个资深架构师。请根据用户原始需求和最终的执行计划，提炼出1到2条极具价值的技术经验或项目规约。字数严格控制在 100 字以内，直接输出干货。"},
-                {"role": "user", "content": f"原始需求: {user_req}\n执行策略: {json.dumps(plan, ensure_ascii=False)}"}
+                {"role": "system", "content": (
+                    "你是一个资深架构师。根据用户需求、执行计划和 TDD 过程中的实际事件（代码产出、测试通过/失败记录），"
+                    "提炼出 2-3 条极具价值的技术经验。重点关注：踩过的坑、失败后如何修复、关键架构决策。"
+                    "字数控制在 200 字以内，直接输出干货。"
+                )},
+                {"role": "user", "content": (
+                    f"原始需求: {user_req}\n"
+                    f"执行计划: {json.dumps(plan, ensure_ascii=False)[:500]}\n"
+                    f"TDD 关键事件:\n{events_summary}"
+                )}
             ]
             try:
                 resp = self.llm_client.chat_completion(msg, model="qwen3-max")
                 distilled_knowledge = resp.content.strip()
-                memorize(
-                    distilled_knowledge, 
-                    metadata={"source": "post_project_reflection", "project_name": plan.get('project_name')},
-                    project_id=self.project_id
-                )
+                
+                meta = {"source": "post_project_reflection", "project_name": plan.get('project_name')}
+                
+                # 双写：global (跨项目通用经验) + project (专属上下文)
+                memorize(distilled_knowledge, scope="global", metadata=meta)
+                memorize(distilled_knowledge, scope="project", project_id=self.project_id, metadata=meta)
+                
+                # 同时记入事件流
+                append_event("system", "reflection", distilled_knowledge, project_id=self.project_id)
+                
                 logger.info("✨ [后台任务] 经验复盘与长时记忆写入完毕！")
             except Exception as e:
                 logger.warning(f"✨ [后台任务] 经验复盘总结失败: {e}")

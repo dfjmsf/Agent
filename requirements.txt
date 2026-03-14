@@ -11,4 +11,7 @@ watchdog
 python-multipart
 pandas
 SQLAlchemy
-chromadb
+
+# === Database (PostgreSQL + pgvector) ===
+psycopg2-binary
+pgvector

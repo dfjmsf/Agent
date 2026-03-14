@@ -3,7 +3,8 @@ import sys
 import threading
 import logging
 import asyncio
-from typing import Optional
+from typing import Optional, Dict
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect, UploadFile, File
 import shutil
 import json
@@ -25,8 +26,6 @@ from core.ws_broadcaster import global_broadcaster
 # 设置基础的控制台日志输出格式
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("FastAPIServer")
-
-app = FastAPI(title="Multi-Agent Coding Framework API")
 
 # --- Watchdog 文件系统监控配置 ---
 class ProjectDirectoryEventHandler(FileSystemEventHandler):
@@ -54,6 +53,52 @@ class ProjectDirectoryEventHandler(FileSystemEventHandler):
 
 observer = Observer()
 
+# --- Project 级别互斥锁 (防止同一项目并发生成) ---
+_project_locks: Dict[str, threading.Lock] = {}
+_locks_guard = threading.Lock()
+
+
+def _get_project_lock(project_id: str) -> threading.Lock:
+    """获取或创建指定项目的互斥锁"""
+    with _locks_guard:
+        if project_id not in _project_locks:
+            _project_locks[project_id] = threading.Lock()
+        return _project_locks[project_id]
+
+
+# --- Lifespan 上下文管理器 (替代已弃用的 @app.on_event) ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI 生命周期管理：启动时初始化资源，关闭时清理资源"""
+    # === Startup ===
+    global_broadcaster.main_loop = asyncio.get_running_loop()
+
+    # PostgreSQL + pgvector 初始化
+    from core.database import init_db, check_health
+    if check_health():
+        init_db()
+        logger.info("✅ PostgreSQL 连接正常，数据表已就绪")
+    else:
+        logger.error("❌ PostgreSQL 连接失败！请确认 Docker 容器 astrea-pg 是否已启动")
+
+    projects_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects")
+    if not os.path.exists(projects_dir):
+        os.makedirs(projects_dir)
+
+    event_handler = ProjectDirectoryEventHandler()
+    observer.schedule(event_handler, projects_dir, recursive=True)
+    observer.start()
+    logger.info(f"👀 Watchdog 已启动，正在静默监控目录: {projects_dir}")
+
+    yield  # === 应用运行中 ===
+
+    # === Shutdown ===
+    observer.stop()
+    observer.join()
+
+
+app = FastAPI(title="Multi-Agent Coding Framework API", lifespan=lifespan)
+
 # 允许跨域请求供 React 独立运行
 app.add_middleware(
     CORSMiddleware,
@@ -62,26 +107,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-@app.on_event("startup")
-async def startup_event():
-    # 捕获主线程的 Asyncio Loop
-    global_broadcaster.main_loop = asyncio.get_running_loop()
-    
-    # 启动 Watchdog 守护线程监控 projects 目录
-    projects_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects")
-    if not os.path.exists(projects_dir):
-        os.makedirs(projects_dir)
-        
-    event_handler = ProjectDirectoryEventHandler()
-    observer.schedule(event_handler, projects_dir, recursive=True)
-    observer.start()
-    logger.info(f"👀 Watchdog 已启动，正在静默监控目录: {projects_dir}")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    observer.stop()
-    observer.join()
 
 class NewProjectReq(BaseModel):
     project_name: str
@@ -104,16 +129,24 @@ async def websocket_endpoint(websocket: WebSocket):
 def run_project_thread(prompt: str, out_dir: str, project_id: str):
     """
     由于我们的 Agent 系统是同步阻塞写的，将其放入隔离的线程中运行。
+    使用 project_id 级别的互斥锁防止同一项目被并发生成。
     """
-    logger.info(f"后台协程：开始启动 Manager 同步阻塞流程 (Project: {project_id})...")
+    lock = _get_project_lock(project_id)
+    if not lock.acquire(blocking=False):
+        logger.warning(f"项目 {project_id} 已有生成任务在运行，拒绝重复提交。")
+        global_broadcaster.emit_sync("System", "error", f"项目 {project_id} 已有任务在执行中，请等待完成后再提交。")
+        return
 
-    manager = ManagerAgent(project_id=project_id)
     try:
+        logger.info(f"后台协程：开始启动 Manager 同步阻塞流程 (Project: {project_id})...")
+        manager = ManagerAgent(project_id=project_id)
         success, final_dir = manager.run_project(prompt, out_dir or None)
         if not success:
             logger.error(f"项目生成失败，输出目录: {final_dir}")
     except Exception as e:
         global_broadcaster.emit_sync("System", "error", f"项目生成异常：{str(e)}")
+    finally:
+        lock.release()
 
 @app.post("/api/project/new")
 async def create_new_project(req: NewProjectReq):
