@@ -1,7 +1,9 @@
 import os
+import re
 import logging
 import threading
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
+from difflib import SequenceMatcher
 import time
 
 logger = logging.getLogger("StateManager")
@@ -75,16 +77,77 @@ class VirtualFileSystem:
             self._update_access()
             return self.retries.get(task_id, 0)
 
+    @staticmethod
+    def _normalize_whitespace(s: str) -> str:
+        """空白归一化：Tab→空格、多空格合一、去行尾空白"""
+        lines = s.split('\n')
+        normalized = []
+        for line in lines:
+            line = line.replace('\t', '    ')   # Tab → 4 空格
+            line = re.sub(r'[ ]+', ' ', line)    # 多空格合一
+            line = line.rstrip()                 # 去行尾空白
+            normalized.append(line)
+        return '\n'.join(normalized)
+
+    def _fuzzy_find_and_replace(self, content: str, search: str, replace: str) -> Tuple[bool, str, str]:
+        """
+        三级匹配策略：
+        Level 1: 精确匹配
+        Level 2: 空白归一化后匹配
+        Level 3: difflib 最佳子串模糊匹配 (similarity >= 0.6)
+        
+        Returns: (success, new_content, level_used)
+        """
+        # --- Level 1: 精确匹配 ---
+        if search in content:
+            return True, content.replace(search, replace, 1), "L1:精确"
+        
+        # --- Level 2: 空白归一化匹配 ---
+        norm_search = self._normalize_whitespace(search)
+        content_lines = content.split('\n')
+        search_lines = norm_search.split('\n')
+        search_len = len(search_lines)
+        
+        for start_idx in range(len(content_lines) - search_len + 1):
+            window = content_lines[start_idx:start_idx + search_len]
+            norm_window = [re.sub(r'[ ]+', ' ', l.replace('\t', '    ').rstrip()) for l in window]
+            if norm_window == search_lines:
+                # 找到归一化匹配！用原始行范围做替换
+                before = '\n'.join(content_lines[:start_idx])
+                after = '\n'.join(content_lines[start_idx + search_len:])
+                parts = [before, replace, after]
+                new_content = '\n'.join(p for p in parts if p)  # 避免头尾空行
+                return True, new_content, "L2:归一化"
+        
+        # --- Level 3: difflib 模糊匹配 ---
+        # 在 content 中按滑动窗口找最相似的片段
+        best_ratio = 0.0
+        best_start = -1
+        best_end = -1
+        
+        # 搜索窗口大小：search 行数 ± 2
+        for window_size in range(max(1, search_len - 2), search_len + 3):
+            for start_idx in range(len(content_lines) - window_size + 1):
+                window_text = '\n'.join(content_lines[start_idx:start_idx + window_size])
+                ratio = SequenceMatcher(None, search, window_text).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_start = start_idx
+                    best_end = start_idx + window_size
+        
+        if best_ratio >= 0.6 and best_start >= 0:
+            before = '\n'.join(content_lines[:best_start])
+            after = '\n'.join(content_lines[best_end:])
+            parts = [before, replace, after]
+            new_content = '\n'.join(p for p in parts if p)
+            return True, new_content, f"L3:模糊({best_ratio:.0%})"
+        
+        return False, content, "全部失败"
+
     def apply_edits(self, filepath: str, edits: list) -> tuple:
         """
         差量编辑：对指定文件执行 search/replace 操作。
-        
-        Args:
-            filepath: 相对文件路径
-            edits: [{"search": "原始片段", "replace": "替换内容"}, ...]
-        
-        Returns:
-            (success: bool, message: str)
+        使用三级匹配策略：精确 → 空白归一化 → 模糊匹配。
         """
         with self._lock:
             self._update_access()
@@ -105,26 +168,32 @@ class VirtualFileSystem:
             
             applied = 0
             failed = []
+            levels_used = []
             for i, edit in enumerate(edits):
+                if not isinstance(edit, dict):
+                    failed.append(f"edit[{i}]: 非 dict 格式，跳过")
+                    continue
                 search = edit.get("search", "")
                 replace = edit.get("replace", "")
                 if not search:
                     failed.append(f"edit[{i}]: search 为空")
                     continue
-                if search in content:
-                    content = content.replace(search, replace, 1)
+                
+                success, content, level = self._fuzzy_find_and_replace(content, search, replace)
+                if success:
                     applied += 1
+                    levels_used.append(level)
                 else:
-                    failed.append(f"edit[{i}]: 未找到匹配 '{search[:50]}...'")
+                    failed.append(f"edit[{i}]: 三级匹配均未命中 '{search[:50]}...'")
             
             if applied > 0:
                 self.vfs[filepath] = content
                 self.is_dirty = True
-                logger.info(f"🔧 [{self.project_id}] apply_edits({filepath}): {applied} 成功, {len(failed)} 失败")
+                logger.info(f"🔧 [{self.project_id}] apply_edits({filepath}): {applied} 成功 [{', '.join(levels_used)}], {len(failed)} 失败")
             
             if failed:
                 return applied > 0, f"应用 {applied} 处编辑, {len(failed)} 处失败: {'; '.join(failed)}"
-            return True, f"全部 {applied} 处编辑应用成功"
+            return True, f"全部 {applied} 处编辑应用成功 [{', '.join(levels_used)}]"
 
     def commit_to_disk(self, target_dir: str) -> None:
         """

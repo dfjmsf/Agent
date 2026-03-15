@@ -12,9 +12,10 @@ from agents.coder import CoderAgent
 from agents.reviewer import ReviewerAgent
 from core.database import (
     append_event, get_recent_events, rename_project_events,
-    recall, memorize,
+    recall, memorize, upsert_file_tree,
     create_project_meta, update_project_status, rename_project_meta,
 )
+from agents.synthesizer import SynthesizerAgent
 
 logger = logging.getLogger("ManagerAgent")
 
@@ -87,6 +88,20 @@ class ManagerAgent:
                 plan["project_name"] = "AutoGen_Project"
             if "tasks" not in plan:
                 plan["tasks"] = []
+            
+            # 去重：防止 LLM 将同一文件拆成多个 task
+            seen_files = set()
+            deduped_tasks = []
+            for task in plan["tasks"]:
+                tf = task.get("target_file", "")
+                if tf not in seen_files:
+                    seen_files.add(tf)
+                    deduped_tasks.append(task)
+                else:
+                    logger.warning(f"⚠️ 去重: 跳过重复文件 task: {tf}")
+            if len(deduped_tasks) < len(plan["tasks"]):
+                logger.warning(f"⚠️ Manager 去重: {len(plan['tasks'])} → {len(deduped_tasks)} 个 task")
+            plan["tasks"] = deduped_tasks
                 
             logger.info(f"✅ 任务拆解完成: {plan.get('project_name')}")
             global_broadcaster.emit_sync("Manager", "plan_ready", f"成功拆解任务: {plan.get('project_name')}", {"plan": plan})
@@ -100,10 +115,11 @@ class ManagerAgent:
             logger.error(f"Manager 拆解任务时发生异常: {e}")
             return {"project_name": "Error_Project", "architecture_summary": "API异常", "tasks": []}
 
-    def execute_tdd_loop(self, task: Dict[str, Any], final_dir: str = None) -> bool:
+    def execute_tdd_loop(self, task: Dict[str, Any], final_dir: str = None) -> Tuple[bool, Dict[str, str]]:
         """
         核心的 TDD (Test-Driven Development) 开发与审查闭环
-        返回: 是否成功解决该 Task
+        返回: (success: bool, milestones: dict)
+        milestones: {"a": 初始代码, "b": 报错摘要流, "c": 最终代码}
         """
         target_file = task.get("target_file", "")
         description = task.get("description", "")
@@ -125,6 +141,11 @@ class ManagerAgent:
                     logger.info(f"📂 从磁盘预加载已有文件到 VFS: {target_file} ({len(existing_code)} bytes)")
                 except Exception as e:
                     logger.warning(f"⚠️ 磁盘文件预加载失败: {target_file} - {e}")
+        
+        # 里程碑收集器
+        milestones = {"a": "", "b": "", "c": ""}
+        error_trail = []  # 报错摘要流
+        
         feedback = None
         vfs.reset_retry(task_id)
         
@@ -135,7 +156,9 @@ class ManagerAgent:
             if current_retry >= MAX_RETRIES:
                 logger.error(f"🚨 [熔断触发] 任务 {task_id} 连续失败 {MAX_RETRIES} 次，陷入死循环！停止执行。")
                 global_broadcaster.emit_sync("Manager", "task_abort", f"任务 {task_id} 发生熔断！", {})
-                return False
+                # 熔断时也收集里程碑 B
+                milestones["b"] = "\n".join(error_trail) if error_trail else "无报错记录"
+                return False, milestones
                 
             if current_retry > 2 and feedback:
                 # 第二级熔断警告：连续失败3次及以上，向 Coder 施压
@@ -150,27 +173,45 @@ class ManagerAgent:
             self.coder.generate_code(target_file, description, feedback)
             global_broadcaster.emit_sync("Manager", "vfs_update", f"VFS 文件树更新暂存目标: {target_file}", {"vfs": vfs.get_all_vfs()})
 
-            # 获取 Coder 输出的代码（暂不写入记忆，等 Reviewer 测试后统一记录）
+            # 获取 Coder 输出的代码
             code_draft = vfs.get_draft(target_file) or ""
+            
+            # 里程碑 A：记录第一次的代码（“初始错误直觉”）
+            if current_retry == 0:
+                milestones["a"] = code_draft
+            
+            # 更新 File Tree
+            file_list = list(vfs.get_all_vfs().keys())
+            upsert_file_tree(self.project_id, file_list)
             
             # 3. Reviewer 测试与审查沙盒执行
             is_pass, reviewer_feedback = self.reviewer.evaluate_draft(target_file, description)
             
-            # 4. 统一写入一条带 verdict 标签的 tdd_round 事件（正面/反面教材）
+            # 4. 统一写入 tdd_round 事件
             verdict = "pass" if is_pass else "fail"
-            event_content = (
-                f"[{verdict.upper()}] 任务 {task_id} | 文件: {target_file} | 重试: {current_retry}\n"
-                f"--- 代码片段 ---\n{code_draft[:1500]}\n"
-                f"--- 审查结果 ---\n{reviewer_feedback[:500] if reviewer_feedback else '审查通过'}"
-            )
+            if is_pass:
+                # round_pass 精简：不含代码（与 Synthesizer 经验重复），只记摘要
+                event_content = f"[PASS] 任务 {task_id} | 文件: {target_file} | 重试: {current_retry} | 审查通过"
+            else:
+                # round_fail 保留完整代码和报错（Coder 需要用来修复）
+                event_content = (
+                    f"[FAIL] 任务 {task_id} | 文件: {target_file} | 重试: {current_retry}\n"
+                    f"--- 代码片段 ---\n{code_draft[:1500]}\n"
+                    f"--- 审查结果 ---\n{reviewer_feedback[:500]}"
+                )
             append_event("tdd", f"round_{verdict}", event_content, project_id=self.project_id,
                          metadata={"task_id": task_id, "target_file": target_file,
                                    "retry": current_retry, "verdict": verdict})
 
             if is_pass:
+                # 里程碑 C：最终通过的代码（“通关密码”）
+                milestones["c"] = code_draft
+                milestones["b"] = "\n".join(error_trail) if error_trail else "（一次通过，无报错记录）"
                 logger.info(f"🎉 任务 [{task_id}] 审查通过！完全符合要求。")
-                return True
+                return True, milestones
             else:
+                # 里程碑 B：累积报错摘要
+                error_trail.append(f"尝试{current_retry + 1}: {reviewer_feedback[:200]}")
                 feedback = reviewer_feedback
                 vfs.increment_retry(task_id)
                 logger.warning(f"🔨 任务 [{task_id}] 审查未通过，退回重写 (Current Retries: {current_retry + 1}/{MAX_RETRIES})")
@@ -277,26 +318,45 @@ class ManagerAgent:
 
         logger.info(f"🔥 项目开始启动！项目名: {plan.get('project_name', 'Unnamed')}")
 
+        all_milestones = []  # 收集所有任务的里程碑
+        synthesizer = SynthesizerAgent(project_id=self.project_id)
+
         for idx, task in enumerate(tasks):
             logger.info(f"\n[{idx+1}/{len(tasks)}] ========================")
-            success = self.execute_tdd_loop(task, final_dir=final_dir)
+            success, milestones = self.execute_tdd_loop(task, final_dir=final_dir)
+            all_milestones.append({"task": task, "milestones": milestones, "success": success})
 
             if not success:
-                logger.critical(f"💥 核心任务 {task.get('task_id')} 彻底失败。整个项目编译被强行终止以防止 Token 被无效消耗。")
+                logger.critical(f"💥 核心任务 {task.get('task_id')} 彻底失败。")
                 global_broadcaster.emit_sync("System", "error", f"💥 核心任务 {task.get('task_id')} 连续熔断。项目腰斩！")
                 append_event("system", "circuit_break", f"任务 {task.get('task_id')} 熔断", project_id=self.project_id)
                 update_project_status(self.project_id, "failed")
+                
+                # 熔断时也调用 Synthesizer 提炼 Anti-pattern
+                global_broadcaster.emit_sync("System", "info", "🧠 熔断了！正在提炼失败教训...")
+                def _bg_failure():
+                    synthesizer.synthesize_failure(milestones, user_requirement, plan)
+                threading.Thread(target=_bg_failure, daemon=True).start()
+                
                 return False, final_dir
 
-        # 6. 全部通过，执行反思闭环 (Reflect & Memorize)
-        logger.info("\n🏆 所有任务均已通过 Reviewer 测试！开始触发全局反思...")
-        self._reflect_and_memorize(user_requirement, plan)
+        # 6. 全部通过，调用 Synthesizer 提炼 Contrastive Pair
+        logger.info("\n🏆 所有任务均已通过 Reviewer 测试！触发 Synthesizer 知识提炼...")
         
         vfs.commit_to_disk(final_dir)
-        global_state_manager.remove_vfs(self.project_id)  # 结束后释放内存
+        global_state_manager.remove_vfs(self.project_id)
         update_project_status(self.project_id, "success")
         logger.info(f"✨ 项目交付完成: {final_dir}")
-        global_broadcaster.emit_sync("System", "success", f"✨ 项目完美生成于！{final_dir}", {"final_path": final_dir})
+        global_broadcaster.emit_sync("System", "success", f"✨ 项目完美生成！{final_dir}", {"final_path": final_dir})
+
+        # 后台异步提炼经验
+        global_broadcaster.emit_sync("System", "info", "🧠 所有测试通过！Synthesizer 正在提炼技术经验...")
+        def _bg_success():
+            for item in all_milestones:
+                if item["success"]:
+                    synthesizer.synthesize_success(item["milestones"], user_requirement, plan)
+            logger.info("✨ [后台任务] Synthesizer 知识提炼完毕！")
+        threading.Thread(target=_bg_success, daemon=True).start()
 
         return True, final_dir
 

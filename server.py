@@ -329,7 +329,18 @@ async def run_project_code(req: RunRequest):
             "returncode": -1
         }
 
+class GraduateReq(BaseModel):
+    project_id: str
+
+@app.post("/api/project/graduate")
+async def graduate_project(req: GraduateReq):
+    """将项目的短期经验"毕业"为全局长期记忆。"""
+    from core.database import graduate_project_experience
+    count = graduate_project_experience(req.project_id)
+    return {"status": "ok", "graduated_count": count, "project_id": req.project_id}
+
 if __name__ == "__main__":
     import uvicorn
     # 为了防止 Windows 上部分多进程阻塞，这里禁用了 reload 并以纯净模式跑
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
+

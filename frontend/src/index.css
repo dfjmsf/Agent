@@ -141,6 +141,25 @@ body {
   box-shadow: 0 0 10px rgba(177, 74, 237, 0.4);
 }
 
+.btn-graduate {
+  background: rgba(59, 199, 199, 0.12);
+  border: 1px solid #3bc7c7;
+  color: #3bc7c7;
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-family: 'Inter', sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.btn-graduate:hover {
+  background: #3bc7c7;
+  color: #fff;
+  box-shadow: 0 0 10px rgba(59, 199, 199, 0.4);
+}
+
 .main-content-row {
   display: flex;
   flex-direction: row;

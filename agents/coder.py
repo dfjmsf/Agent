@@ -38,22 +38,31 @@ class CoderAgent:
         return "\n".join(lines).strip()
 
     def _build_memory_hint(self, target_file: str, description: str) -> str:
-        """构建长短期记忆提示"""
+        """构建长短期记忆提示，按 scope 分组注入"""
         memory_hint = ""
         
-        # RAG 长期记忆
-        past_tips = recall(f"{target_file} {description}", n_results=2, project_id=self.project_id, caller="Coder")
+        # 长期记忆 → 全局通用架构智慧（recall 现在只返回 global scope）
+        past_tips = recall(f"{target_file} {description}", n_results=5, project_id=self.project_id, caller="Coder")
         if past_tips:
-            memory_hint = "\n\n【历史踩坑经验 (RAG 长期记忆)】\n" + "\n".join([f"- {tip}" for tip in past_tips])
+            tips_str = "\n".join([f"  {i+1}. {tip}" for i, tip in enumerate(past_tips)])
+            memory_hint = f"\n\n【🌍 全局通用架构智慧 (Global Experience)】\n{tips_str}"
         
-        # 短期记忆 — 反面教材
-        recent_fails = get_recent_events(
+        # 短期记忆 → 项目专属经验（必须绝对服从）
+        experience_events = get_recent_events(
             project_id=self.project_id, limit=3,
-            event_types=["round_fail"], caller="Coder"
+            event_types=["experience_project"], caller="Coder"
         )
-        if recent_fails:
-            fail_hints = "\n".join([f"[失败案例 #{i+1}] {e.content[:300]}" for i, e in enumerate(recent_fails)])
-            memory_hint += f"\n\n【近期失败教训 (短期记忆)】\n{fail_hints}\n请务必避免重蹈覆辙！"
+        if experience_events:
+            exp_hints = "\n".join([f"  {i+1}. {e.content[:200]}" for i, e in enumerate(experience_events)])
+            memory_hint += f"\n\n【📦 本项目最高优先级规则 (Project Experience - 必须绝对服从)】\n{exp_hints}"
+        
+        # 短期记忆 → 项目文件树
+        file_tree_events = get_recent_events(
+            project_id=self.project_id, limit=1,
+            event_types=["file_tree"], caller="Coder"
+        )
+        if file_tree_events:
+            memory_hint += f"\n\n【📂 当前项目文件结构】\n{file_tree_events[0].content[:500]}"
         
         return memory_hint
 
@@ -138,7 +147,7 @@ class CoderAgent:
                                 return updated_code
                             else:
                                 logger.warning(f"⚠️ [Editor] 差量编辑部分失败: {msg}，尝试 fallback")
-                    except (json.JSONDecodeError, KeyError, TypeError) as e:
+                    except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
                         logger.warning(f"⚠️ [Editor] 工具参数解析失败: {e}，fallback 全量覆写")
 
         # Fallback: 全量覆写
