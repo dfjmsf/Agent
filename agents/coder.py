@@ -66,20 +66,30 @@ class CoderAgent:
         
         return memory_hint
 
-    def _generate_full(self, target_file: str, description: str, vfs, memory_hint: str) -> str:
+    def _generate_full(self, target_file: str, description: str, vfs, memory_hint: str, task_meta: dict = None) -> str:
         """首次生成：输出完整代码文件"""
         vfs_dict = vfs.get_all_vfs()
+        
+        # 按 dependencies 过滤 VFS 上下文
+        dep_files = self._resolve_dependency_files(task_meta) if task_meta else None
         vfs_context = []
         for file_path, content in vfs_dict.items():
             if file_path != target_file:
+                # 如果有依赖列表，只注入依赖文件；否则 fallback 到全量
+                if dep_files is not None and file_path not in dep_files:
+                    continue
                 preview = content[:800] + "\n...[省略]" if len(content) > 800 else content
-                vfs_context.append(f"--- [现存文件: {file_path}] ---\n{preview}\n")
+                vfs_context.append(f"--- [依赖文件: {file_path}] ---\n{preview}\n")
                 
-        vfs_str = "".join(vfs_context) if vfs_context else "当前项目是空的，你是写的第一个文件。"
+        vfs_str = "".join(vfs_context) if vfs_context else "当前无依赖文件，你是写的第一个文件。"
+
+        # 注入项目规划书
+        project_spec = task_meta.get("project_spec", "无规划书") if task_meta else "无规划书"
 
         system_content = Prompts.CODER_SYSTEM.format(
             target_file=target_file,
             description=description,
+            project_spec=project_spec,
             vfs_context=vfs_str
         ) + memory_hint
         
@@ -154,19 +164,28 @@ class CoderAgent:
         logger.warning(f"⚠️ [Editor] Fallback 全量覆写模式")
         return self._fallback_full_rewrite(target_file, description, feedback, vfs, memory_hint)
 
-    def _fallback_full_rewrite(self, target_file: str, description: str, feedback: str, vfs, memory_hint: str) -> str:
+    def _fallback_full_rewrite(self, target_file: str, description: str, feedback: str, vfs, memory_hint: str, task_meta: dict = None) -> str:
         """降级方案：和原来一样全量重写"""
         vfs_dict = vfs.get_all_vfs()
+        
+        # 按 dependencies 过滤 VFS 上下文
+        dep_files = self._resolve_dependency_files(task_meta) if task_meta else None
         vfs_context = []
         for file_path, content in vfs_dict.items():
             if file_path != target_file:
+                if dep_files is not None and file_path not in dep_files:
+                    continue
                 preview = content[:800] + "\n...[省略]" if len(content) > 800 else content
-                vfs_context.append(f"--- [现存文件: {file_path}] ---\n{preview}\n")
-        vfs_str = "".join(vfs_context) if vfs_context else "当前项目是空的。"
+                vfs_context.append(f"--- [依赖文件: {file_path}] ---\n{preview}\n")
+        vfs_str = "".join(vfs_context) if vfs_context else "当前无依赖文件。"
+
+        # 注入项目规划书
+        project_spec = task_meta.get("project_spec", "无规划书") if task_meta else "无规划书"
 
         system_content = Prompts.CODER_SYSTEM.format(
             target_file=target_file,
             description=description,
+            project_spec=project_spec,
             vfs_context=vfs_str
         ) + memory_hint
 
@@ -189,7 +208,31 @@ class CoderAgent:
         logger.info(f"✅ Coder Fallback 全量重写完成 ({len(clean_code)} bytes)")
         return clean_code
 
-    def generate_code(self, target_file: str, description: str, feedback: Optional[str] = None) -> str:
+    def _resolve_dependency_files(self, task_meta: dict) -> set:
+        """
+        从 task_meta 中解析出当前 task 的依赖文件集合。
+        通过 dependencies (task_id 列表) + all_tasks 反查 target_file。
+        """
+        if not task_meta:
+            return set()
+        
+        deps = task_meta.get("dependencies", [])
+        all_tasks = task_meta.get("all_tasks", [])
+        
+        if not deps or not all_tasks:
+            return set()
+        
+        # 构建 task_id → target_file 映射
+        id_to_file = {t.get("task_id", ""): t.get("target_file", "") for t in all_tasks}
+        
+        dep_files = set()
+        for dep_id in deps:
+            if dep_id in id_to_file:
+                dep_files.add(id_to_file[dep_id])
+        
+        return dep_files
+
+    def generate_code(self, target_file: str, description: str, feedback: Optional[str] = None, task_meta: dict = None) -> str:
         """
         生成或修复代码（统一入口）
         
@@ -218,7 +261,7 @@ class CoderAgent:
         if edit_instruction:
             result = self._fix_with_editor(target_file, description, edit_instruction, vfs, memory_hint)
         else:
-            result = self._generate_full(target_file, description, vfs, memory_hint)
+            result = self._generate_full(target_file, description, vfs, memory_hint, task_meta=task_meta)
         
         global_broadcaster.emit_sync("Coder", "coding_done", f"{target_file} 编写完毕", {"code": result})
         return result

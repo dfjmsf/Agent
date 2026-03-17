@@ -7,7 +7,7 @@ from core.prompt import Prompts
 from core.state_manager import global_state_manager
 from tools.sandbox import sandbox_env
 from core.ws_broadcaster import global_broadcaster
-from core.database import recall, get_recent_events
+from core.database import get_recent_events
 
 logger = logging.getLogger("ReviewerAgent")
 
@@ -57,12 +57,8 @@ class ReviewerAgent:
         logger.info(f"🛡️ Reviewer 正在审查文件: {target_file}")
         global_broadcaster.emit_sync("Reviewer", "review_start", f"开始审查目标文件: {target_file}", {"target": target_file, "code": code_draft})
 
-        # 长期记忆 → 全局通用测试经验
-        past_tips = recall(f"测试 {target_file} {description}", n_results=2, project_id=self.project_id, caller="Reviewer")
+        # 记忆注入（精简：删除 recall 全局经验，保留项目专属经验 + 文件树）
         memory_hint = ""
-        if past_tips:
-            tips_str = "\n".join([f"  {i+1}. {tip}" for i, tip in enumerate(past_tips)])
-            memory_hint = f"\n\n【🌍 全局通用测试经验 (Global Experience)】\n{tips_str}"
 
         # 短期记忆 → 项目专属经验
         experience_events = get_recent_events(

@@ -33,21 +33,94 @@ class ManagerAgent:
         self.coder = CoderAgent(project_id)
         self.reviewer = ReviewerAgent(project_id)
 
-    def plan_tasks(self, user_requirement: str) -> dict:
+    def _generate_project_spec(self, user_requirement: str) -> dict:
         """
-        调用大模型，将用户的一句话需求拆解为 JSON 格式的 Task List
+        步骤 1: 生成或增量更新项目规划书 (Project Spec)。
+        - 新项目: 全量生成
+        - 已有规划书: 注入旧 spec，让 LLM 判断是否需要修改（允许原样输出）
         """
-        logger.info("🧠 Manager 正在思考架构并拆解任务...")
+        logger.info("📋 Manager 正在生成/更新项目规划书...")
         
-        # 1. 查询结构化短期记忆 (Sliding Window History)
-        recent_events = get_recent_events(project_id=self.project_id, limit=10, caller="Manager")
-        history_str = "\n".join([f"[{e.role}/{e.event_type}]: {e.content[:100]}..." for e in recent_events]) if recent_events else "无近期对话。"
+        # 检查是否已有规划书
+        existing_spec_events = get_recent_events(
+            project_id=self.project_id, limit=1,
+            event_types=["project_spec"], caller="Manager/Spec"
+        )
+        
+        if existing_spec_events:
+            # 已有规划书 → 增量更新（全量覆写模式，prompt 提供"可以不改"选项）
+            old_spec_content = existing_spec_events[0].content
+            system_prompt = Prompts.MANAGER_SPEC_UPDATE_SYSTEM.format(existing_spec=old_spec_content)
+            logger.info("📋 检测到已有规划书，进入增量更新模式")
+        else:
+            # 新项目 → 全量生成
+            system_prompt = Prompts.MANAGER_SPEC_SYSTEM
+            logger.info("📋 新项目，全量生成规划书")
+        
+        user_prompt = f"主人的开发需求：\n{user_requirement}\n请输出项目规划书 JSON。"
+        
+        try:
+            raw_response = self.llm_client.chat_completion(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+            )
+            json_str = raw_response.content
+            if "```json" in json_str:
+                json_str = json_str.split("```json")[1].split("```")[0].strip()
+            elif "```" in json_str:
+                json_str = json_str.split("```")[1].split("```")[0].strip()
+            
+            spec = json.loads(json_str)
+            spec_text = json.dumps(spec, ensure_ascii=False, indent=2)
+            
+            # upsert 语义：删旧写新
+            from sqlalchemy import text as sql_text
+            from core.database import ScopedSession, SessionEvent
+            session = ScopedSession()
+            try:
+                session.query(SessionEvent).filter(
+                    SessionEvent.project_id == self.project_id,
+                    SessionEvent.event_type == "project_spec"
+                ).delete()
+                session.commit()
+            finally:
+                ScopedSession.remove()
+            
+            append_event("manager", "project_spec", spec_text, project_id=self.project_id)
+            
+            logger.info(f"✅ 项目规划书生成完毕 ({len(spec_text)} bytes)")
+            global_broadcaster.emit_sync("Manager", "project_spec_ready", "项目规划书已就绪", {"spec": spec})
+            
+            return spec
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"规划书 JSON 解析失败: {e}")
+            return {}
+        except Exception as e:
+            logger.error(f"规划书生成异常: {e}")
+            return {}
+
+    def plan_tasks(self, user_requirement: str, project_spec: dict = None) -> dict:
+        """
+        步骤 2: 基于规划书拆解任务列表。
+        """
+        logger.info("🧠 Manager 正在基于规划书拆解任务...")
+        
+        # 1. 查询短期记忆 — 只读 prompt 类事件（精简：不注入 TDD 噪音）
+        recent_events = get_recent_events(
+            project_id=self.project_id, limit=5,
+            event_types=["prompt"], caller="Manager"
+        )
+        history_str = "\n".join([f"[用户需求]: {e.content[:150]}..." for e in recent_events]) if recent_events else "无近期对话。"
         
         # 2. 查询长期经验记忆 (RAG)
         past_experience = recall(user_requirement, n_results=3, project_id=self.project_id, caller="Manager")
         experience_str = "\n".join(past_experience) if past_experience else "无相关历史经验。"
 
-        # 3. 构造环境变量声明 (防止后续循环乱改项目名并提供结构化视野)
+        # 3. 构造环境变量声明
         is_new_project = "新建项目" in self.project_id or self.project_id == "default_project"
         if is_new_project:
             env_context = "【项目环境】\n这是基于主人的首个请求刚刚创建的全新宇宙草稿。请为它起一个酷炫、精简的纯英文字符串作为 JSON 中的 `project_name` 字段。"
@@ -62,7 +135,13 @@ class ManagerAgent:
                 f"这是当前项目内存里的所有文件，你可以在此基础上规划对旧文件的修改（覆盖），或者指派增加全新的子模块文件。"
             )
 
-        system_prompt = Prompts.MANAGER_SYSTEM + f"\n\n【近期对话上下文】\n{history_str}\n\n【RAG 检索到的过往血泪经验】\n{experience_str}\n\n{env_context}"
+        # 4. 注入规划书（如果有）
+        spec_context = ""
+        if project_spec:
+            spec_str = json.dumps(project_spec, ensure_ascii=False, indent=2)
+            spec_context = f"\n\n【项目规划书 — 你必须基于此架构拆解任务】\n{spec_str}"
+
+        system_prompt = Prompts.MANAGER_SYSTEM + f"\n\n【近期用户需求历史】\n{history_str}\n\n【RAG 检索到的过往血泪经验】\n{experience_str}\n\n{env_context}{spec_context}"
         user_prompt = f"主人的开发需求：\n{user_requirement}\n请严格按照 JSON Schema 输出。"
         
         try:
@@ -115,7 +194,7 @@ class ManagerAgent:
             logger.error(f"Manager 拆解任务时发生异常: {e}")
             return {"project_name": "Error_Project", "architecture_summary": "API异常", "tasks": []}
 
-    def execute_tdd_loop(self, task: Dict[str, Any], final_dir: str = None) -> Tuple[bool, Dict[str, str]]:
+    def execute_tdd_loop(self, task: Dict[str, Any], final_dir: str = None, task_meta: dict = None) -> Tuple[bool, Dict[str, str]]:
         """
         核心的 TDD (Test-Driven Development) 开发与审查闭环
         返回: (success: bool, milestones: dict)
@@ -170,7 +249,7 @@ class ManagerAgent:
                 logger.info(f"🔄 第 {current_retry} 次重试修复 [{task_id}]...")
                 global_broadcaster.emit_sync("Manager", "task_retry", f"子任务 {task_id} 正在进行第 {current_retry} 次重试", {"attempt": current_retry})
             
-            self.coder.generate_code(target_file, description, feedback)
+            self.coder.generate_code(target_file, description, feedback, task_meta=task_meta)
             global_broadcaster.emit_sync("Manager", "vfs_update", f"VFS 文件树更新暂存目标: {target_file}", {"vfs": vfs.get_all_vfs()})
 
             # 获取 Coder 输出的代码
@@ -258,8 +337,13 @@ class ManagerAgent:
         vfs.clear_state()
         global_broadcaster.emit_sync("System", "start_project", "系统重置并启动新项目生成...")
 
-        # 3. 任务拆解
-        plan = self.plan_tasks(user_requirement)
+        # 3. 生成规划书 → 任务拆解（两步）
+        project_spec = self._generate_project_spec(user_requirement)
+        plan = self.plan_tasks(user_requirement, project_spec=project_spec)
+        
+        # 将 spec 存入 plan 供后续传递
+        plan["project_spec"] = project_spec
+        spec_text = json.dumps(project_spec, ensure_ascii=False, indent=2) if project_spec else "无规划书"
         append_event("manager", "plan", json.dumps(plan, ensure_ascii=False), project_id=self.project_id)
 
         # 4. 解析输出目录并执行动态重命名
@@ -323,7 +407,13 @@ class ManagerAgent:
 
         for idx, task in enumerate(tasks):
             logger.info(f"\n[{idx+1}/{len(tasks)}] ========================")
-            success, milestones = self.execute_tdd_loop(task, final_dir=final_dir)
+            # 构建 task_meta 传递给 Coder：规划书 + 依赖列表
+            task_meta = {
+                "project_spec": spec_text,
+                "dependencies": task.get("dependencies", []),
+                "all_tasks": tasks,  # 用于按 dependencies 查找依赖文件
+            }
+            success, milestones = self.execute_tdd_loop(task, final_dir=final_dir, task_meta=task_meta)
             all_milestones.append({"task": task, "milestones": milestones, "success": success})
 
             if not success:
