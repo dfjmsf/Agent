@@ -12,8 +12,9 @@ from agents.coder import CoderAgent
 from agents.reviewer import ReviewerAgent
 from core.database import (
     append_event, get_recent_events, rename_project_events,
-    recall, memorize, upsert_file_tree,
+    recall, upsert_file_tree,
     create_project_meta, update_project_status, rename_project_meta,
+    insert_trajectory, finalize_trajectory,
 )
 from agents.synthesizer import SynthesizerAgent
 
@@ -283,14 +284,25 @@ class ManagerAgent:
                                    "retry": current_retry, "verdict": verdict})
 
             if is_pass:
-                # 里程碑 C：最终通过的代码（“通关密码”）
+                # 里程碑 C：最终通过的代码（"通关密码"）
                 milestones["c"] = code_draft
                 milestones["b"] = "\n".join(error_trail) if error_trail else "（一次通过，无报错记录）"
+                # 轨迹表：回填最终成功代码
+                finalize_trajectory(self.project_id, task_id, code_draft)
                 logger.info(f"🎉 任务 [{task_id}] 审查通过！完全符合要求。")
                 return True, milestones
             else:
                 # 里程碑 B：累积报错摘要
                 error_trail.append(f"尝试{current_retry + 1}: {reviewer_feedback[:200]}")
+                # 轨迹表：写入本轮失败快照（0 Token，静默 INSERT）
+                insert_trajectory(
+                    project_id=self.project_id,
+                    task_id=task_id,
+                    attempt_round=current_retry,
+                    error_summary=reviewer_feedback[:2000],
+                    failed_code=code_draft,
+                    recalled_memory_ids=[],  # 阶段三接入 Auditor 后填入实际 IDs
+                )
                 feedback = reviewer_feedback
                 vfs.increment_retry(task_id)
                 logger.warning(f"🔨 任务 [{task_id}] 审查未通过，退回重写 (Current Retries: {current_retry + 1}/{MAX_RETRIES})")
@@ -449,50 +461,3 @@ class ManagerAgent:
         threading.Thread(target=_bg_success, daemon=True).start()
 
         return True, final_dir
-
-    def _reflect_and_memorize(self, user_req: str, plan: dict):
-        """成功后，调用 qwen3-max 对整个过程进行反思，提炼精髓存入 PG 长期记忆 (后台异步执行)"""
-        
-        # 收集本次 TDD 循环的关键事件作为反思素材
-        recent_events = get_recent_events(project_id=self.project_id, limit=20, caller="Manager/Reflect")
-        events_summary = "\n".join([
-            f"[{e.role}/{e.event_type}]: {e.content[:150]}..."
-            for e in recent_events
-            if e.event_type in ('round_pass', 'round_fail', 'circuit_break')
-        ]) or "无详细事件日志。"
-        
-        def _background_task():
-            logger.info("🧠 正在后台线程中萃取开发经验存入长期记忆...")
-            
-            msg = [
-                {"role": "system", "content": (
-                    "你是一个资深架构师。根据用户需求、执行计划和 TDD 过程中的实际事件（代码产出、测试通过/失败记录），"
-                    "提炼出 2-3 条极具价值的技术经验。重点关注：踩过的坑、失败后如何修复、关键架构决策。"
-                    "字数控制在 200 字以内，直接输出干货。"
-                )},
-                {"role": "user", "content": (
-                    f"原始需求: {user_req}\n"
-                    f"执行计划: {json.dumps(plan, ensure_ascii=False)[:500]}\n"
-                    f"TDD 关键事件:\n{events_summary}"
-                )}
-            ]
-            try:
-                resp = self.llm_client.chat_completion(msg, model="qwen3-max")
-                distilled_knowledge = resp.content.strip()
-                
-                meta = {"source": "post_project_reflection", "project_name": plan.get('project_name')}
-                
-                # 双写：global (跨项目通用经验) + project (专属上下文)
-                memorize(distilled_knowledge, scope="global", metadata=meta)
-                memorize(distilled_knowledge, scope="project", project_id=self.project_id, metadata=meta)
-                
-                # 同时记入事件流
-                append_event("system", "reflection", distilled_knowledge, project_id=self.project_id)
-                
-                logger.info("✨ [后台任务] 经验复盘与长时记忆写入完毕！")
-            except Exception as e:
-                logger.warning(f"✨ [后台任务] 经验复盘总结失败: {e}")
-                
-        # 抛入后台执行，不阻塞前台项目完成的 WebSocket
-        global_broadcaster.emit_sync("System", "info", "🧠 所有测试通过！大模型正在后台默默回溯思考，总结并打入长时记忆库...")
-        threading.Thread(target=_background_task, daemon=True).start()

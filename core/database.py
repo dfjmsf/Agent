@@ -8,9 +8,9 @@ import logging
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, event, Float
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean, event, Float
 from sqlalchemy.orm import declarative_base, sessionmaker, scoped_session
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, ARRAY as PG_ARRAY
 from pgvector.sqlalchemy import Vector
 from dotenv import load_dotenv
 
@@ -80,6 +80,22 @@ class ProjectMeta(Base):
     status = Column(String(50), default="in_progress")  # in_progress / success / failed
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class TaskTrajectory(Base):
+    """TDD 试错轨迹表 — 记录每次打回的代码快照和报错"""
+    __tablename__ = "astrea_task_trajectories"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_id = Column(String(200), nullable=False, index=True)
+    task_id = Column(String(100), nullable=False)
+    attempt_round = Column(Integer, default=0)
+    error_summary = Column(Text)
+    failed_code = Column(Text)
+    final_code = Column(Text, default=None)
+    recalled_memory_ids = Column(PG_ARRAY(Integer), default=[])
+    is_synthesized = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 # ============================================================
@@ -231,6 +247,81 @@ def upsert_file_tree(project_id: str, file_list: list):
     except Exception as e:
         session.rollback()
         logger.error(f"File Tree 写入失败: {e}")
+    finally:
+        ScopedSession.remove()
+
+
+# ============================================================
+# 5.5 轨迹表操作 (TDD 试错记录)
+# ============================================================
+
+def insert_trajectory(
+    project_id: str,
+    task_id: str,
+    attempt_round: int,
+    error_summary: str,
+    failed_code: str,
+    recalled_memory_ids: List[int] = None,
+):
+    """TDD 打回时写入一条试错轨迹（0 Token，纯静默 INSERT）。"""
+    logger.info(f"📝 轨迹记录写入中... [{project_id}/{task_id}] round={attempt_round}")
+    t0 = time.time()
+    session = ScopedSession()
+    try:
+        record = TaskTrajectory(
+            project_id=project_id,
+            task_id=task_id,
+            attempt_round=attempt_round,
+            error_summary=error_summary[:2000] if error_summary else None,
+            failed_code=failed_code[:5000] if failed_code else None,
+            recalled_memory_ids=recalled_memory_ids or [],
+        )
+        session.add(record)
+        session.commit()
+        elapsed = (time.time() - t0) * 1000
+        logger.info(f"✅ 轨迹记录写入完成 [{task_id}/round{attempt_round}] ({elapsed:.0f}ms)")
+    except Exception as e:
+        session.rollback()
+        logger.error(f"轨迹记录写入失败: {e}")
+    finally:
+        ScopedSession.remove()
+
+
+def finalize_trajectory(project_id: str, task_id: str, final_code: str):
+    """TDD 通过时，将最终成功代码回填到该 task 的轨迹中。"""
+    session = ScopedSession()
+    try:
+        session.query(TaskTrajectory).filter(
+            TaskTrajectory.project_id == project_id,
+            TaskTrajectory.task_id == task_id,
+        ).update({"final_code": final_code[:5000] if final_code else None})
+        session.commit()
+        logger.info(f"✅ 轨迹最终代码回填完成 [{task_id}]")
+    except Exception as e:
+        session.rollback()
+        logger.error(f"轨迹回填失败: {e}")
+    finally:
+        ScopedSession.remove()
+
+
+def get_recalled_memory_union(project_id: str, task_id: str) -> set:
+    """从轨迹表中捞出该 task 历次召回的所有记忆 ID，去重并集。"""
+    session = ScopedSession()
+    try:
+        from sqlalchemy import text as sql_text
+        sql = sql_text("""
+            SELECT DISTINCT UNNEST(recalled_memory_ids)
+            FROM astrea_task_trajectories
+            WHERE project_id = :pid AND task_id = :tid
+              AND recalled_memory_ids IS NOT NULL
+        """)
+        result = session.execute(sql, {"pid": project_id, "tid": task_id})
+        ids = {row[0] for row in result}
+        logger.info(f"🔗 轨迹记忆并集: [{task_id}] → {len(ids)} 条去重 IDs: {ids}")
+        return ids
+    except Exception as e:
+        logger.error(f"轨迹记忆并集查询失败: {e}")
+        return set()
     finally:
         ScopedSession.remove()
 

@@ -57,17 +57,8 @@ class ReviewerAgent:
         logger.info(f"🛡️ Reviewer 正在审查文件: {target_file}")
         global_broadcaster.emit_sync("Reviewer", "review_start", f"开始审查目标文件: {target_file}", {"target": target_file, "code": code_draft})
 
-        # 记忆注入（精简：删除 recall 全局经验，保留项目专属经验 + 文件树）
+        # 记忆注入（Reviewer 仅保留文件树，用于生成测试脚本时的 import 参考）
         memory_hint = ""
-
-        # 短期记忆 → 项目专属经验
-        experience_events = get_recent_events(
-            project_id=self.project_id, limit=3,
-            event_types=["experience_project"], caller="Reviewer"
-        )
-        if experience_events:
-            exp_hints = "\n".join([f"  {i+1}. {e.content[:200]}" for i, e in enumerate(experience_events)])
-            memory_hint += f"\n\n【📦 本项目最高优先级规则 (Project Experience - 必须绝对服从)】\n{exp_hints}"
 
         # 短期记忆 → 项目文件树
         file_tree_events = get_recent_events(
