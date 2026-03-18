@@ -119,7 +119,7 @@ class ManagerAgent:
         
         # 2. 查询长期经验记忆 (RAG)
         past_experience = recall(user_requirement, n_results=3, project_id=self.project_id, caller="Manager")
-        experience_str = "\n".join(past_experience) if past_experience else "无相关历史经验。"
+        experience_str = "\n".join([e["content"] for e in past_experience]) if past_experience else "无相关历史经验。"
 
         # 3. 构造环境变量声明
         is_new_project = "新建项目" in self.project_id or self.project_id == "default_project"

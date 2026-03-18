@@ -41,10 +41,10 @@ class CoderAgent:
         """构建长短期记忆提示，按 scope 分组注入"""
         memory_hint = ""
         
-        # 长期记忆 → 全局通用架构智慧（recall 现在只返回 global scope）
+        # 长期记忆 → 全局通用架构智慧（recall 返回 List[Dict]）
         past_tips = recall(f"{target_file} {description}", n_results=5, project_id=self.project_id, caller="Coder")
         if past_tips:
-            tips_str = "\n".join([f"  {i+1}. {tip}" for i, tip in enumerate(past_tips)])
+            tips_str = "\n".join([f"  {i+1}. {tip['content']}" for i, tip in enumerate(past_tips)])
             memory_hint = f"\n\n【🌍 全局通用架构智慧 (Global Experience)】\n{tips_str}"
         
         # 短期记忆 → 项目专属经验（必须绝对服从）

@@ -68,6 +68,14 @@ class Memory(Base):
     embedding = Column(Vector(EMBEDDING_DIM))
     metadata_ = Column("metadata", JSONB, default={})
     created_at = Column(DateTime, default=datetime.utcnow)
+    # --- 结构化字段 (v1.2.2) ---
+    tech_stacks = Column(PG_ARRAY(String), default=[])     # L0 硬过滤, GIN 索引
+    exp_type = Column(String(50), default="general")        # contrastive_pair / anti_pattern / general
+    scenario = Column(Text)                                 # 场景描述
+    # --- 动态追踪字段 (AMC 底座) ---
+    success_count = Column(Integer, default=0)              # S
+    usage_count = Column(Integer, default=0)                # U
+    last_used_round = Column(Integer, default=0)            # R_last
 
 
 class ProjectMeta(Base):
@@ -103,13 +111,38 @@ class TaskTrajectory(Base):
 # ============================================================
 
 def init_db():
-    """创建所有表 + pgvector 扩展 (幂等操作)"""
+    """创建所有表 + pgvector 扩展 + 列迁移 + GIN 索引 (全幂等)"""
     from sqlalchemy import text
     with engine.connect() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         conn.commit()
     Base.metadata.create_all(bind=engine)
-    logger.info("✅ PostgreSQL 数据库表初始化完毕")
+    
+    # v1.2.2 迁移: 为已有 memories 表添加新列 (幂等，列存在则跳过)
+    migrations = [
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS tech_stacks VARCHAR[] DEFAULT '{}'",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS exp_type VARCHAR(50) DEFAULT 'general'",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS scenario TEXT",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS success_count INTEGER DEFAULT 0",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS usage_count INTEGER DEFAULT 0",
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_used_round INTEGER DEFAULT 0",
+    ]
+    with engine.connect() as conn:
+        for sql in migrations:
+            try:
+                conn.execute(text(sql))
+            except Exception:
+                pass  # 列已存在，静默跳过
+        conn.commit()
+    
+    # GIN 索引: 支撑 tech_stacks 数组过滤
+    with engine.connect() as conn:
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_mem_tech_stacks 
+            ON memories USING GIN(tech_stacks)
+        """))
+        conn.commit()
+    logger.info("✅ 数据库初始化完成 (含 v1.2.2 迁移 + GIN 索引)")
 
 
 def check_health() -> bool:
@@ -334,16 +367,21 @@ def memorize(
     text: str,
     scope: str = "project",
     project_id: str = "global",
-    metadata: dict = None
+    metadata: dict = None,
+    tech_stacks: list = None,
+    exp_type: str = "general",
+    scenario: str = "",
 ):
     """
-    向量化一段经验/反思并存入长期记忆。
-    scope: 'global' (跨项目通用经验) | 'project' (项目专属经验)
+    向量化一段经验并存入长期记忆。
+    Embedding 提纯策略：仅对 scenario + content 做向量化，tech_stacks 标签不参与。
     """
     if not text or not text.strip():
         return
 
-    embedding = get_embedding(text)
+    # Embedding 提纯：scenario + content，排除技术栈标签
+    embed_text = f"{scenario}\n{text}" if scenario else text
+    embedding = get_embedding(embed_text)
     if not embedding:
         return
 
@@ -355,10 +393,13 @@ def memorize(
             content=text,
             embedding=embedding,
             metadata_=metadata or {},
+            tech_stacks=tech_stacks or [],
+            exp_type=exp_type,
+            scenario=scenario or None,
         )
         session.add(record)
         session.commit()
-        logger.info(f"✅ 长期记忆写入 ({scope}/{project_id}): '{text[:30]}...'")
+        logger.info(f"✅ 长期记忆写入 ({scope}/{project_id}): '{text[:30]}...' stacks={tech_stacks or []}")
     except Exception as e:
         session.rollback()
         logger.error(f"长期记忆写入失败: {e}")
@@ -477,21 +518,21 @@ def recall(
     project_id: str = "global",
     similarity_threshold: float = 0.6,
     caller: str = "Unknown"
-) -> List[str]:
+) -> List[Dict]:
     """
-    三阶段双路长期记忆召回：
+    三阶段双路长期记忆召回（返回 Dict 含 id 用于 Auditor 追踪）：
     1. pgvector 向量粗排 Top 15 (threshold≥0.6)
     2. BM25 关键词粗排 Top 15
-    3. 合并去重 → DashScope Rerank 精排 Top 5
+    3. 合并去重 → DashScope Rerank 精排 Top N
     
-    同时检索 global + project 范围。
+    返回: [{"id": 12, "content": "...", "similarity": 0.87}, ...]
     """
     COARSE_TOP_N = 15
     
     logger.info(f"🔍 [{caller}] 长期记忆召回中... query='{query[:50]}...' project={project_id}")
     t0 = time.time()
     
-    # === 路径 1: 向量粗排 ===
+    # === 路径 1: 向量粗排（返回 id + content + similarity） ===
     vector_results = []
     query_embedding = get_embedding(query)
     if query_embedding:
@@ -499,7 +540,7 @@ def recall(
         try:
             from sqlalchemy import text as sql_text
             sql = sql_text("""
-                SELECT content, 1 - (embedding <=> CAST(:qvec AS vector)) AS similarity
+                SELECT id, content, 1 - (embedding <=> CAST(:qvec AS vector)) AS similarity
                 FROM memories
                 WHERE (scope = 'global' OR (scope = 'project' AND project_id = :pid))
                   AND 1 - (embedding <=> CAST(:qvec AS vector)) >= :threshold
@@ -513,10 +554,10 @@ def recall(
                 "n": COARSE_TOP_N,
             })
             rows = list(result)
-            vector_results = [row[0] for row in rows]
+            vector_results = [{"id": row[0], "content": row[1], "similarity": float(row[2])} for row in rows]
             
             if rows:
-                sims = ', '.join([f"{row[1]:.3f}" for row in rows])
+                sims = ', '.join([f"{r['similarity']:.3f}" for r in vector_results])
                 logger.info(f"🔍 [{caller}] 向量粗排命中 {len(rows)} 条, 相似度=[{sims}]")
         except Exception as e:
             logger.error(f"向量粗排失败: {e}")
@@ -525,17 +566,18 @@ def recall(
     else:
         logger.warning(f"🔍 [{caller}] Embedding 失败，仅使用 BM25 路径")
     
-    # === 路径 2: BM25 粗排 ===
-    bm25_results = _bm25_search(query, project_id, top_n=COARSE_TOP_N)
+    # === 路径 2: BM25 粗排（无 id，设为 -1 占位） ===
+    bm25_raw = _bm25_search(query, project_id, top_n=COARSE_TOP_N)
+    bm25_results = [{"id": -1, "content": doc, "similarity": 0.0} for doc in bm25_raw]
     
     # === 合并去重 ===
     seen = set()
     merged = []
-    for doc in vector_results + bm25_results:
-        doc_key = doc.strip()[:100]  # 用前100字符做去重 key
+    for item in vector_results + bm25_results:
+        doc_key = item["content"].strip()[:100]
         if doc_key not in seen:
             seen.add(doc_key)
-            merged.append(doc)
+            merged.append(item)
     
     merge_elapsed = (time.time() - t0) * 1000
     logger.info(f"🔍 [{caller}] 双路合并: 向量{len(vector_results)} + BM25 {len(bm25_results)} → 去重后 {len(merged)} 条 ({merge_elapsed:.0f}ms)")
@@ -549,12 +591,25 @@ def recall(
         return merged
     
     # === Rerank 精排 ===
-    ranked = _rerank(query, merged, top_n=n_results)
+    rerank_docs = [item["content"] for item in merged]
+    ranked = _rerank(query, rerank_docs, top_n=n_results)
+    
+    # 将 Rerank 结果映射回 Dict（保留 id）
+    content_to_item = {item["content"].strip()[:100]: item for item in merged}
+    final_results = []
+    for r in ranked:
+        key = r["content"].strip()[:100]
+        original = content_to_item.get(key, {})
+        final_results.append({
+            "id": original.get("id", -1),
+            "content": r["content"],
+            "similarity": r["score"],
+        })
     
     total_elapsed = (time.time() - t0) * 1000
-    logger.info(f"🔍 [{caller}] 召回完成 ({total_elapsed:.0f}ms): 向量{len(vector_results)} + BM25 {len(bm25_results)} → 合并{len(merged)} → 精排{len(ranked)}")
+    logger.info(f"🔍 [{caller}] 召回完成 ({total_elapsed:.0f}ms): 向量{len(vector_results)} + BM25 {len(bm25_results)} → 合并{len(merged)} → 精排{len(final_results)}")
     
-    return [r["content"] for r in ranked]
+    return final_results
 
 
 

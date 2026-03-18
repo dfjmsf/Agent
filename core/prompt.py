@@ -328,13 +328,20 @@ Coder 刚刚写完了一份代码草案。你必须审查它。
 2. 格式：
 {{
   "scope": "global 或 project",
-  "experience": "提炼的经验（200字以内，使用 Contrastive Pair 对比格式：❌错误做法 → ✅正确做法）",
-  "tags": ["关键词1", "关键词2"]
+  "tech_stacks": ["Python", "FastAPI"],
+  "exp_type": "contrastive_pair",
+  "scenario": "一句话描述遇到的问题场景（如：FastAPI 路由注册后端口冲突）",
+  "content": "提炼的经验（200字以内，使用对比格式：❌错误做法 → ✅正确做法）"
 }}
-3. scope 判定规则：
-   - "global"：通用编程智慧，适用于任何项目（如：排序算法、API设计、异常处理等通用模式）
+3. 字段规则：
+   - tech_stacks: 涉及的技术栈数组（如 ["Python", "Flask", "SQLite"]）。跨技术栈的通用经验设为空数组 []
+   - exp_type: 固定填 "contrastive_pair"
+   - scenario: 纯自然语言描述遇到的场景/问题（禁止包含代码），20-50字
+   - content: 纯自然语言描述解决方案（禁止包含标签、技术栈名称前缀），50-200字
+4. scope 判定规则：
+   - "global"：通用编程智慧，适用于任何项目（排序算法、API设计、异常处理等）
    - "project"：仅与本项目相关的特殊规范或版本兼容问题
-4. 如果里程碑 A 和 C 完全相同（一次就通过），experience 写"一次通过，无踩坑经验"，scope 设为 "project"
+5. 如果里程碑 A 和 C 完全相同（一次就通过），content 写"一次通过，无踩坑经验"，scope 设为 "project"
 """
 
     SYNTHESIZER_FAILURE_SYSTEM = """你是一位资深开发经验提炼师（Synthesizer Agent）。
@@ -354,11 +361,18 @@ Coder 刚刚写完了一份代码草案。你必须审查它。
 2. 格式：
 {{
   "scope": "global 或 project",
-  "experience": "反模式警告（200字以内）：🚫 绝对不要这样做 → 描述失败的根本原因和死胡同路径",
-  "tags": ["关键词1", "关键词2"]
+  "tech_stacks": ["Python", "FastAPI"],
+  "exp_type": "anti_pattern",
+  "scenario": "一句话描述遇到的失败场景",
+  "content": "反模式警告（200字以内）：🚫 绝对不要这样做 → 描述失败的根本原因和死胡同路径"
 }}
-3. scope 判定规则：
-   - "global"：通用的反模式（如：死循环、无限递归、API 误用等）
-   - "project"：仅与本项目相关的问题（如：特定版本不兼容、项目专属配置冲突）
-4. 重点分析：为什么连续5次都无法修复？根因是什么？
+3. 字段规则（同上）：
+   - tech_stacks: 涉及的技术栈。通用反模式设为 []
+   - exp_type: 固定填 "anti_pattern"
+   - scenario / content: 纯自然语言，禁止标签
+4. scope 判定规则：
+   - "global"：通用反模式（死循环、无限递归、API误用等）
+   - "project"：仅与本项目相关的问题
+5. 重点分析：为什么连续5次都无法修复？根因是什么？
 """
+

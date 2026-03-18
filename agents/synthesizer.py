@@ -61,18 +61,21 @@ class SynthesizerAgent:
     def _write_experience(self, parsed: Dict[str, Any]):
         """
         将提炼的经验按 scope 写入不同存储：
-        - scope=global → 只写 memories 表（长期记忆）
-        - scope=project → 只写 session_events 表（短期记忆，与 project_id 共存亡）
+        - scope=global → memories 表（长期记忆）
+        - scope=project → session_events 表（短期记忆，与 project_id 共存亡）
         """
         scope = parsed.get("scope", "project")
-        experience = parsed.get("experience", "")
-        tags = parsed.get("tags", [])
+        # 兼容新旧格式：优先取 content，fallback 到旧 experience
+        content = parsed.get("content") or parsed.get("experience", "")
+        tech_stacks = parsed.get("tech_stacks", [])
+        exp_type = parsed.get("exp_type", "general")
+        scenario = parsed.get("scenario", "")
+        tags = parsed.get("tags", [])  # 旧格式兼容
         
-        if not experience or experience == "一次通过，无踩坑经验":
+        if not content or content == "一次通过，无踩坑经验":
             logger.info(f"📝 Synthesizer: 一次通过无经验可提炼，跳过写入")
             return
         
-        # 验证 scope 合法性
         if scope not in ("global", "project"):
             logger.warning(f"⚠️ Synthesizer scope 非法: '{scope}'，降级为 'project'")
             scope = "project"
@@ -81,20 +84,29 @@ class SynthesizerAgent:
             "source": "synthesizer",
             "tags": tags,
             "scope_reason": "llm_routing",
+            "exp_type": exp_type,
         }
         
         if scope == "global":
             # 全局经验 → 长期记忆（memories 表），跨项目永久保留
-            memorize(experience, scope="global", project_id=self.project_id, metadata=meta)
-            logger.info(f"📝 经验写入 [长期记忆/global]: '{experience[:50]}...' tags={tags}")
+            memorize(
+                text=content,
+                scope="global",
+                project_id=self.project_id,
+                metadata=meta,
+                tech_stacks=tech_stacks,
+                exp_type=exp_type,
+                scenario=scenario,
+            )
+            logger.info(f"📝 经验写入 [长期记忆/global]: '{content[:50]}...' stacks={tech_stacks}")
         else:
             # 项目经验 → 短期记忆（session_events 表），与 project_id 共存亡
             append_event(
                 "synthesizer", "experience_project",
-                experience, project_id=self.project_id,
+                content, project_id=self.project_id,
                 metadata=meta
             )
-            logger.info(f"📝 经验写入 [短期记忆/project]: '{experience[:50]}...' tags={tags}")
+            logger.info(f"📝 经验写入 [短期记忆/project]: '{content[:50]}...' stacks={tech_stacks}")
 
     def synthesize_success(
         self,
