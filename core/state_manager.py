@@ -227,6 +227,7 @@ class VirtualFileSystem:
 
     def _write_vfs_to_dir(self, dest_dir: str) -> None:
         """内部方法，调用方必须已持有 self._lock"""
+        created_dirs = set()
         for rel_path, content in self.vfs.items():
             clean_rel_path = rel_path.lstrip("/").lstrip("\\")
             abs_path = os.path.abspath(os.path.join(dest_dir, clean_rel_path))
@@ -235,9 +236,23 @@ class VirtualFileSystem:
                 logger.error(f"检测到非法路径跳跃，已拦截: {clean_rel_path}")
                 continue
 
-            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            parent_dir = os.path.dirname(abs_path)
+            os.makedirs(parent_dir, exist_ok=True)
+            created_dirs.add(parent_dir)
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(content)
+        
+        # 为所有创建的子目录自动生成 __init__.py（确保 Python 包可被 import）
+        abs_dest = os.path.abspath(dest_dir)
+        for d in created_dirs:
+            # 从该目录向上遍历到 dest_dir，沿途每层都补 __init__.py
+            current = d
+            while current != abs_dest and current.startswith(abs_dest):
+                init_file = os.path.join(current, "__init__.py")
+                if not os.path.exists(init_file):
+                    with open(init_file, "w", encoding="utf-8") as f:
+                        f.write("")
+                current = os.path.dirname(current)
 
 
 class StateManager:

@@ -89,9 +89,10 @@ class CoderAgent:
         system_content = Prompts.CODER_SYSTEM.format(
             target_file=target_file,
             description=description,
+            memory_hint=memory_hint,
             project_spec=project_spec,
             vfs_context=vfs_str
-        ) + memory_hint
+        )
         
         user_prompt = "请开始编写该文件的代码。只输出这一个文件的代码内容。"
 
@@ -185,9 +186,10 @@ class CoderAgent:
         system_content = Prompts.CODER_SYSTEM.format(
             target_file=target_file,
             description=description,
+            memory_hint=memory_hint,
             project_spec=project_spec,
             vfs_context=vfs_str
-        ) + memory_hint
+        )
 
         user_prompt = f"【🚨 紧急修复要求】你之前生成的代码被 Reviewer 测试出错了！\n以下是沙盒运行报错或审查人的建议：\n\n{feedback}\n\n请修复上述 bug，并重新输出该文件的完整纯净代码！不能偷懒只输出片段！"
 

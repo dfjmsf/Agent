@@ -23,6 +23,9 @@ workspace/_run_*.py
 output_project/
 projects/
 
+# Sandbox venv 隔离环境 (每项目独立，不追踪)
+sandboxes/
+
 # 上下文文件上传隔离沙盒
 uploads/
 

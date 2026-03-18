@@ -44,7 +44,14 @@ class Prompts:
   "tech_stack": ["技术1", "技术2"],
   "module_graph": "模块依赖描述（如 main.py → routes.py → models.py）",
   "api_contracts": [
-    {{"method": "POST", "path": "/api/xxx", "request": "字段描述", "response": "字段描述"}}
+    {{
+      "base_url": "http://localhost:端口号(禁止使用8000)",
+      "method": "GET",
+      "path": "/api/xxx",
+      "request_params": {{"param1": "type", "param2": "type"}},
+      "response_body": {{"field1": "type"}},
+      "response_example": "{{\\\"field1\\\": 123.45}}"
+    }}
   ],
   "data_models": [
     {{"name": "User", "fields": "id:int, username:str, email:str"}}
@@ -55,9 +62,10 @@ class Prompts:
 
 【规则】
 1. 输出必须是纯净 JSON，不带任何 Markdown 标记。
-2. api_contracts 仅在有 Web API 时填写，否则留空数组。
+2. api_contracts 仅在有 Web API 时填写，否则留空数组。前后端分离项目必须填写 base_url（含端口号），确保前端代码能正确请求后端。
 3. 对于简单单文件脚本，所有字段都应极简（如 tech_stack 只写 ["Python 3"]）。
 4. 总字数控制在 500 字以内，追求信息密度而非面面俱到。
+5. response_body 是接口返回的精确 JSON 结构，后端必须严格返回该结构，禁止自行添加 success/data/code 等包装层。response_example 是一个具体的返回值示例。
 """
 
     MANAGER_SPEC_UPDATE_SYSTEM = """你是一个世界顶级的架构师（Manager Agent）。
@@ -109,13 +117,16 @@ class Prompts:
 当前要求的文件名：{target_file}
 任务描述：{description}
 
-【项目规划书 — 全局架构契约（必须严格遵守）】
-{project_spec}
+【历史经验参考 — 仅供参考，与规划书冲突时以规划书为准】
+{memory_hint}
 
 【依赖文件代码 — 仅包含与当前任务直接相关的文件】
 {vfs_context}
 
-请直接、立刻输出该文件的最终绝对代码，不要说多余的解释。
+【项目规划书 — 全局架构契约（最高优先级，必须严格遵守，覆盖一切历史经验）】
+{project_spec}
+
+请严格按照项目规划书中的 api_contracts（含 base_url、端口号、路径）编写代码。直接、立刻输出该文件的最终绝对代码，不要说多余的解释。
 """
 
     # ----------------------------------------------------

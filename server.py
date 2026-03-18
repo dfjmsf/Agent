@@ -81,6 +81,11 @@ async def lifespan(app: FastAPI):
     else:
         logger.error("❌ PostgreSQL 连接失败！请确认 Docker 容器 astrea-pg 是否已启动")
 
+    # 启动时清理残留的 sandbox venv（上次删除失败的）
+    from tools.sandbox import sandbox_env
+    sandbox_env.venv_manager.cleanup_stale()
+    logger.info("🧹 Sandbox 残留清理完成")
+
     projects_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects")
     if not os.path.exists(projects_dir):
         os.makedirs(projects_dir)
