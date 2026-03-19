@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import logging
 import tempfile
+import threading
 from typing import Dict, Any, Optional, Set, List
 
 from core.state_manager import global_state_manager
@@ -284,6 +285,83 @@ class PythonSandbox:
     
     def __init__(self):
         self.venv_manager = SandboxVenvManager()
+        self._warmup_events: Dict[str, threading.Event] = {}
+    
+    def warm_up(self, project_id: str, tech_stacks: List[str]):
+        """
+        异步预热：创建 venv + 预装 tech_stack 依赖。
+        Manager 规划书完成后由后台线程调用。
+        """
+        event = threading.Event()
+        self._warmup_events[project_id] = event
+        
+        # 规划书 tech_stack → pip 包名 映射（规划书名称 ≠ import 名 ≠ pip 包名）
+        TECH_STACK_TO_PACKAGES = {
+            "fastapi": ["fastapi", "uvicorn"],
+            "flask": ["flask"],
+            "django": ["django"],
+            "express": [],  # Node.js，不走 pip
+            "sqlalchemy": ["sqlalchemy"],
+            "sqlite": [], "sqlite3": [],  # 标准库
+            "postgresql": ["psycopg2-binary"],
+            "mysql": ["pymysql"],
+            "mongodb": ["pymongo"],
+            "redis": ["redis"],
+            "pydantic": ["pydantic"],
+            "requests": ["requests"],
+            "httpx": ["httpx"],
+            "beautifulsoup": ["beautifulsoup4"],
+            "selenium": ["selenium"],
+            "pandas": ["pandas"],
+            "numpy": ["numpy"],
+            "matplotlib": ["matplotlib"],
+            "pillow": ["Pillow"],
+            "pytest": ["pytest"],
+            "jinja2": ["jinja2"],
+            "celery": ["celery"],
+            "websocket": ["websockets"],
+            "cors": [],  # 通常随 fastapi 安装
+        }
+        # 跳过的纯标识名（语言、前端技术等，不是 pip 包）
+        SKIP_NAMES = {'python', 'python3', 'html', 'css', 'javascript', 'js',
+                      'typescript', 'ts', 'sql', 'json', 'yaml', 'xml',
+                      'react', 'vue', 'angular', 'node', 'nodejs', 'npm'}
+        
+        try:
+            logger.info(f"🔥 Sandbox 预热启动: {project_id}, tech_stacks={tech_stacks}")
+            self.venv_manager.get_or_create_venv(project_id)
+            
+            packages_to_install = set()
+            for tech in tech_stacks:
+                key = tech.lower().strip()
+                if key in SKIP_NAMES:
+                    continue
+                if key in TECH_STACK_TO_PACKAGES:
+                    packages_to_install.update(TECH_STACK_TO_PACKAGES[key])
+                else:
+                    # fallback: 试试 IMPORT_TO_PACKAGE，再 fallback 到原名
+                    pkg = IMPORT_TO_PACKAGE.get(key, key)
+                    if pkg.lower() not in STDLIB_MODULES:
+                        packages_to_install.add(pkg)
+            
+            if packages_to_install:
+                logger.info(f"📦 预热安装: {packages_to_install}")
+            for pkg in packages_to_install:
+                self.venv_manager.install_package(project_id, pkg)
+            
+            logger.info(f"✅ Sandbox 预热完成: {project_id}")
+        except Exception as e:
+            logger.warning(f"⚠️ Sandbox 预热异常: {e}")
+        finally:
+            event.set()  # 无论成功失败都标记完成
+    
+    def wait_warmup(self, project_id: str, timeout: float = 120):
+        """等待预热完成（Reviewer 调用 execute_code 前自动调用）"""
+        event = self._warmup_events.get(project_id)
+        if event and not event.is_set():
+            logger.info(f"⏳ 等待 Sandbox 预热完成: {project_id}")
+            event.wait(timeout=timeout)
+            logger.info(f"✅ Sandbox 预热等待结束: {project_id}")
     
     def _truncate_output(self, text: str) -> str:
         """输出硬性截断，保留最后 N 个字符"""
@@ -376,7 +454,11 @@ class PythonSandbox:
         if not third_party:
             return
         
-        logger.info(f"📦 检测到第三方依赖: {third_party}")
+        # 过滤掉已缓存的包，减少日志噪音
+        cached = self.venv_manager._installed_cache.get(project_id, set())
+        new_deps = {imp for imp in third_party if IMPORT_TO_PACKAGE.get(imp, imp) not in cached}
+        if new_deps:
+            logger.info(f"📦 检测到第三方依赖: {new_deps}")
         
         for imp in third_party:
             # 查映射表，获取实际 pip 包名
@@ -386,10 +468,14 @@ class PythonSandbox:
     def execute_code(self, code_string: str, project_id: str, stdin_data: str = None) -> Dict[str, Any]:
         """
         核心执行方法：
-        1. 获取项目 sandbox venv
-        2. 自动安装依赖
-        3. 在阅后即焚临时目录中执行
+        1. 等待预热完成（如有）
+        2. 获取项目 sandbox venv
+        3. 自动安装依赖
+        4. 在阅后即焚临时目录中执行
         """
+        # 等待预热完成（如果 Manager 已触发异步预热）
+        self.wait_warmup(project_id)
+        
         vfs = global_state_manager.get_vfs(project_id)
         
         # 1. 获取 sandbox venv 的 python 路径

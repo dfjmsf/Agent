@@ -175,6 +175,13 @@ Coder 刚刚写完了一份代码草案。你必须审查它。
      except (PermissionError, OSError):
          pass  # Windows 文件锁，静默跳过
      ```
+5. 【路径断言规范】
+   沙盒中所有文件都在临时目录运行，绝对路径每次不同。断言路径时只检查相对特征：
+   ```
+   assert app.template_folder.endswith("frontend")
+   assert os.path.basename(db_path) == "data.db"
+   assert "src" in config_path
+   ```
 """
 
     REVIEWER_TOOL_SCHEMA = [
