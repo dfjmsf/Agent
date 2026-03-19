@@ -22,6 +22,7 @@ class CoderAgent:
     def __init__(self, project_id: str = "default_project"):
         self.model = os.getenv("MODEL_CODER", "qwen3-coder-plus")
         self.project_id = project_id
+        self._last_recalled_ids: List[int] = []  # 最近一次 recall 的记忆 IDs
 
     def _clean_markdown(self, raw_text: str) -> str:
         """
@@ -38,12 +39,15 @@ class CoderAgent:
         return "\n".join(lines).strip()
 
     def _build_memory_hint(self, target_file: str, description: str) -> str:
-        """构建长短期记忆提示，按 scope 分组注入"""
+        """构建长短期记忆提示，按 scope 分组注入。同时缓存 recalled IDs。"""
         memory_hint = ""
+        self._last_recalled_ids = []
         
         # 长期记忆 → 全局通用架构智慧（recall 返回 List[Dict]）
         past_tips = recall(f"{target_file} {description}", n_results=5, project_id=self.project_id, caller="Coder")
         if past_tips:
+            # 缓存 recalled IDs（过滤 id > 0 的有效 ID）
+            self._last_recalled_ids = [t["id"] for t in past_tips if t.get("id", -1) > 0]
             tips_str = "\n".join([f"  {i+1}. {tip['content']}" for i, tip in enumerate(past_tips)])
             memory_hint = f"\n\n【🌍 全局通用架构智慧 (Global Experience)】\n{tips_str}"
         

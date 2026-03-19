@@ -15,8 +15,11 @@ from core.database import (
     recall, upsert_file_tree,
     create_project_meta, update_project_status, rename_project_meta,
     insert_trajectory, finalize_trajectory,
+    get_recalled_memory_union, settle_memory_scores,
+    get_global_round, tick_global_round,
 )
 from agents.synthesizer import SynthesizerAgent
+from agents.auditor import AuditorAgent
 
 logger = logging.getLogger("ManagerAgent")
 
@@ -251,6 +254,7 @@ class ManagerAgent:
                 global_broadcaster.emit_sync("Manager", "task_retry", f"子任务 {task_id} 正在进行第 {current_retry} 次重试", {"attempt": current_retry})
             
             self.coder.generate_code(target_file, description, feedback, task_meta=task_meta)
+            recalled_ids = getattr(self.coder, '_last_recalled_ids', [])
             global_broadcaster.emit_sync("Manager", "vfs_update", f"VFS 文件树更新暂存目标: {target_file}", {"vfs": vfs.get_all_vfs()})
 
             # 获取 Coder 输出的代码
@@ -287,21 +291,25 @@ class ManagerAgent:
                 # 里程碑 C：最终通过的代码（"通关密码"）
                 milestones["c"] = code_draft
                 milestones["b"] = "\n".join(error_trail) if error_trail else "（一次通过，无报错记录）"
-                # 轨迹表：回填最终成功代码
+                # 轨迹表：写入成功轨迹（含 recalled IDs）+ 回填最终代码
+                insert_trajectory(
+                    project_id=self.project_id, task_id=task_id,
+                    attempt_round=current_retry, error_summary=None,
+                    failed_code=None, recalled_memory_ids=recalled_ids,
+                )
                 finalize_trajectory(self.project_id, task_id, code_draft)
-                logger.info(f"🎉 任务 [{task_id}] 审查通过！完全符合要求。")
+                logger.info(f"🎉 任务 [{task_id}] 审查通过！recalled_ids={recalled_ids}")
                 return True, milestones
             else:
                 # 里程碑 B：累积报错摘要
                 error_trail.append(f"尝试{current_retry + 1}: {reviewer_feedback[:200]}")
-                # 轨迹表：写入本轮失败快照（0 Token，静默 INSERT）
+                # 轨迹表：写入本轮失败快照 + 实际 recalled IDs
                 insert_trajectory(
-                    project_id=self.project_id,
-                    task_id=task_id,
+                    project_id=self.project_id, task_id=task_id,
                     attempt_round=current_retry,
                     error_summary=reviewer_feedback[:2000],
                     failed_code=code_draft,
-                    recalled_memory_ids=[],  # 阶段三接入 Auditor 后填入实际 IDs
+                    recalled_memory_ids=recalled_ids,
                 )
                 feedback = reviewer_feedback
                 vfs.increment_retry(task_id)
@@ -451,13 +459,50 @@ class ManagerAgent:
         logger.info(f"✨ 项目交付完成: {final_dir}")
         global_broadcaster.emit_sync("System", "success", f"✨ 项目完美生成！{final_dir}", {"final_path": final_dir})
 
-        # 后台异步提炼经验
-        global_broadcaster.emit_sync("System", "info", "🧠 所有测试通过！Synthesizer 正在提炼技术经验...")
-        def _bg_success():
-            for item in all_milestones:
-                if item["success"]:
-                    synthesizer.synthesize_success(item["milestones"], user_requirement, plan)
-            logger.info("✨ [后台任务] Synthesizer 知识提炼完毕！")
-        threading.Thread(target=_bg_success, daemon=True).start()
+        # 后台异步: Synthesizer 蒸馏 + Auditor 审计 + AMC 延迟结算
+        global_broadcaster.emit_sync("System", "info", "🧠 所有测试通过！正在执行经验提炼与 AMC 结算...")
+        task_ids = [t.get("task_id", "") for t in plan.get("tasks", [])]
+        project_id = self.project_id
+        def _bg_settlement():
+            try:
+                for item in all_milestones:
+                    if item["success"]:
+                        synthesizer.synthesize_success(item["milestones"], user_requirement, plan)
+                logger.info("✨ [后台] Synthesizer 知识提炼完毕")
+                all_memory_ids = set()
+                for tid in task_ids:
+                    all_memory_ids |= get_recalled_memory_union(project_id, tid)
+                if not all_memory_ids:
+                    logger.info("📋 [后台] 无召回记忆需要结算，跳过 Auditor")
+                    tick_global_round()
+                    return
+                auditor = AuditorAgent()
+                final_code = ""
+                for item in all_milestones:
+                    if item["success"] and item["milestones"].get("c"):
+                        final_code = item["milestones"]["c"]
+                memories_to_audit = [{"id": mid, "content": ""} for mid in all_memory_ids]
+                from core.database import ScopedSession, Memory
+                session = ScopedSession()
+                try:
+                    for m in memories_to_audit:
+                        if m["id"] > 0:
+                            row = session.query(Memory).filter(Memory.id == m["id"]).first()
+                            if row:
+                                m["content"] = row.content[:300]
+                finally:
+                    ScopedSession.remove()
+                audit_result = auditor.audit(final_code, memories_to_audit)
+                used_ids, ignored_ids = set(), set()
+                for r in audit_result.get("results", []):
+                    mid = r.get("memory_id", -1)
+                    if mid > 0:
+                        (used_ids if r.get("adopted") else ignored_ids).add(mid)
+                settle_memory_scores(used_ids, ignored_ids, get_global_round())
+                tick_global_round()
+                logger.info(f"✨ [后台] AMC 延迟结算完成: 功臣{len(used_ids)} 陪跑{len(ignored_ids)}")
+            except Exception as e:
+                logger.error(f"❌ [后台] 结算流程异常: {e}")
+        threading.Thread(target=_bg_settlement, daemon=True).start()
 
         return True, final_dir

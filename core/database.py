@@ -358,6 +358,117 @@ def get_recalled_memory_union(project_id: str, task_id: str) -> set:
     finally:
         ScopedSession.remove()
 
+# ============================================================
+# 5.6 AMC 评分 (ASTrea Memory Consolidation)
+# ============================================================
+
+import math
+
+def amc_score(s: int, u: int, delta_r: int, C: int = 5, k: float = 0.0005) -> float:
+    """
+    AMC 评分公式: ((s+C)/(u+2*C)) * log10(s+10) * exp(-k * delta_r)
+    - C: 系统容忍度(惯性)，防止首次评分过高/过低
+    - k: 时间衰减系数
+    - delta_r: 当前全局轮次 - 该记忆的 last_used_round
+    """
+    return ((s + C) / (u + 2 * C)) * math.log10(s + 10) * math.exp(-k * delta_r)
+
+
+# ============================================================
+# 5.7 全局逻辑时钟
+# ============================================================
+
+class GlobalRound(Base):
+    """全局逻辑时钟 — 仅 task 成功通过时 +1"""
+    __tablename__ = "astrea_global_round"
+    id = Column(Integer, primary_key=True, default=1)
+    current_round = Column(Integer, default=0)
+
+
+def get_global_round() -> int:
+    """获取当前全局轮次 R。"""
+    session = ScopedSession()
+    try:
+        row = session.query(GlobalRound).first()
+        if not row:
+            row = GlobalRound(id=1, current_round=0)
+            session.add(row)
+            session.commit()
+        return row.current_round
+    finally:
+        ScopedSession.remove()
+
+
+def tick_global_round() -> int:
+    """任务成功通过时推进全局轮次 R += 1。返回新的 R。"""
+    session = ScopedSession()
+    try:
+        row = session.query(GlobalRound).first()
+        if not row:
+            row = GlobalRound(id=1, current_round=0)
+            session.add(row)
+            session.flush()
+        row.current_round += 1
+        session.commit()
+        new_r = row.current_round
+        logger.info(f"⏰ 全局逻辑时钟推进: R = {new_r}")
+        return new_r
+    except Exception as e:
+        session.rollback()
+        logger.error(f"全局时钟推进失败: {e}")
+        return 0
+    finally:
+        ScopedSession.remove()
+
+
+# ============================================================
+# 5.8 Score 结算 (延迟结算模式)
+# ============================================================
+
+def settle_memory_scores(used_ids: set, ignored_ids: set, global_round: int):
+    """
+    终局大清算 — 原子更新所有涉及记忆的 S/U/R。
+    - 功臣(used): S+1, U+1, last_used_round=R
+    - 陪跑(ignored): U+1, last_used_round=R
+    """
+    if not used_ids and not ignored_ids:
+        return
+    
+    session = ScopedSession()
+    try:
+        from sqlalchemy import text as sql_text
+        
+        # 功臣: S+1, U+1
+        if used_ids:
+            ids_list = list(used_ids)
+            session.execute(sql_text("""
+                UPDATE memories 
+                SET success_count = success_count + 1,
+                    usage_count = usage_count + 1,
+                    last_used_round = :r
+                WHERE id = ANY(:ids)
+            """), {"r": global_round, "ids": ids_list})
+            logger.info(f"🏅 功臣结算: {ids_list} → S+1, U+1, R={global_round}")
+        
+        # 陪跑: U+1 only
+        if ignored_ids:
+            ids_list = list(ignored_ids)
+            session.execute(sql_text("""
+                UPDATE memories 
+                SET usage_count = usage_count + 1,
+                    last_used_round = :r
+                WHERE id = ANY(:ids)
+            """), {"r": global_round, "ids": ids_list})
+            logger.info(f"🚶 陪跑结算: {ids_list} → U+1, R={global_round}")
+        
+        session.commit()
+        logger.info(f"✅ AMC 结算完成: 功臣{len(used_ids)} + 陪跑{len(ignored_ids)}")
+    except Exception as e:
+        session.rollback()
+        logger.error(f"AMC 结算失败: {e}")
+    finally:
+        ScopedSession.remove()
+
 
 # ============================================================
 # 6. 长期记忆操作 (替代 memory.py)
@@ -462,10 +573,10 @@ def _rerank(query: str, documents: List[str], top_n: int = 5) -> List[dict]:
         return [{"content": doc, "score": 0.0} for doc in documents[:top_n]]
 
 
-def _bm25_search(query: str, project_id: str, top_n: int = 15) -> List[str]:
+def _bm25_search(query: str, project_id: str, top_n: int = 15) -> List[Dict]:
     """
     BM25 关键词粗排：从 memories 表全量加载后做 BM25 检索。
-    使用 jieba 分词处理中文。
+    返回 List[Dict] 含 id/content/s/u/r_last。
     """
     import jieba
     from rank_bm25 import BM25Okapi
@@ -475,19 +586,21 @@ def _bm25_search(query: str, project_id: str, top_n: int = 15) -> List[str]:
         from sqlalchemy import text as sql_text
         
         sql = sql_text("""
-            SELECT content FROM memories
+            SELECT id, content, success_count, usage_count, last_used_round
+            FROM memories
             WHERE (scope = 'global' OR (scope = 'project' AND project_id = :pid))
         """)
         result = session.execute(sql, {"pid": project_id})
-        all_docs = [row[0] for row in result if row[0]]
+        all_rows = [(row[0], row[1], row[2] or 0, row[3] or 0, row[4] or 0) for row in result if row[1]]
         
-        if not all_docs:
+        if not all_rows:
             return []
         
         t0 = time.time()
         
         # jieba 分词
-        tokenized_docs = [list(jieba.cut(doc)) for doc in all_docs]
+        all_contents = [r[1] for r in all_rows]
+        tokenized_docs = [list(jieba.cut(doc)) for doc in all_contents]
         tokenized_query = list(jieba.cut(query))
         
         # BM25 检索
@@ -495,16 +608,20 @@ def _bm25_search(query: str, project_id: str, top_n: int = 15) -> List[str]:
         scores = bm25.get_scores(tokenized_query)
         
         # 取 Top N（排除零分）
-        scored_docs = [(all_docs[i], scores[i]) for i in range(len(all_docs)) if scores[i] > 0]
-        scored_docs.sort(key=lambda x: x[1], reverse=True)
-        top_docs = scored_docs[:top_n]
+        scored = [(all_rows[i], scores[i]) for i in range(len(all_rows)) if scores[i] > 0]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top = scored[:top_n]
         
         elapsed = (time.time() - t0) * 1000
-        if top_docs:
-            bm25_scores = ', '.join([f"{s:.2f}" for _, s in top_docs[:5]])
-            logger.info(f"📊 BM25 粗排完成 ({elapsed:.0f}ms): {len(all_docs)}篇 → {len(top_docs)} 条, scores=[{bm25_scores}]")
+        if top:
+            bm25_scores = ', '.join([f"{s:.2f}" for _, s in top[:5]])
+            logger.info(f"📊 BM25 粗排完成 ({elapsed:.0f}ms): {len(all_rows)}篇 → {len(top)} 条, scores=[{bm25_scores}]")
         
-        return [doc for doc, _ in top_docs]
+        return [{
+            "id": row[0], "content": row[1],
+            "s": row[2], "u": row[3], "r_last": row[4],
+            "similarity": 0.0,
+        } for row, _ in top]
     except Exception as e:
         logger.warning(f"⚠️ BM25 检索失败: {e}")
         return []
@@ -512,35 +629,58 @@ def _bm25_search(query: str, project_id: str, top_n: int = 15) -> List[str]:
         ScopedSession.remove()
 
 
-def recall(
-    query: str,
-    n_results: int = 5,
-    project_id: str = "global",
-    similarity_threshold: float = 0.6,
-    caller: str = "Unknown"
+def _vector_search_with_filter(
+    query_embedding, project_id: str, top_n: int,
+    similarity_threshold: float, tech_stacks_filter: list = None,
+    universal_only: bool = False
 ) -> List[Dict]:
     """
-    三阶段双路长期记忆召回（返回 Dict 含 id 用于 Auditor 追踪）：
-    1. pgvector 向量粗排 Top 15 (threshold≥0.6)
-    2. BM25 关键词粗排 Top 15
-    3. 合并去重 → DashScope Rerank 精排 Top N
-    
-    返回: [{"id": 12, "content": "...", "similarity": 0.87}, ...]
+    pgvector 向量粗排（内部方法）。
+    - tech_stacks_filter: 主管线按技术栈过滤
+    - universal_only: 副管线只捞通用经验 (tech_stacks = '{}')
     """
-    COARSE_TOP_N = 15
-    
-    logger.info(f"🔍 [{caller}] 长期记忆召回中... query='{query[:50]}...' project={project_id}")
-    t0 = time.time()
-    
-    # === 路径 1: 向量粗排（返回 id + content + similarity） ===
-    vector_results = []
-    query_embedding = get_embedding(query)
-    if query_embedding:
-        session = ScopedSession()
-        try:
-            from sqlalchemy import text as sql_text
+    session = ScopedSession()
+    try:
+        from sqlalchemy import text as sql_text
+        
+        if universal_only:
+            # 副管线: 只捞 tech_stacks 为空数组的通用经验
             sql = sql_text("""
-                SELECT id, content, 1 - (embedding <=> CAST(:qvec AS vector)) AS similarity
+                SELECT id, content, success_count, usage_count, last_used_round,
+                       1 - (embedding <=> CAST(:qvec AS vector)) AS similarity
+                FROM memories
+                WHERE (scope = 'global' OR (scope = 'project' AND project_id = :pid))
+                  AND (tech_stacks = '{}' OR tech_stacks IS NULL)
+                  AND 1 - (embedding <=> CAST(:qvec AS vector)) >= :threshold
+                ORDER BY embedding <=> CAST(:qvec AS vector)
+                LIMIT :n
+            """)
+            result = session.execute(sql, {
+                "qvec": str(query_embedding), "pid": project_id,
+                "threshold": similarity_threshold, "n": top_n,
+            })
+        elif tech_stacks_filter:
+            # 主管线: 按 tech_stacks 过滤 + 通用经验
+            sql = sql_text("""
+                SELECT id, content, success_count, usage_count, last_used_round,
+                       1 - (embedding <=> CAST(:qvec AS vector)) AS similarity
+                FROM memories
+                WHERE (scope = 'global' OR (scope = 'project' AND project_id = :pid))
+                  AND (tech_stacks && CAST(:stacks AS VARCHAR[]) OR tech_stacks = '{}' OR tech_stacks IS NULL)
+                  AND 1 - (embedding <=> CAST(:qvec AS vector)) >= :threshold
+                ORDER BY embedding <=> CAST(:qvec AS vector)
+                LIMIT :n
+            """)
+            result = session.execute(sql, {
+                "qvec": str(query_embedding), "pid": project_id,
+                "stacks": "{" + ",".join(tech_stacks_filter) + "}",
+                "threshold": similarity_threshold, "n": top_n,
+            })
+        else:
+            # 无过滤: 全量
+            sql = sql_text("""
+                SELECT id, content, success_count, usage_count, last_used_round,
+                       1 - (embedding <=> CAST(:qvec AS vector)) AS similarity
                 FROM memories
                 WHERE (scope = 'global' OR (scope = 'project' AND project_id = :pid))
                   AND 1 - (embedding <=> CAST(:qvec AS vector)) >= :threshold
@@ -548,68 +688,199 @@ def recall(
                 LIMIT :n
             """)
             result = session.execute(sql, {
-                "qvec": str(query_embedding),
-                "pid": project_id,
-                "threshold": similarity_threshold,
-                "n": COARSE_TOP_N,
+                "qvec": str(query_embedding), "pid": project_id,
+                "threshold": similarity_threshold, "n": top_n,
             })
-            rows = list(result)
-            vector_results = [{"id": row[0], "content": row[1], "similarity": float(row[2])} for row in rows]
-            
-            if rows:
-                sims = ', '.join([f"{r['similarity']:.3f}" for r in vector_results])
-                logger.info(f"🔍 [{caller}] 向量粗排命中 {len(rows)} 条, 相似度=[{sims}]")
-        except Exception as e:
-            logger.error(f"向量粗排失败: {e}")
-        finally:
-            ScopedSession.remove()
-    else:
-        logger.warning(f"🔍 [{caller}] Embedding 失败，仅使用 BM25 路径")
+        
+        rows = list(result)
+        return [{
+            "id": row[0], "content": row[1],
+            "s": row[2] or 0, "u": row[3] or 0, "r_last": row[4] or 0,
+            "similarity": float(row[5]),
+        } for row in rows]
+    except Exception as e:
+        logger.error(f"向量检索失败: {e}")
+        return []
+    finally:
+        ScopedSession.remove()
+
+
+def _apply_amc_and_fuse(items: List[Dict], global_r: int, alpha: float = 0.7) -> List[Dict]:
+    """
+    L3+L4: 对一批候选记忆计算 AMC 分数 → 归一化 → 加权融合排序。
+    Final_Score = α * sim_norm + (1-α) * score_norm
+    """
+    if not items:
+        return []
     
-    # === 路径 2: BM25 粗排（无 id，设为 -1 占位） ===
-    bm25_raw = _bm25_search(query, project_id, top_n=COARSE_TOP_N)
-    bm25_results = [{"id": -1, "content": doc, "similarity": 0.0} for doc in bm25_raw]
+    # L3: 计算 AMC score
+    for item in items:
+        delta_r = global_r - item.get("r_last", 0)
+        item["amc"] = amc_score(item.get("s", 0), item.get("u", 0), delta_r)
     
-    # === 合并去重 ===
+    # 归一化 similarity
+    sims = [item["similarity"] for item in items]
+    sim_min, sim_max = min(sims), max(sims)
+    for item in items:
+        item["sim_norm"] = (item["similarity"] - sim_min) / (sim_max - sim_min) if sim_max > sim_min else 0.5
+    
+    # 归一化 AMC score
+    amcs = [item["amc"] for item in items]
+    amc_min, amc_max = min(amcs), max(amcs)
+    for item in items:
+        item["score_norm"] = (item["amc"] - amc_min) / (amc_max - amc_min) if amc_max > amc_min else 0.5
+    
+    # L4: 加权融合
+    for item in items:
+        item["final_score"] = alpha * item["sim_norm"] + (1 - alpha) * item["score_norm"]
+    
+    items.sort(key=lambda x: x["final_score"], reverse=True)
+    return items
+
+
+def _run_main_pipeline(
+    query: str, query_embedding, project_id: str, 
+    tech_stacks: list, top_n: int, similarity_threshold: float,
+    global_r: int, caller: str
+) -> List[Dict]:
+    """主管线: L0→L1(双路)→L2(Rerank)→L3(AMC)→L4(融合)→Top N"""
+    t0 = time.time()
+    
+    # L0+L1: pgvector
+    vector_results = _vector_search_with_filter(
+        query_embedding, project_id, top_n=15,
+        similarity_threshold=similarity_threshold,
+        tech_stacks_filter=tech_stacks if tech_stacks else None,
+    )
+    
+    # L1: BM25 (已返回 List[Dict] 含 id)
+    bm25_results = _bm25_search(query, project_id, top_n=15)
+    
+    # 合并去重
     seen = set()
     merged = []
     for item in vector_results + bm25_results:
-        doc_key = item["content"].strip()[:100]
-        if doc_key not in seen:
-            seen.add(doc_key)
+        key = item["content"].strip()[:100]
+        if key not in seen:
+            seen.add(key)
             merged.append(item)
-    
-    merge_elapsed = (time.time() - t0) * 1000
-    logger.info(f"🔍 [{caller}] 双路合并: 向量{len(vector_results)} + BM25 {len(bm25_results)} → 去重后 {len(merged)} 条 ({merge_elapsed:.0f}ms)")
     
     if not merged:
         return []
     
-    # 如果合并结果 ≤ n_results，直接返回
-    if len(merged) <= n_results:
-        logger.info(f"🔍 [{caller}] 合并结果 ≤ {n_results} 条，跳过 Rerank")
-        return merged
+    logger.info(f"🔍 [{caller}] 主管线 L1: 向量{len(vector_results)} + BM25{len(bm25_results)} → {len(merged)}")
     
-    # === Rerank 精排 ===
-    rerank_docs = [item["content"] for item in merged]
-    ranked = _rerank(query, rerank_docs, top_n=n_results)
+    # L2: Rerank (缩至 Top 10)
+    if len(merged) > 10:
+        rerank_docs = [item["content"] for item in merged]
+        ranked = _rerank(query, rerank_docs, top_n=10)
+        content_map = {item["content"].strip()[:100]: item for item in merged}
+        reranked = []
+        for r in ranked:
+            key = r["content"].strip()[:100]
+            original = content_map.get(key, {"id": -1, "s": 0, "u": 0, "r_last": 0})
+            reranked.append({**original, "content": r["content"], "similarity": r["score"]})
+        merged = reranked
     
-    # 将 Rerank 结果映射回 Dict（保留 id）
-    content_to_item = {item["content"].strip()[:100]: item for item in merged}
-    final_results = []
-    for r in ranked:
-        key = r["content"].strip()[:100]
-        original = content_to_item.get(key, {})
-        final_results.append({
-            "id": original.get("id", -1),
-            "content": r["content"],
-            "similarity": r["score"],
+    # L3+L4: AMC + 融合
+    fused = _apply_amc_and_fuse(merged, global_r)
+    
+    elapsed = (time.time() - t0) * 1000
+    logger.info(f"🔍 [{caller}] 主管线完成 ({elapsed:.0f}ms) → Top {min(top_n, len(fused))}")
+    
+    return fused[:top_n]
+
+
+def _run_universal_pipeline(
+    query: str, query_embedding, project_id: str,
+    similarity_threshold: float, global_r: int, caller: str
+) -> Optional[Dict]:
+    """副管线: L0(通用)→L1(pgvector)→L3(AMC)→L4→Top 1 (跳过 Rerank)"""
+    t0 = time.time()
+    
+    vector_results = _vector_search_with_filter(
+        query_embedding, project_id, top_n=3,
+        similarity_threshold=similarity_threshold,
+        universal_only=True,
+    )
+    
+    if not vector_results:
+        return None
+    
+    fused = _apply_amc_and_fuse(vector_results, global_r)
+    
+    elapsed = (time.time() - t0) * 1000
+    logger.info(f"🔍 [{caller}] 副管线(通用) ({elapsed:.0f}ms) → Top 1")
+    
+    return fused[0] if fused else None
+
+
+def recall(
+    query: str,
+    n_results: int = 3,
+    project_id: str = "global",
+    similarity_threshold: float = 0.6,
+    caller: str = "Unknown",
+    tech_stacks: list = None,
+) -> List[Dict]:
+    """
+    四段式双管线长期记忆召回 (v1.2.2):
+    
+    主管线: L0 tech_stacks → L1 pgvector+BM25 → L2 Rerank → L3 AMC → L4 融合 → Top 3
+    副管线: L0 universal  → L1 pgvector       → L3 AMC    → L4      → Top 1
+    合并去重 → 3~4 条
+    
+    返回: [{"id": 12, "content": "...", "similarity": 0.87}, ...]
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    logger.info(f"🔍 [{caller}] 四段式召回启动... query='{query[:50]}...' stacks={tech_stacks}")
+    t0 = time.time()
+    
+    query_embedding = get_embedding(query)
+    if not query_embedding:
+        logger.warning(f"🔍 [{caller}] Embedding 失败，返回空")
+        return []
+    
+    global_r = get_global_round()
+    
+    # 双管线并行
+    main_result = []
+    univ_result = None
+    
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future_main = executor.submit(
+            _run_main_pipeline, query, query_embedding, project_id,
+            tech_stacks or [], n_results, similarity_threshold, global_r, caller
+        )
+        future_univ = executor.submit(
+            _run_universal_pipeline, query, query_embedding, project_id,
+            similarity_threshold, global_r, caller
+        )
+        
+        main_result = future_main.result()
+        univ_result = future_univ.result()
+    
+    # 合并去重
+    main_ids = {item["id"] for item in main_result}
+    if univ_result and univ_result["id"] not in main_ids:
+        main_result.append(univ_result)
+        logger.info(f"🔍 [{caller}] 通用经验保底席位生效: id={univ_result['id']}")
+    
+    # 清理内部计算字段，返回干净 Dict
+    final = []
+    for item in main_result:
+        final.append({
+            "id": item.get("id", -1),
+            "content": item.get("content", ""),
+            "similarity": item.get("similarity", 0.0),
         })
     
     total_elapsed = (time.time() - t0) * 1000
-    logger.info(f"🔍 [{caller}] 召回完成 ({total_elapsed:.0f}ms): 向量{len(vector_results)} + BM25 {len(bm25_results)} → 合并{len(merged)} → 精排{len(final_results)}")
+    ids_str = [f"id={r['id']}" for r in final]
+    logger.info(f"🔍 [{caller}] 四段式召回完成 ({total_elapsed:.0f}ms): {len(final)} 条 {ids_str}")
     
-    return final_results
+    return final
 
 
 
