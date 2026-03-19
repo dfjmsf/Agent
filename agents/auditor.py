@@ -56,6 +56,10 @@ class AuditorAgent:
             
             adopted_count = sum(1 for r in parsed["results"] if r["adopted"])
             logger.info(f"📋 Auditor 审计完成: {adopted_count}/{len(memories)} 条被采用")
+            
+            # 列出每条记忆的当前 AMC 分数
+            self._log_memory_scores(parsed, memories)
+            
             return parsed
             
         except Exception as e:
@@ -65,6 +69,44 @@ class AuditorAgent:
                 {"memory_id": m["id"], "adopted": True, "confidence": 0.5, "evidence": "审计异常，保守通过"}
                 for m in memories
             ]}
+    
+    def _log_memory_scores(self, audit_result: Dict, memories: List[Dict]):
+        """审计后列出每条记忆的当前 AMC 分数。"""
+        try:
+            from core.database import ScopedSession, Memory, amc_score, get_global_round
+            session = ScopedSession()
+            global_r = get_global_round()
+            
+            lines = []
+            result_map = {r["memory_id"]: r for r in audit_result.get("results", [])}
+            
+            for m in memories:
+                mid = m.get("id", -1)
+                if mid <= 0:
+                    continue
+                row = session.query(Memory).filter(Memory.id == mid).first()
+                if not row:
+                    continue
+                s = row.success_count or 0
+                u = row.usage_count or 0
+                r_last = row.last_used_round or 0
+                delta_r = global_r - r_last
+                score = amc_score(s, u, delta_r)
+                
+                audit_info = result_map.get(mid, {})
+                adopted = "✅功臣" if audit_info.get("adopted") else "🚶陪跑"
+                conf = audit_info.get("confidence", 0)
+                
+                lines.append(
+                    f"    [id={mid:>3d}] AMC={score:.4f} | S={s} U={u} ΔR={delta_r} | {adopted} (conf={conf:.2f}) | {(row.content or '')[:60]}"
+                )
+            
+            ScopedSession.remove()
+            
+            if lines:
+                logger.info("📊 记忆 AMC 分数明细:\n" + "\n".join(lines))
+        except Exception as e:
+            logger.warning(f"⚠️ AMC 分数日志失败: {e}")
     
     def _parse_response(self, raw: str, memories: List[Dict]) -> Dict:
         """解析 LLM 输出的 JSON，做容错处理。"""

@@ -78,6 +78,35 @@ async def lifespan(app: FastAPI):
     if check_health():
         init_db()
         logger.info("✅ PostgreSQL 连接正常，数据表已就绪")
+        # 列出所有表及大小
+        try:
+            from core.database import engine
+            from sqlalchemy import text
+            with engine.connect() as conn:
+                rows = conn.execute(text("""
+                    SELECT c.relname AS table_name,
+                           pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size,
+                           COALESCE(obj_description(c.oid), '') AS comment
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'public' AND c.relkind = 'r'
+                    ORDER BY pg_total_relation_size(c.oid) DESC
+                """)).fetchall()
+            TABLE_COMMENTS = {
+                "memories": "长期记忆库 (AMC评分)",
+                "session_events": "短期记忆/会话事件",
+                "astrea_task_trajectories": "TDD轨迹表",
+                "astrea_global_round": "全局逻辑时钟",
+                "project_meta": "项目元数据",
+            }
+            table_lines = []
+            for r in rows:
+                name, size = r[0], r[1]
+                desc = TABLE_COMMENTS.get(name, r[2] or "—")
+                table_lines.append(f"    📦 {name:<30s} {size:>10s}  | {desc}")
+            logger.info("📊 当前数据库表清单:\n" + "\n".join(table_lines))
+        except Exception as e:
+            logger.warning(f"⚠️ 表清单获取失败: {e}")
     else:
         logger.error("❌ PostgreSQL 连接失败！请确认 Docker 容器 astrea-pg 是否已启动")
 

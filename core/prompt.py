@@ -390,27 +390,33 @@ Coder 刚刚写完了一份代码草案。你必须审查它。
 
 【强制输出规则】
 1. 输出必须是纯净 JSON，不带任何 markdown 标记
-2. 格式：
+2. 格式（注意字段顺序：先找证据 → 再评置信度 → 最后下结论）：
 {{
   "results": [
     {{
       "memory_id": 12,
-      "adopted": true,
+      "evidence": "代码第15行使用了记忆建议的 try-except 异常捕获模式",
       "confidence": 0.9,
-      "evidence": "代码第15行使用了记忆建议的 try-except 异常捕获模式"
+      "adopted": true
     }},
     {{
       "memory_id": 7,
-      "adopted": false,
+      "evidence": "代码未涉及记忆提到的数据库连接池优化",
       "confidence": 0.85,
-      "evidence": "代码未涉及记忆提到的数据库连接池优化"
+      "adopted": false
     }}
   ]
 }}
 3. 审计标准（必须严格遵守）：
-   - adopted=true 仅当代码中存在可追溯的具体证据（行号、模式、结构）
+   - 先寻找 evidence（代码行号、模式、结构），再根据证据评估 confidence，最后判定 adopted
+   - adopted=true 仅当代码中存在可追溯的具体证据
    - 仅仅是"主题相关"不算采用
    - confidence 表示你对判断的置信度 (0.0~1.0)
    - evidence 必须引用代码中的具体位置或模式
-4. 每条记忆都必须出现在 results 中，不可遗漏
+4. 避坑类经验（Anti-pattern）的特殊判定：
+   - 若记忆内容以"❌"开头或包含"→ ✅"格式，说明这是一条"避坑经验"
+   - 避坑经验的 adopted=true 条件：代码**成功规避**了记忆描述的反模式，或**采用了**记忆推荐的正确做法
+   - 举例：记忆说"❌直接用 eval() → ✅用 ast.literal_eval()"，代码中使用了 ast.literal_eval()，则 adopted=true
+   - 若代码中完全没涉及该避坑场景（既没踩坑也没规避），则 adopted=false
+5. 每条记忆都必须出现在 results 中，不可遗漏
 """
