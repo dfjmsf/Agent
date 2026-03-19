@@ -7,7 +7,7 @@ from core.llm_client import default_llm
 from core.prompt import Prompts
 from core.state_manager import global_state_manager
 from core.ws_broadcaster import global_broadcaster
-from core.database import recall, get_recent_events
+from core.database import recall, get_recent_events, recall_project_experience
 
 logger = logging.getLogger("CoderAgent")
 
@@ -51,14 +51,23 @@ class CoderAgent:
             tips_str = "\n".join([f"  {i+1}. {tip['content']}" for i, tip in enumerate(past_tips)])
             memory_hint = f"\n\n【🌍 全局通用架构智慧 (Global Experience)】\n{tips_str}"
         
-        # 短期记忆 → 项目专属经验（必须绝对服从）
-        experience_events = get_recent_events(
-            project_id=self.project_id, limit=3,
-            event_types=["experience_project"], caller="Coder"
+        # 短期记忆 → 项目专属经验（轻量 RAG 语义召回）
+        exp_contents = recall_project_experience(
+            query=f"{target_file} {description}",
+            project_id=self.project_id, limit=3, caller="Coder"
         )
-        if experience_events:
-            exp_hints = "\n".join([f"  {i+1}. {e.content[:200]}" for i, e in enumerate(experience_events)])
+        if exp_contents:
+            exp_hints = "\n".join([f"  {i+1}. {c[:200]}" for i, c in enumerate(exp_contents)])
             memory_hint += f"\n\n【📦 本项目最高优先级规则 (Project Experience - 必须绝对服从)】\n{exp_hints}"
+        
+        # 短期记忆 → 滑动窗口：最近 3 轮 TDD 上下文（避免重蹈覆辙）
+        tdd_events = get_recent_events(
+            project_id=self.project_id, limit=3,
+            event_types=["round_pass", "round_fail"], caller="Coder"
+        )
+        if tdd_events:
+            tdd_hints = "\n".join([f"  {e.content[:500]}" for e in tdd_events])
+            memory_hint += f"\n\n【🔄 最近 TDD 轮次记录（你的近期尝试，务必避免重复犯错）】\n{tdd_hints}"
         
         # 短期记忆 → 项目文件树
         file_tree_events = get_recent_events(

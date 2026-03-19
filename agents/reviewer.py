@@ -86,10 +86,19 @@ class ReviewerAgent:
         messages.append(response_msg) # 把 AI 的回复原样加进历史
 
         # 如果大模型乖乖调用了沙盒
+        sandbox_failed = False  # 退出码硬判标志
         if hasattr(response_msg, "tool_calls") and response_msg.tool_calls:
             for tool_call in response_msg.tool_calls:
                 if tool_call.function.name == "sandbox_execute":
                     tool_result_str = self._execute_sandbox_tool(tool_call)
+                    
+                    # 记录沙盒退出码，用于后续硬判
+                    try:
+                        _result = json.loads(tool_result_str)
+                        if _result.get("returncode", -1) != 0:
+                            sandbox_failed = True
+                    except (json.JSONDecodeError, TypeError):
+                        sandbox_failed = True
                     
                     # 将沙盒结果附加到消息流中
                     messages.append({
@@ -127,6 +136,13 @@ class ReviewerAgent:
             feedback = report_dict.get("feedback", report_text)
             
             is_pass = (status.upper() == "PASS")
+            
+            # 硬判：沙盒退出码非零时，强制覆盖 LLM 的 PASS 为 FAIL
+            if sandbox_failed and is_pass:
+                logger.warning("⚠️ 沙盒退出码非零但 LLM 判定 PASS → 强制覆盖为 FAIL（禁止放水）")
+                is_pass = False
+                feedback = f"[系统强制驳回] 沙盒测试退出码非零，LLM 不得放水。\n原始反馈: {feedback}"
+            
             if is_pass:
                 logger.info(f"✅ Reviewer 盖章通过！")
                 global_broadcaster.emit_sync("Reviewer", "review_pass", "审查通过！", {"feedback": feedback})

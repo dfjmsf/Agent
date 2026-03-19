@@ -100,13 +100,16 @@ class SynthesizerAgent:
             )
             logger.info(f"📝 经验写入 [长期记忆/global]: '{content[:50]}...' stacks={tech_stacks}")
         else:
-            # 项目经验 → 短期记忆（session_events 表），与 project_id 共存亡
+            # 项目经验 → 短期记忆（session_events 表），带 embedding 支持轻量 RAG
+            from core.database import get_embedding
+            exp_embedding = get_embedding(content)
             append_event(
                 "synthesizer", "experience_project",
                 content, project_id=self.project_id,
-                metadata=meta
+                metadata=meta,
+                embedding=exp_embedding,
             )
-            logger.info(f"📝 经验写入 [短期记忆/project]: '{content[:50]}...' stacks={tech_stacks}")
+            logger.info(f"📝 经验写入 [短期记忆/project +vec]: '{content[:50]}...' stacks={tech_stacks}")
 
     def synthesize_success(
         self,

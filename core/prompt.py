@@ -112,6 +112,11 @@ class Prompts:
    ```
 5. 你的输出必须是一个纯净的代码文件文本（绝对禁止在两端使用 ```python 或 ``` 标记），你的输出将直接作为 .py 源文件被沙盒运行！如果带有 markdown 标签将导致立刻报错！
 6. 必须引用所有需要的依赖，确保上下文独立运行无缺漏。
+7. 【Windows 资源管理铁律】
+   本系统运行在 Windows 上，文件句柄未释放会导致 PermissionError 文件锁：
+   - 涉及文件操作（open/sqlite3/shelve/dbm）时，必须使用 `with` 语句或在 finally 中显式 `close()`。
+   - SQLite 连接必须在使用完毕后显式关闭（`conn.close()`），不能依赖垃圾回收。
+   - 禁止在函数中打开文件句柄却不关闭就 return。
 
 【输入变量注入】
 当前要求的文件名：{target_file}
@@ -150,6 +155,26 @@ Coder 刚刚写完了一份代码草案。你必须审查它。
    - 绝对禁止在测试脚本中调用 `main()` 函数！绝对禁止运行含有 `input()` 的入口代码！
    - 沙盒环境没有 stdin 输入，任何触发 `input()` 的调用都会导致 EOFError 崩溃！
    - 如果被测文件是一个纯入口脚本（例如只有 `if __name__` 块），请只做语法检查（`compile()`），不要尝试执行。
+   - 【异步函数测试】如果被测函数是 `async def`（常见于 FastAPI 路由），测试时必须用 `asyncio.run()` 调用，禁止直接调用！
+     直接调用 async 函数只会返回 coroutine 对象而非实际结果。示例:
+     ```
+     import asyncio
+     result = asyncio.run(get_notes())   # ✅ 正确
+     result = get_notes()                # ❌ 返回 coroutine，不是结果！
+     ```
+4. 【Windows 文件锁安全规范】
+   本系统运行在 Windows 上，文件锁机制严格：
+   - 测试中若创建了数据库连接（SQLite/其他），必须在 cleanup 前显式关闭连接（`conn.close()`）。
+   - 测试脚本的 cleanup 阶段（`os.remove()`、`os.unlink()`、`shutil.rmtree()`）必须用 `try/except (PermissionError, OSError)` 包裹，禁止裸调用。
+   - 临时文件优先使用 `tempfile.NamedTemporaryFile(delete=False)` + 手动清理，或用 `atexit` 延迟清理。
+   - 示例:
+     ```
+     conn.close()  # 必须先关闭！
+     try:
+         os.remove(db_path)
+     except (PermissionError, OSError):
+         pass  # Windows 文件锁，静默跳过
+     ```
 """
 
     REVIEWER_TOOL_SCHEMA = [

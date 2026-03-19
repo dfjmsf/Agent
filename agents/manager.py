@@ -425,6 +425,23 @@ class ManagerAgent:
         all_milestones = []  # 收集所有任务的里程碑
         synthesizer = SynthesizerAgent(project_id=self.project_id)
 
+        # 软删除该 project 的旧轨迹记录（标记 is_synthesized=True），确保本次审计范围干净
+        from core.database import TaskTrajectory
+        from core.database import ScopedSession as _SS
+        _session = _SS()
+        try:
+            staled = _session.query(TaskTrajectory).filter(
+                TaskTrajectory.project_id == self.project_id,
+                TaskTrajectory.is_synthesized == False,
+            ).update({"is_synthesized": True})
+            _session.commit()
+            if staled:
+                logger.info(f"🧹 旧轨迹已归档: {staled} 条 (project={self.project_id})")
+        except Exception:
+            _session.rollback()
+        finally:
+            _SS.remove()
+
         for idx, task in enumerate(tasks):
             logger.info(f"\n[{idx+1}/{len(tasks)}] ========================")
             # 构建 task_meta 传递给 Coder：规划书 + 依赖列表
@@ -459,9 +476,8 @@ class ManagerAgent:
         logger.info(f"✨ 项目交付完成: {final_dir}")
         global_broadcaster.emit_sync("System", "success", f"✨ 项目完美生成！{final_dir}", {"final_path": final_dir})
 
-        # 后台异步: Synthesizer 蒸馏 + Auditor 审计 + AMC 延迟结算
+        # 后台异步: Synthesizer 蒸馏 + Auditor 按 task 粒度审计 + AMC 延迟结算
         global_broadcaster.emit_sync("System", "info", "🧠 所有测试通过！正在执行经验提炼与 AMC 结算...")
-        task_ids = [t.get("task_id", "") for t in plan.get("tasks", [])]
         project_id = self.project_id
         def _bg_settlement():
             try:
@@ -469,38 +485,50 @@ class ManagerAgent:
                     if item["success"]:
                         synthesizer.synthesize_success(item["milestones"], user_requirement, plan)
                 logger.info("✨ [后台] Synthesizer 知识提炼完毕")
-                all_memory_ids = set()
-                for tid in task_ids:
-                    all_memory_ids |= get_recalled_memory_union(project_id, tid)
-                if not all_memory_ids:
-                    logger.info("📋 [后台] 无召回记忆需要结算，跳过 Auditor")
-                    tick_global_round()
-                    return
+
+                # 按 task 粒度审计：每个 task 的 recalled IDs 只对该 task 的 final_code 审计
+                all_used_ids, all_ignored_ids = set(), set()
                 auditor = AuditorAgent()
-                final_code = ""
-                for item in all_milestones:
-                    if item["success"] and item["milestones"].get("c"):
-                        final_code = item["milestones"]["c"]
-                memories_to_audit = [{"id": mid, "content": ""} for mid in all_memory_ids]
                 from core.database import ScopedSession, Memory
-                session = ScopedSession()
-                try:
-                    for m in memories_to_audit:
-                        if m["id"] > 0:
-                            row = session.query(Memory).filter(Memory.id == m["id"]).first()
-                            if row:
-                                m["content"] = row.content[:300]
-                finally:
-                    ScopedSession.remove()
-                audit_result = auditor.audit(final_code, memories_to_audit)
-                used_ids, ignored_ids = set(), set()
-                for r in audit_result.get("results", []):
-                    mid = r.get("memory_id", -1)
-                    if mid > 0:
-                        (used_ids if r.get("adopted") else ignored_ids).add(mid)
-                settle_memory_scores(used_ids, ignored_ids, get_global_round())
+
+                for item in all_milestones:
+                    if not item["success"]:
+                        continue
+                    tid = item["task"].get("task_id", "")
+                    task_memory_ids = get_recalled_memory_union(project_id, tid)
+                    if not task_memory_ids:
+                        continue
+
+                    task_final_code = item["milestones"].get("c", "")
+                    if not task_final_code:
+                        continue
+
+                    # 填充记忆内容
+                    memories_to_audit = [{"id": mid, "content": ""} for mid in task_memory_ids]
+                    session = ScopedSession()
+                    try:
+                        for m in memories_to_audit:
+                            if m["id"] > 0:
+                                row = session.query(Memory).filter(Memory.id == m["id"]).first()
+                                if row:
+                                    m["content"] = row.content[:300]
+                    finally:
+                        ScopedSession.remove()
+
+                    logger.info(f"📋 [后台] Auditor 审计 [{tid}]: {len(memories_to_audit)} 条记忆 vs {len(task_final_code)} bytes 代码")
+                    audit_result = auditor.audit(task_final_code, memories_to_audit)
+
+                    for r in audit_result.get("results", []):
+                        mid = r.get("memory_id", -1)
+                        if mid > 0:
+                            (all_used_ids if r.get("adopted") else all_ignored_ids).add(mid)
+
+                if all_used_ids or all_ignored_ids:
+                    settle_memory_scores(all_used_ids, all_ignored_ids, get_global_round())
+                    logger.info(f"✨ [后台] AMC 延迟结算完成: 功臣{len(all_used_ids)} 陪跑{len(all_ignored_ids)}")
+                else:
+                    logger.info("📋 [后台] 无召回记忆需要结算，跳过")
                 tick_global_round()
-                logger.info(f"✨ [后台] AMC 延迟结算完成: 功臣{len(used_ids)} 陪跑{len(ignored_ids)}")
             except Exception as e:
                 logger.error(f"❌ [后台] 结算流程异常: {e}")
         threading.Thread(target=_bg_settlement, daemon=True).start()

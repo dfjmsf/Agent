@@ -24,7 +24,10 @@ from core.state_manager import global_state_manager
 from core.ws_broadcaster import global_broadcaster
 
 # 设置基础的控制台日志输出格式
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger("FastAPIServer")
 
 # --- Watchdog 文件系统监控配置 ---

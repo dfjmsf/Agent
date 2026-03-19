@@ -7,8 +7,6 @@ from dotenv import load_dotenv
 # 加载环境变量
 load_dotenv()
 
-# 设置基础日志记录
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("LLMClient")
 
 # 全局 Token 追踪器

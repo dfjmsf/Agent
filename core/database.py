@@ -53,6 +53,7 @@ class SessionEvent(Base):
     role = Column(String(50))         # user / manager / coder / reviewer / sandbox / system
     event_type = Column(String(50))   # prompt / plan / code / test_pass / test_fail / circuit_break / reflection
     content = Column(Text)
+    embedding = Column(Vector(EMBEDDING_DIM))  # 项目经验向量化 (B1 轻量 RAG)
     metadata_ = Column("metadata", JSONB, default={})
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -126,6 +127,8 @@ def init_db():
         "ALTER TABLE memories ADD COLUMN IF NOT EXISTS success_count INTEGER DEFAULT 0",
         "ALTER TABLE memories ADD COLUMN IF NOT EXISTS usage_count INTEGER DEFAULT 0",
         "ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_used_round INTEGER DEFAULT 0",
+        # session_events 轻量 RAG
+        f"ALTER TABLE session_events ADD COLUMN IF NOT EXISTS embedding vector({EMBEDDING_DIM})",
     ]
     with engine.connect() as conn:
         for sql in migrations:
@@ -189,9 +192,10 @@ def append_event(
     event_type: str,
     content: str,
     project_id: str = "default",
-    metadata: dict = None
+    metadata: dict = None,
+    embedding: list = None,
 ):
-    """追加一条事件到短期记忆流。"""
+    """追加一条事件到短期记忆流。embedding 可选（项目经验写入时带向量）。"""
     logger.info(f"📝 短期记忆写入中... [{role}/{event_type}] project={project_id}")
     t0 = time.time()
     session = ScopedSession()
@@ -201,15 +205,78 @@ def append_event(
             role=role,
             event_type=event_type,
             content=content,
+            embedding=embedding,
             metadata_=metadata or {},
         )
         session.add(record)
         session.commit()
         elapsed = (time.time() - t0) * 1000
-        logger.info(f"✅ 短期记忆写入完成 [{role}/{event_type}] ({elapsed:.0f}ms)")
+        vec_hint = " +vec" if embedding else ""
+        logger.info(f"✅ 短期记忆写入完成 [{role}/{event_type}]{vec_hint} ({elapsed:.0f}ms)")
     except Exception as e:
         session.rollback()
         logger.error(f"写入 session_events 失败: {e}")
+    finally:
+        ScopedSession.remove()
+
+
+def recall_project_experience(
+    query: str,
+    project_id: str,
+    limit: int = 3,
+    similarity_threshold: float = 0.5,
+    caller: str = "Unknown",
+) -> List[str]:
+    """
+    轻量 RAG: 对项目级经验 (experience_project) 做向量语义检索。
+    仅检索有 embedding 的事件，按相似度排序，过滤低分项。
+    返回: List[str] 经验文本内容
+    """
+    logger.info(f"🔍 [{caller}] 项目经验 RAG 召回中... project={project_id}")
+    t0 = time.time()
+    
+    query_embedding = get_embedding(query)
+    if not query_embedding:
+        logger.warning(f"🔍 [{caller}] Embedding 失败，降级为时间序读取")
+        # 降级: 回退到时间序
+        events = get_recent_events(project_id=project_id, limit=limit,
+                                   event_types=["experience_project"], caller=caller)
+        return [e.content[:200] for e in events]
+    
+    session = ScopedSession()
+    try:
+        from sqlalchemy import text as sql_text
+        sql = sql_text("""
+            SELECT content, 1 - (embedding <=> CAST(:qvec AS vector)) AS similarity
+            FROM session_events
+            WHERE project_id = :pid
+              AND event_type = 'experience_project'
+              AND embedding IS NOT NULL
+              AND 1 - (embedding <=> CAST(:qvec AS vector)) >= :threshold
+            ORDER BY embedding <=> CAST(:qvec AS vector)
+            LIMIT :n
+        """)
+        result = session.execute(sql, {
+            "qvec": str(query_embedding),
+            "pid": project_id,
+            "threshold": similarity_threshold,
+            "n": limit,
+        })
+        rows = list(result)
+        elapsed = (time.time() - t0) * 1000
+        
+        if rows:
+            sims = ', '.join([f"{float(r[1]):.3f}" for r in rows])
+            logger.info(f"🔍 [{caller}] 项目经验 RAG 命中 {len(rows)} 条 ({elapsed:.0f}ms) sims=[{sims}]")
+        else:
+            logger.info(f"🔍 [{caller}] 项目经验 RAG 命中 0 条 ({elapsed:.0f}ms)")
+        
+        return [row[0] for row in rows]
+    except Exception as e:
+        logger.warning(f"⚠️ 项目经验 RAG 失败: {e}，降级为时间序")
+        events = get_recent_events(project_id=project_id, limit=limit,
+                                   event_types=["experience_project"], caller=caller)
+        return [e.content[:200] for e in events]
     finally:
         ScopedSession.remove()
 
@@ -338,7 +405,7 @@ def finalize_trajectory(project_id: str, task_id: str, final_code: str):
 
 
 def get_recalled_memory_union(project_id: str, task_id: str) -> set:
-    """从轨迹表中捞出该 task 历次召回的所有记忆 ID，去重并集。"""
+    """从轨迹表中捞出该 task 本轮召回的所有记忆 ID（排除已归档），去重并集。"""
     session = ScopedSession()
     try:
         from sqlalchemy import text as sql_text
@@ -347,6 +414,7 @@ def get_recalled_memory_union(project_id: str, task_id: str) -> set:
             FROM astrea_task_trajectories
             WHERE project_id = :pid AND task_id = :tid
               AND recalled_memory_ids IS NOT NULL
+              AND is_synthesized = false
         """)
         result = session.execute(sql, {"pid": project_id, "tid": task_id})
         ids = {row[0] for row in result}
