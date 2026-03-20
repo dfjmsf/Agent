@@ -297,7 +297,7 @@ class PythonSandbox:
         
         # 规划书 tech_stack → pip 包名 映射（规划书名称 ≠ import 名 ≠ pip 包名）
         TECH_STACK_TO_PACKAGES = {
-            "fastapi": ["fastapi", "uvicorn"],
+            "fastapi": ["fastapi", "uvicorn", "httpx"],
             "flask": ["flask"],
             "django": ["django"],
             "express": [],  # Node.js，不走 pip
@@ -324,7 +324,7 @@ class PythonSandbox:
         }
         # 跳过的纯标识名（语言、前端技术等，不是 pip 包）
         SKIP_NAMES = {'python', 'python3', 'html', 'css', 'javascript', 'js',
-                      'typescript', 'ts', 'sql', 'json', 'yaml', 'xml',
+                      'typescript', 'ts', 'sql', 'sqlite', 'sqlite3', 'json', 'yaml', 'xml',
                       'react', 'vue', 'angular', 'node', 'nodejs', 'npm'}
         
         try:
@@ -333,16 +333,26 @@ class PythonSandbox:
             
             packages_to_install = set()
             for tech in tech_stacks:
-                key = tech.lower().strip()
-                if key in SKIP_NAMES:
-                    continue
-                if key in TECH_STACK_TO_PACKAGES:
-                    packages_to_install.update(TECH_STACK_TO_PACKAGES[key])
-                else:
-                    # fallback: 试试 IMPORT_TO_PACKAGE，再 fallback 到原名
-                    pkg = IMPORT_TO_PACKAGE.get(key, key)
-                    if pkg.lower() not in STDLIB_MODULES:
-                        packages_to_install.add(pkg)
+                # 标准化：拆分复合名称（如 "HTML/CSS/JavaScript (Vanilla)"）
+                # 去除括号内容，按 / 和空格拆分
+                import re as _re
+                cleaned = _re.sub(r'\([^)]*\)', '', tech)  # 去掉 (Vanilla) 等
+                parts = _re.split(r'[/,\s]+', cleaned)
+                
+                for part in parts:
+                    key = part.lower().strip()
+                    # 去除版本号后缀：python 3 → python, flask 2.0 → flask
+                    key = _re.sub(r'\s*[\d.]+$', '', key).strip()
+                    if not key:
+                        continue
+                    if key in SKIP_NAMES:
+                        continue
+                    if key in TECH_STACK_TO_PACKAGES:
+                        packages_to_install.update(TECH_STACK_TO_PACKAGES[key])
+                    else:
+                        pkg = IMPORT_TO_PACKAGE.get(key, key)
+                        if pkg.lower() not in STDLIB_MODULES:
+                            packages_to_install.add(pkg)
             
             if packages_to_install:
                 logger.info(f"📦 预热安装: {packages_to_install}")

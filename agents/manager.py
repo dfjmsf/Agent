@@ -357,17 +357,8 @@ class ManagerAgent:
         vfs.clear_state()
         global_broadcaster.emit_sync("System", "start_project", "系统重置并启动新项目生成...")
 
-        # 3. 生成规划书 → 异步预热 sandbox → 任务拆解
+        # 3. 生成规划书 → 任务拆解
         project_spec = self._generate_project_spec(user_requirement)
-        
-        # 🔥 规划书就绪 → 异步预热 sandbox（tech_stack 已确定，争取最大预热窗口）
-        from tools.sandbox import sandbox_env
-        tech_stacks = project_spec.get("tech_stack", []) if project_spec else []
-        if tech_stacks:
-            def _bg_warmup():
-                sandbox_env.warm_up(self.project_id, tech_stacks)
-            threading.Thread(target=_bg_warmup, daemon=True).start()
-        
         plan = self.plan_tasks(user_requirement, project_spec=project_spec)
         
         # 将 spec 存入 plan 供后续传递
@@ -413,6 +404,15 @@ class ManagerAgent:
                 new_project_id = old_project_id
         else:
             new_project_id = self.project_id
+
+        # 5. 重命名完成后异步预热 sandbox（用最终 project_id）
+        from tools.sandbox import sandbox_env
+        tech_stacks = project_spec.get("tech_stack", []) if project_spec else []
+        if tech_stacks:
+            final_project_id = new_project_id
+            def _bg_warmup():
+                sandbox_env.warm_up(final_project_id, tech_stacks)
+            threading.Thread(target=_bg_warmup, daemon=True).start()
 
         if out_dir:
             final_dir = os.path.abspath(out_dir)

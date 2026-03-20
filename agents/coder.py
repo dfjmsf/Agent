@@ -24,19 +24,55 @@ class CoderAgent:
         self.project_id = project_id
         self._last_recalled_ids: List[int] = []  # 最近一次 recall 的记忆 IDs
 
-    def _clean_markdown(self, raw_text: str) -> str:
+    # --- 前端文件后缀集合 ---
+    FRONTEND_EXTENSIONS = {'.html', '.htm', '.css', '.js', '.jsx', '.ts', '.tsx', '.vue', '.svelte'}
+
+    def _extract_xml_code(self, raw_text: str, target_file: str) -> str:
         """
-        极度严苛的 Markdown 代码块清洗。
-        大模型很容易忽略要求，加上 ```python 前后缀。
-        如果包含，我们必须把它剥离出来，否则丢进沙盒直接报 SyntaxError。
+        从 LLM 输出中提取 <astrea_file> XML 标签内的代码。
+        支持多文件输出（未来扩展），当前取 target_file 匹配的第一个。
+        如果 XML 提取失败，fallback 到旧的 markdown 清洗。
         """
-        pattern = re.compile(r"```(?:python|py)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
-        match = pattern.search(raw_text)
+        # 主路径：XML 提取
+        pattern = re.compile(
+            r'<astrea_file\s+path="([^"]+)"\s*>(.*?)</astrea_file>',
+            re.DOTALL
+        )
+        matches = pattern.findall(raw_text)
+        
+        if matches:
+            # 优先匹配 target_file
+            for path, content in matches:
+                if path.strip() == target_file:
+                    logger.info(f"📦 XML 提取成功: {path}")
+                    return content.strip()
+            # 如果没有精确匹配，取第一个
+            path, content = matches[0]
+            logger.info(f"📦 XML 提取成功 (首个): {path}")
+            return content.strip()
+        
+        # Fallback：旧的 markdown 清洗
+        logger.warning("⚠️ XML 标签未找到，fallback 到 markdown 清洗")
+        return self._clean_markdown_legacy(raw_text)
+    
+    def _clean_markdown_legacy(self, raw_text: str) -> str:
+        """旧版 markdown 清洗（仅作 fallback）"""
+        md_pattern = re.compile(r"```(?:python|py|html|css|javascript|js)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+        match = md_pattern.search(raw_text)
         if match:
             return match.group(1).strip()
-        
         lines = [line for line in raw_text.split("\n") if not line.strip().startswith("```")]
         return "\n".join(lines).strip()
+    
+    def _get_coder_prompt(self, target_file: str) -> str:
+        """根据文件后缀路由到对应的 Coder prompt"""
+        ext = os.path.splitext(target_file)[1].lower()
+        if ext in self.FRONTEND_EXTENSIONS:
+            logger.info(f"🎨 路由到前端工程师 (ext={ext})")
+            return Prompts.CODER_FRONTEND_SYSTEM
+        else:
+            logger.info(f"⚙️ 路由到后端工程师 (ext={ext})")
+            return Prompts.CODER_BACKEND_SYSTEM
 
     def _build_memory_hint(self, target_file: str, description: str) -> str:
         """构建长短期记忆提示，按 scope 分组注入。同时缓存 recalled IDs。"""
@@ -99,7 +135,7 @@ class CoderAgent:
         # 注入项目规划书
         project_spec = task_meta.get("project_spec", "无规划书") if task_meta else "无规划书"
 
-        system_content = Prompts.CODER_SYSTEM.format(
+        system_content = self._get_coder_prompt(target_file).format(
             target_file=target_file,
             description=description,
             memory_hint=memory_hint,
@@ -120,7 +156,7 @@ class CoderAgent:
             temperature=0.2
         )
         
-        clean_code = self._clean_markdown(response_msg.content)
+        clean_code = self._extract_xml_code(response_msg.content, target_file)
         vfs.save_draft(target_file, clean_code)
         
         logger.info(f"✅ Coder 全量生成完成 ({len(clean_code)} bytes)")
@@ -196,7 +232,7 @@ class CoderAgent:
         # 注入项目规划书
         project_spec = task_meta.get("project_spec", "无规划书") if task_meta else "无规划书"
 
-        system_content = Prompts.CODER_SYSTEM.format(
+        system_content = self._get_coder_prompt(target_file).format(
             target_file=target_file,
             description=description,
             memory_hint=memory_hint,
@@ -217,7 +253,7 @@ class CoderAgent:
             temperature=0.2
         )
         
-        clean_code = self._clean_markdown(response_msg.content)
+        clean_code = self._extract_xml_code(response_msg.content, target_file)
         vfs.save_draft(target_file, clean_code)
         
         logger.info(f"✅ Coder Fallback 全量重写完成 ({len(clean_code)} bytes)")
