@@ -9,6 +9,7 @@ Sandbox — 阅后即焚沙盒 + 项目级 Venv 环境管理
 - Windows 安全删除（重试 + 标记待清理）
 """
 import os
+import re
 import sys
 import ast
 import uuid
@@ -335,9 +336,8 @@ class PythonSandbox:
             for tech in tech_stacks:
                 # 标准化：拆分复合名称（如 "HTML/CSS/JavaScript (Vanilla)"）
                 # 去除括号内容，按 / 和空格拆分
-                import re as _re
-                cleaned = _re.sub(r'\([^)]*\)', '', tech)  # 去掉 (Vanilla) 等
-                parts = _re.split(r'[/,\s]+', cleaned)
+                cleaned = re.sub(r'\([^)]*\)', '', tech)  # 去掉 (Vanilla) 等
+                parts = re.split(r'[/,\s]+', cleaned)
                 
                 for part in parts:
                     key = part.lower().strip()

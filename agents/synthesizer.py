@@ -70,7 +70,7 @@ class SynthesizerAgent:
         tech_stacks = parsed.get("tech_stacks", [])
         exp_type = parsed.get("exp_type", "general")
         scenario = parsed.get("scenario", "")
-        tags = parsed.get("tags", [])  # 旧格式兼容
+
         
         if not content or content == "一次通过，无踩坑经验":
             logger.info(f"📝 Synthesizer: 一次通过无经验可提炼，跳过写入")
@@ -82,7 +82,6 @@ class SynthesizerAgent:
         
         meta = {
             "source": "synthesizer",
-            "tags": tags,
             "scope_reason": "llm_routing",
             "exp_type": exp_type,
         }
@@ -115,7 +114,7 @@ class SynthesizerAgent:
         self,
         milestones: Dict[str, str],
         user_req: str,
-        plan: dict
+        plan: dict = None
     ):
         """
         成功时提炼 Contrastive Pair（对比对）。
@@ -166,7 +165,7 @@ class SynthesizerAgent:
         self,
         milestones: Dict[str, str],
         user_req: str,
-        plan: dict
+        plan: dict = None
     ):
         """
         熔断时提炼 Anti-pattern（反模式）。

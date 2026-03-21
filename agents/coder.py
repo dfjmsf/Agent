@@ -162,7 +162,7 @@ class CoderAgent:
         logger.info(f"✅ Coder 全量生成完成 ({len(clean_code)} bytes)")
         return clean_code
 
-    def _fix_with_editor(self, target_file: str, description: str, feedback: str, vfs, memory_hint: str) -> str:
+    def _fix_with_editor(self, target_file: str, description: str, feedback: str, vfs, memory_hint: str, task_meta: dict = None) -> str:
         """
         修复模式：使用 edit_file Function Calling 做差量编辑。
         如果 LLM 不使用工具或 edits 匹配失败，自动 fallback 到全量覆写。
@@ -212,7 +212,7 @@ class CoderAgent:
 
         # Fallback: 全量覆写
         logger.warning(f"⚠️ [Editor] Fallback 全量覆写模式")
-        return self._fallback_full_rewrite(target_file, description, feedback, vfs, memory_hint)
+        return self._fallback_full_rewrite(target_file, description, feedback, vfs, memory_hint, task_meta=task_meta)
 
     def _fallback_full_rewrite(self, target_file: str, description: str, feedback: str, vfs, memory_hint: str, task_meta: dict = None) -> str:
         """降级方案：和原来一样全量重写"""
@@ -310,7 +310,7 @@ class CoderAgent:
         global_broadcaster.emit_sync("Coder", "coding_start", f"[{mode}] 正在为 {target_file} 编写代码", {"target": target_file})
         
         if edit_instruction:
-            result = self._fix_with_editor(target_file, description, edit_instruction, vfs, memory_hint)
+            result = self._fix_with_editor(target_file, description, edit_instruction, vfs, memory_hint, task_meta=task_meta)
         else:
             result = self._generate_full(target_file, description, vfs, memory_hint, task_meta=task_meta)
         

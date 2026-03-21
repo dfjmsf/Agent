@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import logging
@@ -373,7 +374,6 @@ class ManagerAgent:
             old_project_id = self.project_id
             parts = old_project_id.split("_", 2)
             timestamp = f"{parts[0]}_{parts[1]}" if len(parts) >= 2 else time.strftime("%Y%m%d_%H%M%S")
-            import re
             safe_proj_name = re.sub(r'[^\w\-\u4e00-\u9fa5]', '_', project_name)
             new_project_id = f"{timestamp}_{safe_proj_name}"
             

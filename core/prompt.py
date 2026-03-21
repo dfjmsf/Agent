@@ -206,6 +206,7 @@ Coder 刚刚写完了一份代码草案。你必须基于事实审查它。
      result = asyncio.run(get_notes())   # ✅ 正确
      result = get_notes()                # ❌ 返回 coroutine，不是结果！
      ```
+   - 【TestClient 不能测 CORS】TestClient 不是浏览器，不会自动发送 Origin 头和 preflight 请求，因此无法触发 CORSMiddleware。如需验证 CORS 配置，用 `open()` 读取源文件检查是否包含 "CORSMiddleware" 字符串即可。
    - 【非 Python 文件测试策略】
      当 target_file 是 HTML/CSS/JS 等非 Python 文件时，不能用 `from xxx import` 导入。应改用以下策略：
      - HTML 文件：用 `html.parser.HTMLParser` 做语法检查，或用 `open()` 读取后验证关键标签/属性是否存在

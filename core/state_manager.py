@@ -116,7 +116,7 @@ class VirtualFileSystem:
                 before = '\n'.join(content_lines[:start_idx])
                 after = '\n'.join(content_lines[start_idx + search_len:])
                 parts = [before, replace, after]
-                new_content = '\n'.join(p for p in parts if p)  # 避免头尾空行
+                new_content = '\n'.join(parts)
                 return True, new_content, "L2:归一化"
         
         # --- Level 3: difflib 模糊匹配 ---
@@ -139,7 +139,7 @@ class VirtualFileSystem:
             before = '\n'.join(content_lines[:best_start])
             after = '\n'.join(content_lines[best_end:])
             parts = [before, replace, after]
-            new_content = '\n'.join(p for p in parts if p)
+            new_content = '\n'.join(parts)
             return True, new_content, f"L3:模糊({best_ratio:.0%})"
         
         return False, content, "全部失败"
