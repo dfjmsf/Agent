@@ -7,7 +7,6 @@ import threading
 from typing import List, Dict, Any, Optional, Tuple
 from core.llm_client import default_llm
 from core.prompt import Prompts
-from core.state_manager import global_state_manager
 from core.ws_broadcaster import global_broadcaster
 from agents.coder import CoderAgent
 from agents.reviewer import ReviewerAgent
@@ -130,8 +129,16 @@ class ManagerAgent:
         if is_new_project:
             env_context = "【项目环境】\n这是基于主人的首个请求刚刚创建的全新宇宙草稿。请为它起一个酷炫、精简的纯英文字符串作为 JSON 中的 `project_name` 字段。"
         else:
-            vfs = global_state_manager.get_vfs(self.project_id)
-            existing_files = list(vfs.get_all_vfs().keys())
+            # v1.3: 直接从项目目录读取文件列表（不依赖 StateManager VFS）
+            existing_files = []
+            base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "projects", self.project_id))
+            if os.path.isdir(base_dir):
+                ignore = {'.sandbox', '.git', '__pycache__', '.venv', 'node_modules', '.idea'}
+                for root, dirs, files in os.walk(base_dir):
+                    dirs[:] = [d for d in dirs if d not in ignore]
+                    for f in files:
+                        rel = os.path.relpath(os.path.join(root, f), base_dir).replace("\\", "/")
+                        existing_files.append(rel)
             file_tree = "\n".join([f"- {f}" for f in existing_files]) if existing_files else "目录暂空。"
             env_context = (
                 f"【项目环境】\n当前项目宇宙已永久命名并固化为: `{self.project_id}`\n"

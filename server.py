@@ -19,9 +19,7 @@ from datetime import datetime
 # 确保能找到 core 和 agents 模块
 sys.path.append(str(os.path.dirname(os.path.abspath(__file__))))
 
-from agents.manager import ManagerAgent
 from core.engine import AstreaEngine
-from core.state_manager import global_state_manager
 from core.ws_broadcaster import global_broadcaster
 
 # 设置基础的控制台日志输出格式
@@ -338,15 +336,9 @@ async def get_all_projects_list():
 async def get_project_files(project_id: str):
     """
     获取指定 project_id 项目的物理目录结构。
-    为了防止 VFS 内存和磁盘不同步，先强制 flush 脏数据。
     """
-    # 无状态，需要读取文件树前，强制确保刚改完的 dirty 内存刷回磁盘
-    vfs = global_state_manager.get_vfs(project_id)
     base_projects_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects")
     project_dir = os.path.join(base_projects_dir, project_id)
-    
-    if vfs.is_dirty:
-        vfs.commit_to_disk(project_dir)
     
     if not os.path.exists(project_dir):
         return {"name": project_id, "type": "directory", "children": []}

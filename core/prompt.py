@@ -206,7 +206,22 @@ Coder 刚刚写完了一份代码草案。你必须基于事实审查它。
      result = asyncio.run(get_notes())   # ✅ 正确
      result = get_notes()                # ❌ 返回 coroutine，不是结果！
      ```
-   - 【TestClient 不能测 CORS】TestClient 不是浏览器，不会自动发送 Origin 头和 preflight 请求，因此无法触发 CORSMiddleware。如需验证 CORS 配置，用 `open()` 读取源文件检查是否包含 "CORSMiddleware" 字符串即可。
+   - 【禁止运行时测试 CORS！】无论 Flask 还是 FastAPI，TestClient 都不是浏览器，无法真实触发 CORS。禁止 `assert 'cors' in app.extensions`、禁止检查 Access-Control 响应头。唯一合法方式：用 `open()` 读源文件，检查是否包含 "CORSMiddleware" 或 "CORS(app" 字符串。
+   - 【禁止假设 HTTP 状态码！】
+     你必须仔细阅读 Coder 提交的代码，观察其错误处理逻辑（是 raise HTTPException(400)？还是 422？还是自定义状态码？），然后据此编写断言。
+     禁止拍脑袋写 `assert response.status_code == 400` 这种硬编码断言！如果代码里没有显式抛出 400，就不要断言 400。
+     如果你不确定返回什么状态码，用如下"观测式"写法：
+     ```
+     response = client.get("/api/xxx?bad_param=abc")
+     print(f"实际状态码: {response.status_code}")  # 先观测
+     print(f"实际响应: {response.json()}")
+     assert response.status_code != 200, "异常请求不应返回 200"  # 宽松断言
+     ```
+   - 【先观测再断言（Observe-First 原则）】
+     对于你不确定具体返回值的测试场景，先用 print() 打印实际结果，再写宽松断言。
+     ❌ 错误：`assert response.status_code == 400` (硬猜)
+     ✅ 正确：`assert response.status_code >= 400` (只验证是错误码)
+     ✅ 正确：`assert "error" in response.json() or response.status_code >= 400` (灵活验证)
    - 【非 Python 文件测试策略】
      当 target_file 是 HTML/CSS/JS 等非 Python 文件时，不能用 `from xxx import` 导入。应改用以下策略：
      - HTML 文件：用 `html.parser.HTMLParser` 做语法检查，或用 `open()` 读取后验证关键标签/属性是否存在
@@ -232,6 +247,17 @@ Coder 刚刚写完了一份代码草案。你必须基于事实审查它。
    assert os.path.basename(db_path) == "data.db"
    assert "src" in config_path
    ```
+6. 【DeprecationWarning = FAIL】
+   如果沙盒执行结果的 stderr 中包含 `DeprecationWarning`、`PendingDeprecationWarning` 或 `FutureWarning`，必须判定为 FAIL。
+   弃用警告意味着代码使用了即将被移除的 API，必须在当前版本就修复。
+   例如 FastAPI 的 `Query(regex=...)` 已弃用，应改为 `Query(pattern=...)`。
+   将警告内容和修复建议写入 feedback 退回给 Coder。
+7. 【测试脚本语法铁律】
+   你生成的测试脚本本身必须是合法的 Python！常见致命错误：
+   - SQL 语句必须用引号字符串包裹：`cursor.execute('CREATE TABLE ...')`，禁止裸写 SQL！
+   - JSON 字符串必须用引号包裹，禁止直接写裸 JSON。
+   - 从被测代码中复制多行文本时，必须确保它在 Python 中是合法的字符串字面量。
+   你的测试脚本如果自身就有 SyntaxError / IndentationError，这是你的失职！
 """
 
     REVIEWER_TOOL_SCHEMA = [

@@ -5,7 +5,6 @@ import logging
 from typing import Optional, Dict, Any, List
 from core.llm_client import default_llm
 from core.prompt import Prompts
-from core.state_manager import global_state_manager
 from core.ws_broadcaster import global_broadcaster
 from core.database import recall, get_recent_events, recall_project_experience
 
@@ -13,11 +12,15 @@ logger = logging.getLogger("CoderAgent")
 
 class CoderAgent:
     """
-    编码 Agent (Coder)
-    专职：接收一个确定的任务目标和当前虚拟文件系统的上下文，只输出极简、纯净的代码文本。
+    编码 Agent (Coder) — v1.3 新架构
+
+    职责：接收 Engine 传入的任务目标、Observer 上下文和记忆，输出 XML 格式代码。
+    不再直接读写 VFS，所有上下文由 Engine 注入。
+
     支持两种模式：
-      - 首次生成：直接输出完整代码
-      - 修复模式：使用 edit_file Function Calling 做差量编辑（匹配失败自动 fallback 全量覆写）
+      - 首次生成：输出完整代码文件（<astrea_file action="create">）
+      - 修复模式：使用 edit_file Function Calling 做差量编辑
+        （匹配失败自动 fallback 全量覆写 <astrea_file action="rewrite">）
     """
     def __init__(self, project_id: str = "default_project"):
         self.model = os.getenv("MODEL_CODER", "qwen3-coder-plus")
@@ -35,7 +38,7 @@ class CoderAgent:
         """
         # 主路径：XML 提取
         pattern = re.compile(
-            r'<astrea_file\s+path="([^"]+)"\s*>(.*?)</astrea_file>',
+            r'<astrea_file\s+path="([^"]+)"[^>]*>(.*?)</astrea_file>',
             re.DOTALL
         )
         matches = pattern.findall(raw_text)
@@ -74,13 +77,27 @@ class CoderAgent:
             logger.info(f"⚙️ 路由到后端工程师 (ext={ext})")
             return Prompts.CODER_BACKEND_SYSTEM
 
-    def _build_memory_hint(self, target_file: str, description: str) -> str:
-        """构建长短期记忆提示，按 scope 分组注入。同时缓存 recalled IDs。"""
+    def _build_memory_hint(self, target_file: str, description: str, task_meta: dict = None) -> str:
+        """
+        构建长短期记忆提示（首次生成专用）。
+
+        v1.3：项目文件树和依赖文件上下文由 Engine 通过 task_meta 注入（来自 Observer）。
+        本方法只负责 RAG 记忆召回 + TDD 滑动窗口。
+        """
         memory_hint = ""
         self._last_recalled_ids = []
         
-        # 长期记忆 → 全局通用架构智慧（recall 返回 List[Dict]）
-        past_tips = recall(f"{target_file} {description}", n_results=5, project_id=self.project_id, caller="Coder")
+        # 长期记忆 → 3+1 双管线召回（3条技术栈专用 + 1条通用保底）
+        tech_stacks = None
+        if task_meta:
+            spec = task_meta.get("project_spec", "")
+            if isinstance(spec, dict):
+                tech_stacks = spec.get("tech_stack", None)
+        past_tips = recall(
+            f"{target_file} {description}", n_results=3,
+            project_id=self.project_id, caller="Coder",
+            tech_stacks=tech_stacks
+        )
         if past_tips:
             # 缓存 recalled IDs（过滤 id > 0 的有效 ID）
             self._last_recalled_ids = [t["id"] for t in past_tips if t.get("id", -1) > 0]
@@ -105,35 +122,55 @@ class CoderAgent:
             tdd_hints = "\n".join([f"  {e.content[:500]}" for e in tdd_events])
             memory_hint += f"\n\n【🔄 最近 TDD 轮次记录（你的近期尝试，务必避免重复犯错）】\n{tdd_hints}"
         
-        # 短期记忆 → 项目文件树
-        file_tree_events = get_recent_events(
-            project_id=self.project_id, limit=1,
-            event_types=["file_tree"], caller="Coder"
-        )
-        if file_tree_events:
-            memory_hint += f"\n\n【📂 当前项目文件结构】\n{file_tree_events[0].content[:500]}"
+        # v1.3: 项目文件树由 Observer 提供（通过 task_meta 注入）
+        observer_tree = task_meta.get("observer_tree", "") if task_meta else ""
+        if observer_tree:
+            memory_hint += f"\n\n【📂 当前项目文件结构 (Observer)】\n{observer_tree}"
         
         return memory_hint
 
-    def _generate_full(self, target_file: str, description: str, vfs, memory_hint: str, task_meta: dict = None) -> str:
-        """首次生成：输出完整代码文件"""
-        vfs_dict = vfs.get_all_vfs()
-        
-        # 按 dependencies 过滤 VFS 上下文
-        dep_files = self._resolve_dependency_files(task_meta) if task_meta else None
-        vfs_context = []
-        for file_path, content in vfs_dict.items():
-            if file_path != target_file:
-                # 如果有依赖列表，只注入依赖文件；否则 fallback 到全量
-                if dep_files is not None and file_path not in dep_files:
-                    continue
-                preview = content[:800] + "\n...[省略]" if len(content) > 800 else content
-                vfs_context.append(f"--- [依赖文件: {file_path}] ---\n{preview}\n")
-                
-        vfs_str = "".join(vfs_context) if vfs_context else "当前无依赖文件，你是写的第一个文件。"
+    def _build_fix_hint(self, target_file: str, description: str) -> str:
+        """
+        构建修复模式专用的精简记忆（不重新召回全局 RAG）。
 
+        修复模式核心信息来自 Reviewer 的 feedback，不需要重复注入首次生成时
+        已经看过的全局经验。只保留：
+        - 项目专属经验（可能包含本次踩坑相关的规则）
+        - 最近 1 条 TDD 事件（最新的报错，避免重蹈覆辙）
+        """
+        fix_hint = ""
+        
+        # 项目专属经验（轻量，~200 tokens）
+        exp_contents = recall_project_experience(
+            query=f"{target_file} {description}",
+            project_id=self.project_id, limit=2, caller="Coder-Fix"
+        )
+        if exp_contents:
+            exp_hints = "\n".join([f"  {i+1}. {c[:200]}" for i, c in enumerate(exp_contents)])
+            fix_hint += f"\n\n【📦 本项目规则 (必须绝对服从)】\n{exp_hints}"
+        
+        # 最近 1 条 TDD 事件（最新报错）
+        tdd_events = get_recent_events(
+            project_id=self.project_id, limit=1,
+            event_types=["round_fail"], caller="Coder-Fix"
+        )
+        if tdd_events:
+            fix_hint += f"\n\n【🔄 最近一次失败记录】\n  {tdd_events[0].content[:500]}"
+        
+        return fix_hint
+
+    def _generate_full(self, target_file: str, description: str, memory_hint: str,
+                       observer_context: str = "", task_meta: dict = None) -> str:
+        """
+        首次生成：输出完整代码文件。
+
+        v1.3：依赖文件上下文由 Engine 通过 observer_context 注入（Observer 的骨架提取结果）。
+        """
         # 注入项目规划书
         project_spec = task_meta.get("project_spec", "无规划书") if task_meta else "无规划书"
+
+        # v1.3: 依赖文件上下文来自 Observer（骨架 + 关键片段）
+        vfs_str = observer_context if observer_context else "当前无依赖文件，你是写的第一个文件。"
 
         system_content = self._get_coder_prompt(target_file).format(
             target_file=target_file,
@@ -155,23 +192,24 @@ class CoderAgent:
             model=self.model,
             temperature=0.2
         )
-        
-        clean_code = self._extract_xml_code(response_msg.content, target_file)
-        vfs.save_draft(target_file, clean_code)
-        
-        logger.info(f"✅ Coder 全量生成完成 ({len(clean_code)} bytes)")
-        return clean_code
 
-    def _fix_with_editor(self, target_file: str, description: str, feedback: str, vfs, memory_hint: str, task_meta: dict = None) -> str:
+        # v1.3: 返回原始 LLM 输出，由 Engine 负责 XML 提取和 VFS 写入
+        raw_output = response_msg.content
+        logger.info(f"✅ Coder 全量生成完成 ({len(raw_output)} bytes)")
+        return raw_output
+
+    def _fix_with_editor(self, target_file: str, description: str, feedback: str,
+                         existing_code: str, memory_hint: str, task_meta: dict = None) -> str:
         """
         修复模式：使用 edit_file Function Calling 做差量编辑。
         如果 LLM 不使用工具或 edits 匹配失败，自动 fallback 到全量覆写。
+
+        v1.3：existing_code 由 Engine 传入（来自 VfsUtils 真理区或 Blackboard 草稿），
+        不再从 StateManager VFS 读取。
         """
-        current_code = vfs.get_draft(target_file) or ""
-        
         system_content = Prompts.CODER_FIX_SYSTEM.format(
             target_file=target_file,
-            current_code=current_code,
+            current_code=existing_code,
             feedback=feedback
         ) + memory_hint
 
@@ -199,38 +237,75 @@ class CoderAgent:
                         edits = args.get("edits", [])
                         
                         if edits:
-                            success, msg = vfs.apply_edits(target_file, edits)
-                            if success:
-                                updated_code = vfs.get_draft(target_file)
-                                logger.info(f"🔧 [Editor] 差量编辑成功: {msg}")
-                                global_broadcaster.emit_sync("Coder", "edit_done", f"差量修复完成: {msg}", {"code": updated_code})
-                                return updated_code
+                            # v1.3: 在内存中应用编辑，不写 VFS
+                            patched_code = self._apply_edits_in_memory(existing_code, edits)
+                            if patched_code is not None:
+                                logger.info(f"🔧 [Editor] 差量编辑成功")
+                                global_broadcaster.emit_sync("Coder", "edit_done", f"差量修复完成", {"code": patched_code})
+                                return patched_code
                             else:
-                                logger.warning(f"⚠️ [Editor] 差量编辑部分失败: {msg}，尝试 fallback")
+                                logger.warning(f"⚠️ [Editor] 差量编辑匹配失败，尝试 fallback")
                     except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
                         logger.warning(f"⚠️ [Editor] 工具参数解析失败: {e}，fallback 全量覆写")
 
         # Fallback: 全量覆写
         logger.warning(f"⚠️ [Editor] Fallback 全量覆写模式")
-        return self._fallback_full_rewrite(target_file, description, feedback, vfs, memory_hint, task_meta=task_meta)
+        return self._fallback_full_rewrite(
+            target_file, description, feedback,
+            observer_context=task_meta.get("observer_context", "") if task_meta else "",
+            memory_hint=memory_hint, task_meta=task_meta
+        )
 
-    def _fallback_full_rewrite(self, target_file: str, description: str, feedback: str, vfs, memory_hint: str, task_meta: dict = None) -> str:
-        """降级方案：和原来一样全量重写"""
-        vfs_dict = vfs.get_all_vfs()
+    def _apply_edits_in_memory(self, code: str, edits: list) -> Optional[str]:
+        """
+        在内存中应用差量编辑（不触碰任何文件系统）。
+        返回编辑后的代码，如果任何一个 edit 匹配失败返回 None。
+        """
+        lines = code.split("\n")
+        success_count = 0
+        fail_count = 0
+
+        for edit in edits:
+            search = edit.get("search", "")
+            replace = edit.get("replace", "")
+            if not search:
+                continue
+            
+            # 在代码中查找 search 块
+            search_lines = search.split("\n")
+            found = False
+            
+            for i in range(len(lines) - len(search_lines) + 1):
+                # 精确匹配
+                match = True
+                for j, sl in enumerate(search_lines):
+                    if lines[i + j].rstrip() != sl.rstrip():
+                        match = False
+                        break
+                if match:
+                    replace_lines = replace.split("\n")
+                    lines[i:i + len(search_lines)] = replace_lines
+                    found = True
+                    success_count += 1
+                    break
+            
+            if not found:
+                fail_count += 1
+
+        if fail_count > 0 and success_count == 0:
+            return None  # 全部失败，触发 fallback
         
-        # 按 dependencies 过滤 VFS 上下文
-        dep_files = self._resolve_dependency_files(task_meta) if task_meta else None
-        vfs_context = []
-        for file_path, content in vfs_dict.items():
-            if file_path != target_file:
-                if dep_files is not None and file_path not in dep_files:
-                    continue
-                preview = content[:800] + "\n...[省略]" if len(content) > 800 else content
-                vfs_context.append(f"--- [依赖文件: {file_path}] ---\n{preview}\n")
-        vfs_str = "".join(vfs_context) if vfs_context else "当前无依赖文件。"
+        result = "\n".join(lines)
+        logger.info(f"🔧 [Editor] 内存编辑: {success_count} 成功, {fail_count} 失败")
+        return result
 
+    def _fallback_full_rewrite(self, target_file: str, description: str, feedback: str,
+                               observer_context: str = "", memory_hint: str = "",
+                               task_meta: dict = None) -> str:
+        """降级方案：全量重写"""
         # 注入项目规划书
         project_spec = task_meta.get("project_spec", "无规划书") if task_meta else "无规划书"
+        vfs_str = observer_context if observer_context else "当前无依赖文件。"
 
         system_content = self._get_coder_prompt(target_file).format(
             target_file=target_file,
@@ -253,11 +328,9 @@ class CoderAgent:
             temperature=0.2
         )
         
-        clean_code = self._extract_xml_code(response_msg.content, target_file)
-        vfs.save_draft(target_file, clean_code)
-        
-        logger.info(f"✅ Coder Fallback 全量重写完成 ({len(clean_code)} bytes)")
-        return clean_code
+        raw_output = response_msg.content
+        logger.info(f"✅ Coder Fallback 全量重写完成 ({len(raw_output)} bytes)")
+        return raw_output
 
     def _resolve_dependency_files(self, task_meta: dict) -> set:
         """
@@ -283,18 +356,24 @@ class CoderAgent:
         
         return dep_files
 
-    def generate_code(self, target_file: str, description: str, feedback: Optional[str] = None, task_meta: dict = None) -> str:
+    def generate_code(self, target_file: str, description: str,
+                      feedback: Optional[str] = None, task_meta: dict = None) -> str:
         """
-        生成或修复代码（统一入口）
-        
+        生成或修复代码（统一入口）— v1.3 新架构
+
+        所有上下文由 Engine 通过 task_meta 注入：
+        - task_meta["observer_context"]: Observer 提取的依赖文件骨架
+        - task_meta["observer_tree"]: Observer 提取的项目文件树
+        - task_meta["existing_code"]: 真理区/Blackboard 中的当前代码
+        - task_meta["project_spec"]: 规划书文本
+
         判定模式：
         1. feedback≠None → Reviewer 退回修复（Editor Tools 差量编辑）
-        2. 文件已存在于 VFS → 跨任务修改已有文件（Editor Tools 差量编辑）
+        2. existing_code 不为空 → 跨任务修改已有文件（Editor Tools 差量编辑）
         3. 文件不存在 → 首次生成（全量输出）
         """
-        vfs = global_state_manager.get_vfs(self.project_id)
-        memory_hint = self._build_memory_hint(target_file, description)
-        existing_code = vfs.get_draft(target_file)
+        existing_code = (task_meta or {}).get("existing_code", "")
+        observer_context = (task_meta or {}).get("observer_context", "")
         
         if feedback:
             mode = "Reviewer退回修复"
@@ -310,10 +389,22 @@ class CoderAgent:
         global_broadcaster.emit_sync("Coder", "coding_start", f"[{mode}] 正在为 {target_file} 编写代码", {"target": target_file})
         
         if edit_instruction:
-            result = self._fix_with_editor(target_file, description, edit_instruction, vfs, memory_hint, task_meta=task_meta)
+            # 修复模式：精简记忆（不重新召回全局 RAG，节省 ~1500 tokens/次）
+            fix_hint = self._build_fix_hint(target_file, description)
+            result = self._fix_with_editor(
+                target_file, description, edit_instruction,
+                existing_code=existing_code,
+                memory_hint=fix_hint, task_meta=task_meta
+            )
         else:
-            result = self._generate_full(target_file, description, vfs, memory_hint, task_meta=task_meta)
+            # 首次生成：完整记忆（含全局 RAG 3+1 + 项目经验 + TDD 窗口）
+            memory_hint = self._build_memory_hint(target_file, description, task_meta)
+            result = self._generate_full(
+                target_file, description,
+                memory_hint=memory_hint,
+                observer_context=observer_context,
+                task_meta=task_meta
+            )
         
         global_broadcaster.emit_sync("Coder", "coding_done", f"{target_file} 编写完毕", {"code": result})
         return result
-

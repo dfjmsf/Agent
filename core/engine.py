@@ -49,6 +49,7 @@ class AstreaEngine:
         self.blackboard = Blackboard(project_id)
         self.patcher = CodePatcher()
         self.vfs: Optional[VfsUtils] = None  # run() 时初始化
+        self._shutdown = False  # 优雅退出标志
 
         # Agent 延迟导入（避免循环依赖）
         self._manager = None
@@ -213,6 +214,11 @@ class AstreaEngine:
         total = len(self.blackboard.state.tasks)
 
         while True:
+            # 优雅退出检查
+            if self._shutdown:
+                logger.warning("🛑 Engine 检测到 shutdown 信号，停止执行")
+                return False
+
             # 检查是否全部完成
             if self.blackboard.all_tasks_done():
                 if self.blackboard.has_fused_tasks():
@@ -267,6 +273,11 @@ class AstreaEngine:
         feedback = None
 
         while True:
+            # 优雅退出检查
+            if self._shutdown:
+                logger.warning("🛑 Engine 检测到 shutdown 信号，任务中断")
+                return
+
             # 熔断检测
             if task.retry_count >= MAX_RETRIES:
                 logger.error(f"🚨 [熔断] 任务 {task.task_id} 连续失败 {MAX_RETRIES} 次")
@@ -291,25 +302,34 @@ class AstreaEngine:
                 feedback = "Coder 返回了空代码，请重新生成完整代码。"
                 continue
 
-            # 从 XML 中提取文件和 action
+            # 从输出中提取代码和 action
+            # 优先尝试 XML 提取（_generate_full 的标准输出格式）
             xml_files = extract_xml_files(code_output)
-            if not xml_files:
-                task.log_error("无法从 Coder 输出中提取 XML 文件标签")
-                self.blackboard.increment_retry(task.task_id)
-                feedback = "你的输出中没有找到 <astrea_file> 标签，请使用正确格式。"
-                continue
 
-            # 取目标文件对应的输出
-            target_xml = None
-            for xf in xml_files:
-                if xf["path"] == task.target_file or not xf["path"]:
-                    target_xml = xf
-                    break
-            if not target_xml:
-                target_xml = xml_files[0]  # 取第一个
+            # 判断是否为有效的 XML 提取结果
+            has_real_xml = any(xf["path"] for xf in xml_files) if xml_files else False
 
-            action = target_xml["action"]
-            draft = target_xml["content"]
+            if has_real_xml:
+                # 标准 XML 路径：取目标文件
+                target_xml = None
+                for xf in xml_files:
+                    if xf["path"] == task.target_file:
+                        target_xml = xf
+                        break
+                if not target_xml:
+                    target_xml = xml_files[0]
+
+                action = target_xml["action"]
+                draft = target_xml["content"]
+            else:
+                # Editor 模式返回的已编辑代码（无 XML 标签）
+                # 直接作为 rewrite 处理，跳过 CodePatcher 的 SEARCH/REPLACE 解析
+                action = "rewrite"
+                # 清洗可能的 markdown 代码块
+                if xml_files and xml_files[0]["content"]:
+                    draft = xml_files[0]["content"]
+                else:
+                    draft = code_output.strip()
 
             # 提交草稿到 Blackboard
             self.blackboard.submit_draft(task.task_id, draft, action)
@@ -331,7 +351,7 @@ class AstreaEngine:
             # (3) 写入 Sandbox + 唤醒 Reviewer
             self.blackboard.update_task_status(task.task_id, TaskStatus.PENDING_REVIEW)
 
-            # 写入沙盒
+            # 写入新 VfsUtils 沙盒
             if self.vfs:
                 self.vfs.write_to_sandbox({task.target_file: merged})
 
@@ -391,10 +411,45 @@ class AstreaEngine:
     # ============================================================
 
     def _invoke_coder(self, task: TaskItem, feedback: str = None) -> str:
-        """唤醒 Coder，注入 Observer 上下文和记忆"""
+        """唤醒 Coder，通过 Observer 预取上下文注入 task_meta"""
         coder = self._get_coder()
 
-        # 构建 task_meta（传递给 Coder 的上下文）
+        # (1) Observer 预取：项目文件树
+        observer_tree = ""
+        observer_context = ""
+        try:
+            from tools.observer import Observer
+            obs = Observer(self.vfs.truth_dir if self.vfs else ".")
+
+            # 项目树
+            observer_tree = obs.get_tree()
+
+            # 依赖文件骨架
+            dep_files = self._resolve_dep_files(task)
+            if dep_files:
+                context_parts = []
+                for dep_path in dep_files:
+                    skeleton = obs.get_skeleton(dep_path)
+                    if skeleton and "Error" not in skeleton:
+                        context_parts.append(f"--- [依赖文件骨架: {dep_path}] ---\n{skeleton}\n")
+                    else:
+                        # 骨架失败就读前 800 字符
+                        content = obs.read_file(dep_path)
+                        if content and "Error" not in content:
+                            preview = content[:800] + "\n...[省略]" if len(content) > 800 else content
+                            context_parts.append(f"--- [依赖文件: {dep_path}] ---\n{preview}\n")
+                observer_context = "".join(context_parts)
+        except Exception as e:
+            logger.warning(f"⚠️ Observer 预取异常: {e}")
+
+        # (2) 现有代码（从真理区或 Blackboard 草稿）
+        existing_code = ""
+        if self.vfs:
+            existing_code = self.vfs.read_truth(task.target_file) or ""
+        if not existing_code and task.code_draft:
+            existing_code = task.code_draft
+
+        # (3) 构建 task_meta
         tasks_dict = [
             {"task_id": t.task_id, "target_file": t.target_file, "description": t.description}
             for t in self.blackboard.state.tasks
@@ -403,9 +458,12 @@ class AstreaEngine:
             "project_spec": self.blackboard.state.spec_text,
             "dependencies": task.dependencies,
             "all_tasks": tasks_dict,
+            "observer_tree": observer_tree,
+            "observer_context": observer_context,
+            "existing_code": existing_code,
         }
 
-        # 调用 Coder（暂时保持旧接口，后续 Phase 4d 适配 Observer）
+        # (4) 调用 Coder
         try:
             result = coder.generate_code(
                 target_file=task.target_file,
@@ -417,16 +475,37 @@ class AstreaEngine:
             task.recalled_memory_ids = getattr(coder, '_last_recalled_ids', [])
             return result
         except Exception as e:
+            err_msg = str(e)
+            # 检测 interpreter shutdown
+            if 'interpreter shutdown' in err_msg or 'Event loop is closed' in err_msg:
+                logger.warning(f"🛑 检测到 Python 解释器关闭，Engine 将停止")
+                self._shutdown = True
+                return ""
             logger.error(f"❌ Coder 调用异常: {e}")
             task.log_error(f"Coder 异常: {e}")
             return ""
 
+    def _resolve_dep_files(self, task: TaskItem) -> list:
+        """从依赖 task_id 列表反查依赖文件路径"""
+        if not task.dependencies:
+            return []
+        id_to_file = {t.task_id: t.target_file for t in self.blackboard.state.tasks}
+        return [id_to_file[dep_id] for dep_id in task.dependencies if dep_id in id_to_file]
+
     def _invoke_reviewer(self, task: TaskItem, merged_code: str) -> Tuple[bool, str]:
-        """唤醒 Reviewer（暂时保持旧接口，后续 Phase 4e 适配 Observer）"""
+        """唤醒 Reviewer，传入已缝合的代码和 sandbox 目录"""
         reviewer = self._get_reviewer()
+        sandbox_dir = self.vfs.sandbox_dir if self.vfs else None
         try:
-            return reviewer.evaluate_draft(task.target_file, task.description)
+            return reviewer.evaluate_draft(task.target_file, task.description,
+                                           code_content=merged_code,
+                                           sandbox_dir=sandbox_dir)
         except Exception as e:
+            err_msg = str(e)
+            if 'interpreter shutdown' in err_msg or 'Event loop is closed' in err_msg:
+                logger.warning(f"🛑 检测到 Python 解释器关闭，Engine 将停止")
+                self._shutdown = True
+                return False, "系统正在关闭"
             logger.error(f"❌ Reviewer 调用异常: {e}")
             task.log_error(f"Reviewer 异常: {e}")
             return False, f"Reviewer 执行异常: {e}"
@@ -443,6 +522,7 @@ class AstreaEngine:
 
         project_id = self.project_id
         bb_state = self.blackboard.state
+        vfs_ref = self.vfs  # 捕获引用给后台线程用
 
         def _bg_settlement():
             try:
@@ -451,13 +531,18 @@ class AstreaEngine:
 
                 synthesizer = SynthesizerAgent(project_id=project_id)
 
-                # 构建里程碑(兼容旧接口)
+                # 构建里程碑 — 从真理区读取最终代码
                 milestones_list = []
                 for task in bb_state.tasks:
+                    # 从真理区读取最终代码
+                    final_code = ""
+                    if vfs_ref:
+                        final_code = vfs_ref.read_truth(task.target_file) or ""
+
                     milestone = {
                         "a": "",
                         "b": "\n".join(task.error_logs) if task.error_logs else "",
-                        "c": "",  # 最终代码需要从轨迹表读取
+                        "c": final_code,
                     }
                     milestones_list.append({
                         "task": {"task_id": task.task_id, "target_file": task.target_file},
@@ -549,6 +634,9 @@ class AstreaEngine:
                     self.blackboard.state.project_id = new_id
                     rename_project_events(old_id, new_id)
                     rename_project_meta(old_id, new_id, safe_name)
+                    # 清理旧 Checkpoint（否则旧 "新建项目" key 永不删除）
+                    from core.database import delete_checkpoint
+                    delete_checkpoint(old_id)
                     global_broadcaster.emit_sync("System", "project_renamed",
                         f"项目已重命名: {safe_name}",
                         {"old_id": old_id, "new_id": new_id})

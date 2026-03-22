@@ -21,7 +21,6 @@ import tempfile
 import threading
 from typing import Dict, Any, Optional, Set, List
 
-from core.state_manager import global_state_manager
 from tools.package_map import IMPORT_TO_PACKAGE, STDLIB_MODULES, COMMON_PROJECT_MODULES
 
 logger = logging.getLogger("Sandbox")
@@ -324,9 +323,11 @@ class PythonSandbox:
             "cors": [],  # 通常随 fastapi 安装
         }
         # 跳过的纯标识名（语言、前端技术等，不是 pip 包）
-        SKIP_NAMES = {'python', 'python3', 'html', 'css', 'javascript', 'js',
+        SKIP_NAMES = {'python', 'python3', 'python 3', 'html', 'html5', 'css', 'css3',
+                      'javascript', 'js', 'es6', 'es2015', 'vanilla',
                       'typescript', 'ts', 'sql', 'sqlite', 'sqlite3', 'json', 'yaml', 'xml',
-                      'react', 'vue', 'angular', 'node', 'nodejs', 'npm'}
+                      'react', 'vue', 'angular', 'node', 'nodejs', 'npm',
+                      'tailwind', 'tailwindcss', 'bootstrap', 'sass', 'scss', 'less'}
         
         try:
             logger.info(f"🔥 Sandbox 预热启动: {project_id}, tech_stacks={tech_stacks}")
@@ -342,7 +343,7 @@ class PythonSandbox:
                 for part in parts:
                     key = part.lower().strip()
                     # 去除版本号后缀：python 3 → python, flask 2.0 → flask
-                    key = _re.sub(r'\s*[\d.]+$', '', key).strip()
+                    key = re.sub(r'\s*[\d.]+$', '', key).strip()
                     if not key:
                         continue
                     if key in SKIP_NAMES:
@@ -425,20 +426,36 @@ class PythonSandbox:
             pass
         return imports
     
-    def _auto_install_deps(self, code_string: str, project_id: str):
+    def _auto_install_deps(self, code_string: str, project_id: str, sandbox_dir: str = None):
         """
         自动扫描 import 并安装缺失的第三方包。
-        同时扫描 VFS 中其他文件的 import（因为被测代码可能依赖项目内的其他文件，
-        而那些文件可能 import 了第三方库）。
+        同时扫描项目文件的 import（因为被测代码可能依赖项目内的其他文件）。
+
+        v1.3: 优先从 sandbox_dir（VfsUtils .sandbox 目录）读取项目文件。
         """
         all_imports = self._extract_imports(code_string)
         
-        # 也扫描 VFS 中的项目文件，同时收集项目内模块名
+        # 扫描项目文件，同时收集项目内模块名
         vfs_modules = set()
         try:
-            vfs = global_state_manager.get_vfs(project_id)
-            vfs_dict = vfs.get_all_vfs()
-            for file_path, content in vfs_dict.items():
+            project_files = {}
+            if sandbox_dir and os.path.isdir(sandbox_dir):
+                # v1.3: 从 VfsUtils sandbox 目录读取
+                for root, _, files in os.walk(sandbox_dir):
+                    for fname in files:
+                        if fname.endswith('.py'):
+                            fpath = os.path.join(root, fname)
+                            rel = os.path.relpath(fpath, sandbox_dir).replace('\\', '/')
+                            try:
+                                with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                                    project_files[rel] = f.read()
+                            except Exception:
+                                pass
+            else:
+                # sandbox_dir 未提供，跳过项目文件扫描
+                pass
+
+            for file_path, content in project_files.items():
                 file_imports = self._extract_imports(content)
                 all_imports.update(file_imports)
                 # 收集项目内模块名：main.py → main, backend/main.py → backend, main
@@ -475,30 +492,43 @@ class PythonSandbox:
             package_name = IMPORT_TO_PACKAGE.get(imp, imp)
             self.venv_manager.install_package(project_id, package_name)
     
-    def execute_code(self, code_string: str, project_id: str, stdin_data: str = None) -> Dict[str, Any]:
+    def execute_code(self, code_string: str, project_id: str, stdin_data: str = None,
+                     sandbox_dir: str = None) -> Dict[str, Any]:
         """
         核心执行方法：
         1. 等待预热完成（如有）
         2. 获取项目 sandbox venv
         3. 自动安装依赖
         4. 在阅后即焚临时目录中执行
+
+        v1.3: sandbox_dir 由 Engine 传入（VfsUtils .sandbox 目录），
+        优先从该目录复制项目文件，不再依赖 StateManager VFS。
         """
         # 等待预热完成（如果 Manager 已触发异步预热）
         self.wait_warmup(project_id)
-        
-        vfs = global_state_manager.get_vfs(project_id)
         
         # 1. 获取 sandbox venv 的 python 路径
         sandbox_python = self.venv_manager.get_or_create_venv(project_id)
         
         # 2. 自动扫描并安装缺失依赖
-        self._auto_install_deps(code_string, project_id)
+        self._auto_install_deps(code_string, project_id, sandbox_dir=sandbox_dir)
         
         # 3. 阅后即焚执行
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
-                # 挂载 VFS 文件到临时目录
-                vfs.sync_to_sandbox(temp_dir)
+                # v1.3: 从 VfsUtils sandbox 目录复制项目文件
+                if sandbox_dir and os.path.isdir(sandbox_dir):
+                    import shutil
+                    for item in os.listdir(sandbox_dir):
+                        src = os.path.join(sandbox_dir, item)
+                        dst = os.path.join(temp_dir, item)
+                        if os.path.isdir(src):
+                            shutil.copytree(src, dst, dirs_exist_ok=True)
+                        else:
+                            shutil.copy2(src, dst)
+                else:
+                    # sandbox_dir 未提供，无项目文件可复制
+                    logger.warning("⚠️ sandbox_dir 未提供，测试脚本将在空目录中执行")
                 
                 # 生成运行脚本
                 task_id = uuid.uuid4().hex[:8]

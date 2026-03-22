@@ -55,7 +55,11 @@ class WebSocketBroadcaster:
 
         # 尝试使用我们通过 FastAPI startup 保存的主事件循环
         if hasattr(self, 'main_loop') and self.main_loop:
-            asyncio.run_coroutine_threadsafe(self.broadcast(msg), self.main_loop)
+            try:
+                asyncio.run_coroutine_threadsafe(self.broadcast(msg), self.main_loop)
+            except RuntimeError:
+                # Event loop 已关闭（服务器已停止），静默忽略
+                pass
         else:
             try:
                 loop = asyncio.get_running_loop()
