@@ -107,6 +107,15 @@ class TaskTrajectory(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class BlackboardCheckpoint(Base):
+    """Blackboard 断点续传快照 (v1.3)"""
+    __tablename__ = "blackboard_checkpoints"
+
+    project_id = Column(String(200), primary_key=True)
+    state_json = Column(Text, nullable=False)         # BlackboardState.model_dump_json()
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 # ============================================================
 # 3. 初始化
 # ============================================================
@@ -145,7 +154,7 @@ def init_db():
             ON memories USING GIN(tech_stacks)
         """))
         conn.commit()
-    logger.info("✅ 数据库初始化完成 (含 v1.2.2 迁移 + GIN 索引)")
+    logger.info("✅ 数据库初始化完成 (含 v1.3 迁移 + GIN 索引)")
 
 
 def check_health() -> bool:
@@ -1080,5 +1089,83 @@ def delete_project_events(project_id: str):
     except Exception as e:
         session.rollback()
         logger.error(f"清除项目短期记忆失败: {e}")
+    finally:
+        ScopedSession.remove()
+
+
+# ============================================================
+# Blackboard Checkpoint 持久化 (v1.3)
+# ============================================================
+
+def save_checkpoint(project_id: str, state_json: str):
+    """UPSERT Blackboard 状态快照到 PostgreSQL"""
+    session = ScopedSession()
+    try:
+        existing = session.query(BlackboardCheckpoint).filter(
+            BlackboardCheckpoint.project_id == project_id
+        ).first()
+        if existing:
+            existing.state_json = state_json
+            existing.updated_at = datetime.utcnow()
+        else:
+            session.add(BlackboardCheckpoint(
+                project_id=project_id,
+                state_json=state_json,
+            ))
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        logger.error(f"❌ Checkpoint 保存失败: {e}")
+        raise
+    finally:
+        ScopedSession.remove()
+
+
+def load_checkpoint(project_id: str) -> Optional[str]:
+    """从 PostgreSQL 加载 Blackboard 状态快照"""
+    session = ScopedSession()
+    try:
+        row = session.query(BlackboardCheckpoint).filter(
+            BlackboardCheckpoint.project_id == project_id
+        ).first()
+        return row.state_json if row else None
+    except Exception as e:
+        logger.error(f"❌ Checkpoint 加载失败: {e}")
+        return None
+    finally:
+        ScopedSession.remove()
+
+
+def delete_checkpoint(project_id: str):
+    """清理已完成/放弃的 Blackboard 快照"""
+    session = ScopedSession()
+    try:
+        session.query(BlackboardCheckpoint).filter(
+            BlackboardCheckpoint.project_id == project_id
+        ).delete()
+        session.commit()
+        logger.info(f"🗑️ Checkpoint 已清理: {project_id}")
+    except Exception as e:
+        session.rollback()
+        logger.error(f"❌ Checkpoint 清理失败: {e}")
+    finally:
+        ScopedSession.remove()
+
+
+def list_pending_checkpoints() -> List[Dict[str, Any]]:
+    """列出所有未完成的 Checkpoint（用于前端恢复弹窗）"""
+    session = ScopedSession()
+    try:
+        rows = session.query(BlackboardCheckpoint).all()
+        return [
+            {
+                "project_id": r.project_id,
+                "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.error(f"❌ Checkpoint 列表查询失败: {e}")
+        return []
     finally:
         ScopedSession.remove()
