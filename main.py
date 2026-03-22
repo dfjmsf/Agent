@@ -6,7 +6,7 @@ import logging
 # 确保能找到 core 和 agents 模块
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from agents.manager import ManagerAgent
+from core.engine import AstreaEngine
 
 # 设置基础的控制台日志输出格式
 logging.basicConfig(
@@ -27,7 +27,7 @@ def read_prompt_from_file(file_path: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="🚀 Qwen Multi-Agent 协同代码生成框架",
+        description="🚀 ASTrea v1.3 Multi-Agent 协同代码生成框架",
         formatter_class=argparse.RawTextHelpFormatter,
         epilog="""
 【示例用法】
@@ -63,15 +63,12 @@ def main():
         logger.error("❌ 错误：为您提供的项目需求是空的！")
         sys.exit(1)
 
-    # 2. 如果存在上一个项目残留，强行清空历史幽灵代码
-    # (已由 Manager.run_project() 内部统一处理)
-
     print("\n" + "="*60)
-    print("▶️ 开始进行多智能体协同代码生成...")
+    print("▶️ AstreaEngine v1.3 启动 — 多智能体协同代码生成...")
     print("="*60 + "\n")
 
-    manager = ManagerAgent()
-    success, final_dir = manager.run_project(user_requirement, args.out_dir)
+    engine = AstreaEngine(project_id="default_project")
+    success, final_dir = engine.run(user_requirement, args.out_dir)
 
     if not success:
         logger.critical("💥 项目生成失败，请查看上方日志获取详细信息。")
@@ -81,3 +78,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

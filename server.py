@@ -20,6 +20,7 @@ from datetime import datetime
 sys.path.append(str(os.path.dirname(os.path.abspath(__file__))))
 
 from agents.manager import ManagerAgent
+from core.engine import AstreaEngine
 from core.state_manager import global_state_manager
 from core.ws_broadcaster import global_broadcaster
 
@@ -127,6 +128,23 @@ async def lifespan(app: FastAPI):
     observer.start()
     logger.info(f"👀 Watchdog 已启动，正在静默监控目录: {projects_dir}")
 
+    # v1.3: 启动时检测未完成的 Checkpoint
+    try:
+        from core.database import list_pending_checkpoints
+        pending = list_pending_checkpoints()
+        if pending:
+            logger.info(f"🔄 检测到 {len(pending)} 个未完成的 Checkpoint:")
+            for cp in pending:
+                logger.info(f"   📌 {cp['project_id']} (更新于 {cp['updated_at']})")
+            # 通知前端（WebSocket 延迟发送）
+            async def _notify_pending():
+                await asyncio.sleep(2)  # 等待前端 WebSocket 连接
+                global_broadcaster.emit_sync("System", "pending_checkpoints",
+                    f"发现 {len(pending)} 个未完成的项目可恢复", {"checkpoints": pending})
+            asyncio.create_task(_notify_pending())
+    except Exception as e:
+        logger.warning(f"⚠️ Checkpoint 检测异常: {e}")
+
     yield  # === 应用运行中 ===
 
     # === Shutdown ===
@@ -175,9 +193,9 @@ def run_project_thread(prompt: str, out_dir: str, project_id: str):
         return
 
     try:
-        logger.info(f"后台协程：开始启动 Manager 同步阻塞流程 (Project: {project_id})...")
-        manager = ManagerAgent(project_id=project_id)
-        success, final_dir = manager.run_project(prompt, out_dir or None)
+        logger.info(f"后台线程：AstreaEngine 启动 (Project: {project_id})...")
+        engine = AstreaEngine(project_id=project_id)
+        success, final_dir = engine.run(prompt, out_dir or None)
         if not success:
             logger.error(f"项目生成失败，输出目录: {final_dir}")
     except Exception as e:
@@ -208,7 +226,41 @@ async def start_generation(req: GenerateReq, bg_tasks: BackgroundTasks):
     """
     t = threading.Thread(target=run_project_thread, args=(req.prompt, req.out_dir, req.project_id))
     t.start()
-    return {"status": "started", "message": "Multi-Agent System Activated in Background Thread"}
+    return {"status": "started", "message": "AstreaEngine Activated in Background Thread"}
+
+
+class ResumeReq(BaseModel):
+    project_id: str
+
+@app.post("/api/project/resume")
+async def resume_project(req: ResumeReq):
+    """从 Checkpoint 恢复中断的项目"""
+    engine = AstreaEngine.resume(req.project_id)
+    if not engine:
+        return {"status": "error", "message": f"未找到项目 {req.project_id} 的 Checkpoint"}
+
+    def _resume_thread():
+        lock = _get_project_lock(req.project_id)
+        if not lock.acquire(blocking=False):
+            global_broadcaster.emit_sync("System", "error", f"项目 {req.project_id} 已有任务在执行中")
+            return
+        try:
+            # 继续执行
+            engine._phase_execution()
+        except Exception as e:
+            global_broadcaster.emit_sync("System", "error", f"恢复执行异常: {str(e)}")
+        finally:
+            lock.release()
+
+    t = threading.Thread(target=_resume_thread)
+    t.start()
+    return {"status": "resumed", "project_id": req.project_id}
+
+@app.get("/api/project/checkpoints")
+async def get_pending_checkpoints():
+    """列出所有可恢复的 Checkpoint"""
+    from core.database import list_pending_checkpoints
+    return {"checkpoints": list_pending_checkpoints()}
 
 
 # --- 文件上下文挂载 (Context Uploads) ---
