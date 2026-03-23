@@ -961,6 +961,42 @@ def recall(
 
 
 
+def recall_reviewer_experience(
+    query: str,
+    n_results: int = 2,
+    caller: str = "Reviewer",
+) -> List[str]:
+    """
+    Reviewer 测试经验轻量召回（exp_type='reviewer_test'）。
+    
+    纯向量相似度，不走 BM25/Rerank/AMC，开销极小。
+    返回: ["经验1内容", "经验2内容"]
+    """
+    t0 = time.time()
+    embedding = get_embedding(query)
+    if not embedding:
+        return []
+    
+    session = ScopedSession()
+    try:
+        results = session.query(Memory).filter(
+            Memory.exp_type == "reviewer_test",
+            Memory.scope == "global",
+        ).order_by(
+            Memory.embedding.cosine_distance(embedding)
+        ).limit(n_results).all()
+        
+        contents = [r.content for r in results]
+        elapsed = (time.time() - t0) * 1000
+        logger.info(f"🧪 [{caller}] Reviewer 测试经验召回 ({elapsed:.0f}ms): {len(contents)} 条")
+        return contents
+    except Exception as e:
+        logger.error(f"Reviewer 测试经验召回失败: {e}")
+        return []
+    finally:
+        ScopedSession.remove()
+
+
 # ============================================================
 # 7. 项目元数据操作
 # ============================================================

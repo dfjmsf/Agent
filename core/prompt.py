@@ -44,6 +44,11 @@ class Prompts:
 {{
   "tech_stack": ["技术1", "技术2"],
   "module_graph": "模块依赖描述（如 main.py → routes.py → models.py）",
+  "module_interfaces": {{
+    "文件A.py": "class/def 名称(参数签名) -> 返回类型",
+    "文件B.py": "def 函数名(参数: 类型) -> 返回类型; class 类名(方法列表)",
+    "入口文件.py": "入口描述: 实例化哪些对象, 调用哪些函数, 监听哪个端口"
+  }},
   "api_contracts": [
     {{
       "base_url": "http://localhost:5001(8000已被系统后端占用，推荐 5001、5002 等)",
@@ -64,9 +69,10 @@ class Prompts:
 【规则】
 1. 输出必须是纯净 JSON，不带任何 Markdown 标记。
 2. api_contracts 仅在有 Web API 时填写，否则留空数组。前后端分离项目必须填写 base_url（含端口号），确保前端代码能正确请求后端。
-3. 对于简单单文件脚本，所有字段都应极简（如 tech_stack 只写 ["Python 3"]）。
-4. 总字数控制在 500 字以内，追求信息密度而非面面俱到。
+3. 对于简单单文件脚本，所有字段都应极简（如 tech_stack 只写 ["Python 3"]，module_interfaces 只写入口文件）。
+4. 总字数控制在 800 字以内，追求信息密度而非面面俱到。
 5. response_body 是接口返回的精确 JSON 结构，后端必须严格返回该结构，禁止自行添加 success/data/code 等包装层。response_example 是一个具体的返回值示例。
+6. 【module_interfaces 是跨文件铁律契约】每个模块必须声明它向外暴露的函数名/类名及参数签名。下游文件（如 app.py）必须严格按此签名调用上游模块（如 routes.py）。Coder 禁止凭猜测自创接口名！
 """
 
     MANAGER_SPEC_UPDATE_SYSTEM = """你是一个世界顶级的架构师（Manager Agent）。
@@ -113,6 +119,9 @@ class Prompts:
    本系统运行在 Windows 上，文件句柄未释放会导致 PermissionError 文件锁：
    - 涉及文件操作（open/sqlite3/shelve/dbm）时，必须使用 `with` 语句或在 finally 中显式 `close()`。
    - SQLite 连接必须在使用完毕后显式关闭（`conn.close()`），不能依赖垃圾回收。
+5. 【DRY 铁律：禁止重复造轮子】
+   写路由/控制器时，如果 module_interfaces 中显示 Model 类已有 `to_dict()`/`from_dict()` 等序列化方法，必须直接调用，禁止手动重复写 JSON 解析/序列化逻辑！
+   同理，如果依赖文件骨架中已有现成的工具函数，优先调用而非复制粘贴。
 
 【⚠️ 输出格式 — 必须使用 XML 包裹】
 你的输出必须使用以下 XML 标签包裹代码，系统会提取标签内的内容：
@@ -135,7 +144,8 @@ class Prompts:
 【项目规划书 — 全局架构契约（最高优先级，必须严格遵守，覆盖一切历史经验）】
 {project_spec}
 
-请严格按照项目规划书中的 api_contracts（含 base_url、端口号、路径）编写代码。
+请严格按照项目规划书中的 api_contracts（含 base_url、端口号、路径）和 module_interfaces（函数名、参数签名）编写代码。
+跨文件调用时，函数名和参数必须与 module_interfaces 中定义的完全一致，禁止自创接口名！
 """
 
     # --- 2B. 前端工程师 (HTML/CSS/JS 文件) ---
@@ -171,7 +181,8 @@ class Prompts:
 【项目规划书 — 全局架构契约（最高优先级，必须严格遵守，覆盖一切历史经验）】
 {project_spec}
 
-请严格按照项目规划书中的 api_contracts（含 base_url、端口号、路径）编写代码。
+请严格按照项目规划书中的 api_contracts（含 base_url、端口号、路径）和 module_interfaces（函数名、参数签名）编写代码。
+跨文件调用时，函数名和参数必须与 module_interfaces 中定义的完全一致，禁止自创接口名！
 """
 
     # 兼容旧代码引用
@@ -206,7 +217,7 @@ Coder 刚刚写完了一份代码草案。你必须基于事实审查它。
      result = asyncio.run(get_notes())   # ✅ 正确
      result = get_notes()                # ❌ 返回 coroutine，不是结果！
      ```
-   - 【禁止运行时测试 CORS！】无论 Flask 还是 FastAPI，TestClient 都不是浏览器，无法真实触发 CORS。禁止 `assert 'cors' in app.extensions`、禁止检查 Access-Control 响应头。唯一合法方式：用 `open()` 读源文件，检查是否包含 "CORSMiddleware" 或 "CORS(app" 字符串。
+   - 【禁止运行时测试 CORS！】无论 Flask 还是 FastAPI，TestClient 都不是浏览器，禁止 `assert 'cors' in app.extensions`、禁止检查 Access-Control 响应头。唯一合法方式：用 `open()` 读源文件检查字符串。
    - 【禁止假设 HTTP 状态码！】
      你必须仔细阅读 Coder 提交的代码，观察其错误处理逻辑（是 raise HTTPException(400)？还是 422？还是自定义状态码？），然后据此编写断言。
      禁止拍脑袋写 `assert response.status_code == 400` 这种硬编码断言！如果代码里没有显式抛出 400，就不要断言 400。
@@ -250,14 +261,7 @@ Coder 刚刚写完了一份代码草案。你必须基于事实审查它。
 6. 【DeprecationWarning = FAIL】
    如果沙盒执行结果的 stderr 中包含 `DeprecationWarning`、`PendingDeprecationWarning` 或 `FutureWarning`，必须判定为 FAIL。
    弃用警告意味着代码使用了即将被移除的 API，必须在当前版本就修复。
-   例如 FastAPI 的 `Query(regex=...)` 已弃用，应改为 `Query(pattern=...)`。
    将警告内容和修复建议写入 feedback 退回给 Coder。
-7. 【测试脚本语法铁律】
-   你生成的测试脚本本身必须是合法的 Python！常见致命错误：
-   - SQL 语句必须用引号字符串包裹：`cursor.execute('CREATE TABLE ...')`，禁止裸写 SQL！
-   - JSON 字符串必须用引号包裹，禁止直接写裸 JSON。
-   - 从被测代码中复制多行文本时，必须确保它在 Python 中是合法的字符串字面量。
-   你的测试脚本如果自身就有 SyntaxError / IndentationError，这是你的失职！
 """
 
     REVIEWER_TOOL_SCHEMA = [

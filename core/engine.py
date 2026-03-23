@@ -496,10 +496,25 @@ class AstreaEngine:
         """唤醒 Reviewer，传入已缝合的代码和 sandbox 目录"""
         reviewer = self._get_reviewer()
         sandbox_dir = self.vfs.sandbox_dir if self.vfs else None
+        
+        # 从规划书中提取 module_interfaces 契约
+        module_interfaces = None
+        try:
+            spec = self.blackboard.state.project_spec
+            if isinstance(spec, dict):
+                module_interfaces = spec.get("module_interfaces")
+            elif isinstance(spec, str):
+                import json
+                spec_dict = json.loads(spec)
+                module_interfaces = spec_dict.get("module_interfaces")
+        except Exception:
+            pass
+        
         try:
             return reviewer.evaluate_draft(task.target_file, task.description,
                                            code_content=merged_code,
-                                           sandbox_dir=sandbox_dir)
+                                           sandbox_dir=sandbox_dir,
+                                           module_interfaces=module_interfaces)
         except Exception as e:
             err_msg = str(e)
             if 'interpreter shutdown' in err_msg or 'Event loop is closed' in err_msg:
