@@ -12,7 +12,10 @@ class Prompts:
 3. **每个 target_file 只允许出现一次！** 不允许将同一个文件拆成多个 task。一个文件的所有功能在一个 task 中完成。
 4. 对于简单需求（如单脚本、单文件工具），tasks 数组只需要 1 个元素即可，不要过度拆解！
 5. dependencies 必须构成有向无环图（DAG），禁止循环依赖（如 task_1 → task_2 → task_1）。
-5. 你的输出必须是符合以下 Schema 的纯净 JSON 格式，不要携带任何 Markdown 代码块标签（如 ```json）：
+6. 【Web 项目必须包含前端！】如果需求涉及 Web 应用、UI 界面、前后端分离，则必须同时规划前端文件，禁止只规划后端！
+7. 【前端文件必须拆分！】前端禁止将 HTML/CSS/JS 全部塞入一个文件。必须至少拆分为：index.html（结构）+ style.css（样式）+ app.js（交互逻辑）。
+8. 【前后端分离项目必须加 CORS！】后端入口文件必须配置 CORS（如 flask-cors 或 FastAPI CORSMiddleware），否则前端无法请求 API。
+9. 你的输出必须是符合以下 Schema 的纯净 JSON 格式，不要携带任何 Markdown 代码块标签（如 ```json）：
 
 {
   "project_name": "项目名称",
@@ -20,15 +23,33 @@ class Prompts:
   "tasks": [
     {
       "task_id": "task_1",
-      "target_file": "src/main.py",
-      "description": "实现基础 FastAPI 路由挂载",
+      "target_file": "src/models.py",
+      "description": "定义数据模型",
       "dependencies": []
     },
     {
       "task_id": "task_2",
-      "target_file": "src/models.py",
-      "description": "定义 User 数据库模型",
+      "target_file": "src/app.py",
+      "description": "实现后端入口和路由，配置 CORS",
       "dependencies": ["task_1"]
+    },
+    {
+      "task_id": "task_3",
+      "target_file": "frontend/index.html",
+      "description": "前端 HTML 页面结构，引用 style.css 和 app.js",
+      "dependencies": ["task_2"]
+    },
+    {
+      "task_id": "task_4",
+      "target_file": "frontend/style.css",
+      "description": "前端样式",
+      "dependencies": ["task_3"]
+    },
+    {
+      "task_id": "task_5",
+      "target_file": "frontend/app.js",
+      "description": "前端交互逻辑，调用后端 API",
+      "dependencies": ["task_3", "task_4"]
     }
   ]
 }
@@ -45,9 +66,10 @@ class Prompts:
   "tech_stack": ["技术1", "技术2"],
   "module_graph": "模块依赖描述（如 main.py → routes.py → models.py）",
   "module_interfaces": {{
-    "文件A.py": "class/def 名称(参数签名) -> 返回类型",
-    "文件B.py": "def 函数名(参数: 类型) -> 返回类型; class 类名(方法列表)",
-    "入口文件.py": "入口描述: 实例化哪些对象, 调用哪些函数, 监听哪个端口"
+    "后端模块A.py": "class/def 名称(参数签名) -> 返回类型",
+    "后端模块B.py": "def 函数名(参数: 类型) -> 返回类型; class 类名(方法列表)",
+    "入口文件.py": "入口描述: 实例化哪些对象, 调用哪些函数, 监听哪个端口",
+    "前端页面.html": "页面结构描述: 包含哪些交互元素, 调用哪些 API"
   }},
   "api_contracts": [
     {{
@@ -69,10 +91,11 @@ class Prompts:
 【规则】
 1. 输出必须是纯净 JSON，不带任何 Markdown 标记。
 2. api_contracts 仅在有 Web API 时填写，否则留空数组。前后端分离项目必须填写 base_url（含端口号），确保前端代码能正确请求后端。
-3. 对于简单单文件脚本，所有字段都应极简（如 tech_stack 只写 ["Python 3"]，module_interfaces 只写入口文件）。
-4. 总字数控制在 800 字以内，追求信息密度而非面面俱到。
-5. response_body 是接口返回的精确 JSON 结构，后端必须严格返回该结构，禁止自行添加 success/data/code 等包装层。response_example 是一个具体的返回值示例。
-6. 【module_interfaces 是跨文件铁律契约】每个模块必须声明它向外暴露的函数名/类名及参数签名。下游文件（如 app.py）必须严格按此签名调用上游模块（如 routes.py）。Coder 禁止凭猜测自创接口名！
+3. 【前后端分离项目必须配置 CORS！】key_decisions 中必须注明后端需要启用 CORS（如 flask-cors 或 FastAPI CORSMiddleware）。
+4. 对于简单单文件脚本，所有字段都应极简（如 tech_stack 只写 ["Python 3"]，module_interfaces 只写入口文件）。
+5. 总字数控制在 800 字以内，追求信息密度而非面面俱到。
+6. response_body 是接口返回的精确 JSON 结构，后端必须严格返回该结构，禁止自行添加 success/data/code 等包装层。response_example 是一个具体的返回值示例。
+7. 【module_interfaces 是跨文件铁律契约】每个模块必须声明它向外暴露的函数名/类名及参数签名。下游文件（如 app.py）必须严格按此签名调用上游模块（如 routes.py）。Coder 禁止凭猜测自创接口名！
 """
 
     MANAGER_SPEC_UPDATE_SYSTEM = """你是一个世界顶级的架构师（Manager Agent）。
@@ -210,58 +233,19 @@ Coder 刚刚写完了一份代码草案。你必须基于事实审查它。
    - 绝对禁止在测试脚本中调用 `main()` 函数！绝对禁止运行含有 `input()` 的入口代码！
    - 沙盒环境没有 stdin 输入，任何触发 `input()` 的调用都会导致 EOFError 崩溃！
    - 如果被测文件是一个纯入口脚本（例如只有 `if __name__` 块），请只做语法检查（`compile()`），不要尝试执行。
-   - 【异步函数测试】如果被测函数是 `async def`（常见于 FastAPI 路由），测试时必须用 `asyncio.run()` 调用，禁止直接调用！
-     直接调用 async 函数只会返回 coroutine 对象而非实际结果。示例:
-     ```
-     import asyncio
-     result = asyncio.run(get_notes())   # ✅ 正确
-     result = get_notes()                # ❌ 返回 coroutine，不是结果！
-     ```
+   - 【异步函数测试】如果被测函数是 `async def`，测试时必须用 `asyncio.run()` 调用，禁止直接调用（直接调用只返回 coroutine 对象）。
    - 【禁止运行时测试 CORS！】无论 Flask 还是 FastAPI，TestClient 都不是浏览器，禁止 `assert 'cors' in app.extensions`、禁止检查 Access-Control 响应头。唯一合法方式：用 `open()` 读源文件检查字符串。
    - 【禁止假设 HTTP 状态码！】
-     你必须仔细阅读 Coder 提交的代码，观察其错误处理逻辑（是 raise HTTPException(400)？还是 422？还是自定义状态码？），然后据此编写断言。
-     禁止拍脑袋写 `assert response.status_code == 400` 这种硬编码断言！如果代码里没有显式抛出 400，就不要断言 400。
-     如果你不确定返回什么状态码，用如下"观测式"写法：
+     仔细阅读 Coder 的代码观察其错误处理逻辑，据此编写断言。不确定时用"观测式"写法：
      ```
-     response = client.get("/api/xxx?bad_param=abc")
-     print(f"实际状态码: {response.status_code}")  # 先观测
-     print(f"实际响应: {response.json()}")
+     print(f"实际状态码: {response.status_code}")
      assert response.status_code != 200, "异常请求不应返回 200"  # 宽松断言
      ```
-   - 【先观测再断言（Observe-First 原则）】
-     对于你不确定具体返回值的测试场景，先用 print() 打印实际结果，再写宽松断言。
-     ❌ 错误：`assert response.status_code == 400` (硬猜)
-     ✅ 正确：`assert response.status_code >= 400` (只验证是错误码)
-     ✅ 正确：`assert "error" in response.json() or response.status_code >= 400` (灵活验证)
    - 【非 Python 文件测试策略】
-     当 target_file 是 HTML/CSS/JS 等非 Python 文件时，不能用 `from xxx import` 导入。应改用以下策略：
-     - HTML 文件：用 `html.parser.HTMLParser` 做语法检查，或用 `open()` 读取后验证关键标签/属性是否存在
-     - CSS 文件：用 `open()` 读取后检查关键选择器/属性是否存在
-     - JS 文件：用 `open()` 读取后检查关键函数名/变量名是否存在
-4. 【Windows 文件锁安全规范】
-   本系统运行在 Windows 上，文件锁机制严格：
-   - 测试中若创建了数据库连接（SQLite/其他），必须在 cleanup 前显式关闭连接（`conn.close()`）。
-   - 测试脚本的 cleanup 阶段（`os.remove()`、`os.unlink()`、`shutil.rmtree()`）必须用 `try/except (PermissionError, OSError)` 包裹，禁止裸调用。
-   - 临时文件优先使用 `tempfile.NamedTemporaryFile(delete=False)` + 手动清理，或用 `atexit` 延迟清理。
-   - 示例:
-     ```
-     conn.close()  # 必须先关闭！
-     try:
-         os.remove(db_path)
-     except (PermissionError, OSError):
-         pass  # Windows 文件锁，静默跳过
-     ```
-5. 【路径断言规范】
+     当 target_file 是 HTML/CSS/JS 等非 Python 文件时，不能用 `from xxx import` 导入。应改用 `open()` 读取后验证关键标签/函数名/选择器是否存在。
+4. 【路径断言规范】
    沙盒中所有文件都在临时目录运行，绝对路径每次不同。断言路径时只检查相对特征：
-   ```
-   assert app.template_folder.endswith("frontend")
-   assert os.path.basename(db_path) == "data.db"
-   assert "src" in config_path
-   ```
-6. 【DeprecationWarning = FAIL】
-   如果沙盒执行结果的 stderr 中包含 `DeprecationWarning`、`PendingDeprecationWarning` 或 `FutureWarning`，必须判定为 FAIL。
-   弃用警告意味着代码使用了即将被移除的 API，必须在当前版本就修复。
-   将警告内容和修复建议写入 feedback 退回给 Coder。
+   `assert app.template_folder.endswith("frontend")` 或 `assert os.path.basename(db_path) == "data.db"`
 """
 
     REVIEWER_TOOL_SCHEMA = [

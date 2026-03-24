@@ -129,7 +129,7 @@ class CoderAgent:
         
         return memory_hint
 
-    def _build_fix_hint(self, target_file: str, description: str) -> str:
+    def _build_fix_hint(self, target_file: str, description: str, observer_context: str = "") -> str:
         """
         构建修复模式专用的精简记忆（不重新召回全局 RAG）。
 
@@ -137,6 +137,7 @@ class CoderAgent:
         已经看过的全局经验。只保留：
         - 项目专属经验（可能包含本次踩坑相关的规则）
         - 最近 1 条 TDD 事件（最新的报错，避免重蹈覆辙）
+        - 依赖文件实际签名（精准注入，保证接口匹配）
         """
         fix_hint = ""
         
@@ -156,6 +157,10 @@ class CoderAgent:
         )
         if tdd_events:
             fix_hint += f"\n\n【🔄 最近一次失败记录】\n  {tdd_events[0].content[:500]}"
+        
+        # 依赖文件实际签名（精准注入）
+        if observer_context:
+            fix_hint += f"\n\n【📐 依赖文件实际签名（import/调用必须与此一致）】\n{observer_context}"
         
         return fix_hint
 
@@ -390,7 +395,7 @@ class CoderAgent:
         
         if edit_instruction:
             # 修复模式：精简记忆（不重新召回全局 RAG，节省 ~1500 tokens/次）
-            fix_hint = self._build_fix_hint(target_file, description)
+            fix_hint = self._build_fix_hint(target_file, description, observer_context)
             result = self._fix_with_editor(
                 target_file, description, edit_instruction,
                 existing_code=existing_code,

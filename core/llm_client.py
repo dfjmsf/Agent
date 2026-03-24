@@ -27,6 +27,7 @@ class LLMClient:
         self.client = OpenAI(
             api_key=api_key,
             base_url=base_url,
+            timeout=300.0,  # DashScope 长文件审查可能需要 2-3 分钟
         )
 
     def _update_token_usage(self, usage) -> None:

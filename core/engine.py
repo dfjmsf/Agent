@@ -114,6 +114,14 @@ class AstreaEngine:
             # 预热 sandbox
             self._warmup_sandbox()
 
+            # 防御：规划阶段未产出任何任务 → 直接失败（通常是网络异常）
+            if not self.blackboard.state.tasks:
+                logger.error("💥 规划阶段未生成任何任务，项目失败")
+                self.blackboard.set_project_status(ProjectStatus.FAILED)
+                update_project_status(self.project_id, "failed")
+                global_broadcaster.emit_sync("System", "error", "💥 规划失败：未生成任何任务（可能是网络异常）")
+                return False, out_dir or ""
+
             # Phase 2: 执行
             self.blackboard.set_project_status(ProjectStatus.EXECUTING)
             success = self._phase_execution()
@@ -414,7 +422,14 @@ class AstreaEngine:
         """唤醒 Coder，通过 Observer 预取上下文注入 task_meta"""
         coder = self._get_coder()
 
-        # (1) Observer 预取：项目文件树
+        # (1) 现有代码（提前获取，供精准依赖分析用）
+        existing_code = ""
+        if self.vfs:
+            existing_code = self.vfs.read_truth(task.target_file) or ""
+        if not existing_code and task.code_draft:
+            existing_code = task.code_draft
+
+        # (2) Observer 预取：项目文件树 + 精准依赖骨架
         observer_tree = ""
         observer_context = ""
         try:
@@ -424,8 +439,8 @@ class AstreaEngine:
             # 项目树
             observer_tree = obs.get_tree()
 
-            # 依赖文件骨架
-            dep_files = self._resolve_dep_files(task)
+            # 精准依赖分析（传递闭包 + AST import + 兜底）
+            dep_files = self._resolve_smart_deps(task, existing_code)
             if dep_files:
                 context_parts = []
                 for dep_path in dep_files:
@@ -433,21 +448,14 @@ class AstreaEngine:
                     if skeleton and "Error" not in skeleton:
                         context_parts.append(f"--- [依赖文件骨架: {dep_path}] ---\n{skeleton}\n")
                     else:
-                        # 骨架失败就读前 800 字符
                         content = obs.read_file(dep_path)
                         if content and "Error" not in content:
                             preview = content[:800] + "\n...[省略]" if len(content) > 800 else content
                             context_parts.append(f"--- [依赖文件: {dep_path}] ---\n{preview}\n")
                 observer_context = "".join(context_parts)
+                logger.info(f"📐 精准依赖注入: {dep_files}")
         except Exception as e:
             logger.warning(f"⚠️ Observer 预取异常: {e}")
-
-        # (2) 现有代码（从真理区或 Blackboard 草稿）
-        existing_code = ""
-        if self.vfs:
-            existing_code = self.vfs.read_truth(task.target_file) or ""
-        if not existing_code and task.code_draft:
-            existing_code = task.code_draft
 
         # (3) 构建 task_meta
         tasks_dict = [
@@ -485,12 +493,94 @@ class AstreaEngine:
             task.log_error(f"Coder 异常: {e}")
             return ""
 
-    def _resolve_dep_files(self, task: TaskItem) -> list:
-        """从依赖 task_id 列表反查依赖文件路径"""
-        if not task.dependencies:
+    def _resolve_smart_deps(self, task: TaskItem, existing_code: str = "") -> list:
+        """
+        三级精准依赖解析（零 LLM 成本）：
+        L1: 传递闭包 — 递归展开 task.dependencies
+        L2: AST import — 解析 existing_code 的 import 语句
+        L3: 兜底全量 — 真理区所有源码文件（上限 6 个）
+        """
+        target = task.target_file
+        truth_dir = self.vfs.truth_dir if self.vfs else None
+
+        # L1: 传递闭包
+        dep_files = self._resolve_transitive_deps(task)
+
+        # L2: AST import 分析（修复模式有 existing_code）
+        if existing_code and truth_dir:
+            import_deps = self._resolve_imports(existing_code, truth_dir, target)
+            dep_files = list(set(dep_files + import_deps))
+
+        # L3: 兜底
+        if not dep_files and truth_dir:
+            dep_files = self._get_all_truth_files(truth_dir, exclude=target)
+
+        return dep_files
+
+    def _resolve_transitive_deps(self, task: TaskItem) -> list:
+        """L1: 递归展开 task.dependencies → 传递闭包所有上游文件"""
+        id_to_task = {t.task_id: t for t in self.blackboard.state.tasks}
+        visited = set()
+
+        def _walk(deps):
+            for dep_id in deps:
+                if dep_id in visited:
+                    continue
+                visited.add(dep_id)
+                dep_task = id_to_task.get(dep_id)
+                if dep_task:
+                    _walk(dep_task.dependencies)
+
+        _walk(task.dependencies)
+        return [id_to_task[d].target_file for d in visited if d in id_to_task]
+
+    def _resolve_imports(self, code: str, truth_dir: str, exclude: str = "") -> list:
+        """L2: 从代码的 import 语句精准定位依赖文件"""
+        import ast as ast_module
+        try:
+            tree = ast_module.parse(code)
+        except SyntaxError:
             return []
-        id_to_file = {t.task_id: t.target_file for t in self.blackboard.state.tasks}
-        return [id_to_file[dep_id] for dep_id in task.dependencies if dep_id in id_to_file]
+
+        needed = []
+        for node in ast_module.walk(tree):
+            module = None
+            if isinstance(node, ast_module.ImportFrom) and node.module:
+                module = node.module
+            elif isinstance(node, ast_module.Import):
+                for alias in node.names:
+                    module = alias.name
+
+            if not module:
+                continue
+
+            # module "models" → 尝试 "models.py", "src/models.py" 等
+            candidates = [
+                module.replace(".", "/") + ".py",
+                "src/" + module.replace(".", "/") + ".py",
+            ]
+            for c in candidates:
+                if c != exclude and os.path.isfile(os.path.join(truth_dir, c)):
+                    needed.append(c)
+                    break
+
+        return needed
+
+    @staticmethod
+    def _get_all_truth_files(truth_dir: str, exclude: str = "") -> list:
+        """L3: 兜底 — 获取真理区所有源码文件（上限 6 个）"""
+        SKIP = {'.git', '__pycache__', 'node_modules', '.venv'}
+        EXTS = {'.py', '.js', '.jsx', '.ts', '.tsx', '.html', '.css'}
+        result = []
+        for root, dirs, files in os.walk(truth_dir):
+            dirs[:] = [d for d in dirs if d not in SKIP]
+            for f in files:
+                ext = os.path.splitext(f)[1].lower()
+                if ext in EXTS:
+                    rel = os.path.relpath(os.path.join(root, f), truth_dir).replace("\\", "/")
+                    if rel != exclude:
+                        result.append(rel)
+        return result[:6]
 
     def _invoke_reviewer(self, task: TaskItem, merged_code: str) -> Tuple[bool, str]:
         """唤醒 Reviewer，传入已缝合的代码和 sandbox 目录"""

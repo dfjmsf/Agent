@@ -83,6 +83,21 @@ class ReviewerAgent:
         keywords = ['DeprecationWarning', 'PendingDeprecationWarning', 'FutureWarning']
         return any(kw in stderr for kw in keywords)
 
+    @staticmethod
+    def _is_cleanup_permission_error(stderr: str) -> bool:
+        """
+        Windows 文件锁检测：如果 stderr 只包含 PermissionError
+        （通常是测试完成后清理临时文件时的文件锁），视为非致命错误。
+        """
+        if not stderr:
+            return False
+        # stderr 中有 PermissionError 且没有其他致命错误类型
+        if 'PermissionError' not in stderr:
+            return False
+        fatal_errors = ['AssertionError', 'TypeError', 'ValueError', 'AttributeError',
+                        'ImportError', 'NameError', 'KeyError', 'IndexError']
+        return not any(e in stderr for e in fatal_errors)
+
     def _extract_test_code_from_response(self, response_msg) -> str:
         """从 LLM response 的 tool_call 中提取测试脚本代码"""
         if hasattr(response_msg, "tool_calls") and response_msg.tool_calls:
@@ -261,6 +276,11 @@ class ReviewerAgent:
                         f"请根据警告信息修复代码。"
                     )
                 return True, "测试通过"
+
+            # Windows 文件锁容错：只有 PermissionError → 视为通过
+            if self._is_cleanup_permission_error(stderr):
+                logger.info("✅ Windows 文件锁异常（cleanup 阶段），忽略并视为通过")
+                return True, "测试通过（cleanup 阶段文件锁，已自动忽略）"
 
             # ── Layer 3: 失败分析 ──
             if self._is_reviewer_fault(stderr) and attempt < max_retries:

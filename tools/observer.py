@@ -188,7 +188,15 @@ class Observer:
         return result
 
     def _format_function(self, node, source: str, indent: str = "") -> str:
-        """格式化函数签名 + docstring"""
+        """格式化函数签名 + 装饰器 + docstring"""
+        parts = []
+
+        # 提取装饰器（如 @app.route('/api/notes'), @router.get('/items')）
+        for decorator in node.decorator_list:
+            dec_src = ast.get_source_segment(source, decorator)
+            if dec_src:
+                parts.append(f"{indent}@{dec_src}")
+
         # 构建完整签名
         func_type = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
 
@@ -243,6 +251,7 @@ class Observer:
                 returns = f" -> {ret}"
 
         sig = f"{indent}{func_type} {node.name}({args_str}){returns}:"
+        parts.append(sig)
 
         # Docstring
         docstring = ast.get_docstring(node)
@@ -251,10 +260,17 @@ class Observer:
             first_para = docstring.split('\n\n')[0].strip()
             if len(first_para) > 200:
                 first_para = first_para[:200] + "..."
-            sig += f'\n{indent}    """{first_para}"""'
+            parts.append(f'{indent}    """{first_para}"""')
 
-        sig += f"\n{indent}    ..."
-        return sig
+        parts.append(f"{indent}    ...")
+
+        # 递归提取有装饰器的嵌套函数（如 Flask @app.route 路由）
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if child.decorator_list:  # 只提取带装饰器的嵌套函数
+                    parts.append(self._format_function(child, source, indent=indent + "    "))
+
+        return "\n".join(parts)
 
     def _format_class(self, node, source: str) -> str:
         """格式化类定义 + 方法签名"""
@@ -326,13 +342,19 @@ class Observer:
                 for sel in selectors[:30]:  # 最多 30 个选择器
                     lines.append(f"  {sel.strip()} {{ ... }}")
 
-        # 主要 HTML 结构标签
+        # 主要 HTML 结构标签（含 id/class）
         tags = re.findall(r'<(div|section|nav|header|footer|main|form|table|ul|ol)\s[^>]*(?:id|class)="([^"]*)"', source)
         if tags:
             lines.append(f"\n## HTML 结构")
             for tag, attr in tags[:20]:
                 lines.append(f"  <{tag} ...=\"{attr}\">")
 
+        # 交互元素 ID 提取（input, textarea, button, select, a）
+        interactive_ids = re.findall(r'<(?:input|textarea|button|select|a)\s[^>]*id="([^"]*)"', source)
+        if interactive_ids:
+            lines.append(f"\n## 交互元素 ID")
+            for eid in interactive_ids:
+                lines.append(f"  #{eid}")
         result = "\n".join(lines)
         logger.info(f"👁️ get_skeleton({file_path}) → {len(result)} chars (HTML)")
         return result
