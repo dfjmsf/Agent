@@ -206,6 +206,95 @@ class ManagerAgent:
             logger.error(f"Manager 拆解任务时发生异常: {e}")
             return {"project_name": "Error_Project", "architecture_summary": "API异常", "tasks": []}
 
+    def plan_patch(self, user_requirement: str) -> dict:
+        """
+        Patch Mode 精简规划：读取项目文件树 + Observer 骨架，
+        只规划需要修改的文件（跳过 Spec 生成）。
+        """
+        logger.info("⚡ [Patch Mode] Manager 精简规划启动...")
+        global_broadcaster.emit_sync("Manager", "patch_plan_start", "Patch Mode: 分析需修改的文件...")
+
+        # 1. 读取项目文件树
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "projects", self.project_id))
+        existing_files = []
+        if os.path.isdir(base_dir):
+            ignore = {'.sandbox', '.git', '__pycache__', '.venv', 'node_modules', '.idea'}
+            for root, dirs, files in os.walk(base_dir):
+                dirs[:] = [d for d in dirs if d not in ignore]
+                for f in files:
+                    rel = os.path.relpath(os.path.join(root, f), base_dir).replace("\\", "/")
+                    existing_files.append(rel)
+        file_tree = "\n".join([f"- {f}" for f in existing_files]) if existing_files else "目录暂空。"
+
+        # 2. 提取所有源文件的 Observer 骨架
+        skeleton_parts = []
+        try:
+            from tools.observer import Observer
+            obs = Observer(base_dir)
+            source_exts = {'.py', '.js', '.jsx', '.ts', '.tsx', '.html', '.css', '.vue'}
+            for f in existing_files:
+                ext = os.path.splitext(f)[1].lower()
+                if ext in source_exts:
+                    skeleton = obs.get_skeleton(f)
+                    if skeleton and "Error" not in skeleton:
+                        skeleton_parts.append(skeleton)
+        except Exception as e:
+            logger.warning(f"⚠️ [Patch Mode] Observer 骨架提取异常: {e}")
+
+        file_skeletons = "\n\n".join(skeleton_parts) if skeleton_parts else "无骨架信息。"
+
+        # 3. 构建 prompt
+        system_prompt = Prompts.MANAGER_PATCH_SYSTEM.format(
+            project_id=self.project_id,
+            file_tree=file_tree,
+            file_skeletons=file_skeletons,
+        )
+        user_prompt = f"主人的修改需求：\n{user_requirement}\n请严格按照 JSON Schema 输出。"
+
+        # 4. 调用 LLM
+        try:
+            raw_response = self.llm_client.chat_completion(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+            )
+
+            json_str = raw_response.content
+            if "```json" in json_str:
+                json_str = json_str.split("```json")[1].split("```")[0].strip()
+            elif "```" in json_str:
+                json_str = json_str.split("```")[1].split("```")[0].strip()
+
+            plan = json.loads(json_str)
+
+            plan["project_name"] = self.project_id  # 强制锁定
+            if "tasks" not in plan:
+                plan["tasks"] = []
+
+            # 去重
+            seen_files = set()
+            deduped = []
+            for task in plan["tasks"]:
+                tf = task.get("target_file", "")
+                if tf not in seen_files:
+                    seen_files.add(tf)
+                    deduped.append(task)
+            plan["tasks"] = deduped
+
+            logger.info(f"⚡ [Patch Mode] 精简规划完成: {len(plan['tasks'])} 个文件需修改")
+            global_broadcaster.emit_sync("Manager", "patch_plan_ready",
+                f"Patch Mode: {len(plan['tasks'])} 个文件需修改", {"plan": plan})
+            return plan
+
+        except json.JSONDecodeError:
+            logger.error(f"[Patch Mode] Manager 返回非 JSON: {raw_response.content[:200]}")
+            return {"project_name": self.project_id, "tasks": []}
+        except Exception as e:
+            logger.error(f"[Patch Mode] Manager 规划异常: {e}")
+            return {"project_name": self.project_id, "tasks": []}
+
     def execute_tdd_loop(self, task: Dict[str, Any], final_dir: str = None, task_meta: dict = None) -> Tuple[bool, Dict[str, str]]:
         """
         核心的 TDD (Test-Driven Development) 开发与审查闭环

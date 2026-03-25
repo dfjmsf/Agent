@@ -73,6 +73,7 @@ class Memory(Base):
     tech_stacks = Column(PG_ARRAY(String), default=[])     # L0 硬过滤, GIN 索引
     exp_type = Column(String(50), default="general")        # contrastive_pair / anti_pattern / general
     scenario = Column(Text)                                 # 场景描述
+    domain = Column(String(20), default="general")           # 'backend' / 'frontend' / 'general'
     # --- 动态追踪字段 (AMC 底座) ---
     success_count = Column(Integer, default=0)              # S
     usage_count = Column(Integer, default=0)                # U
@@ -136,6 +137,8 @@ def init_db():
         "ALTER TABLE memories ADD COLUMN IF NOT EXISTS success_count INTEGER DEFAULT 0",
         "ALTER TABLE memories ADD COLUMN IF NOT EXISTS usage_count INTEGER DEFAULT 0",
         "ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_used_round INTEGER DEFAULT 0",
+        # v1.3: 经验域标签
+        "ALTER TABLE memories ADD COLUMN IF NOT EXISTS domain VARCHAR(20) DEFAULT 'general'",
         # session_events 轻量 RAG
         f"ALTER TABLE session_events ADD COLUMN IF NOT EXISTS embedding vector({EMBEDDING_DIM})",
     ]
@@ -551,6 +554,16 @@ def settle_memory_scores(used_ids: set, ignored_ids: set, global_round: int):
 # 6. 长期记忆操作 (替代 memory.py)
 # ============================================================
 
+def infer_domain(target_file: str) -> str:
+    """根据文件扩展名推断经验域：backend / frontend / general"""
+    ext = os.path.splitext(target_file)[1].lower() if target_file else ""
+    if ext in {'.html', '.css', '.js', '.jsx', '.tsx', '.ts', '.vue', '.svelte', '.scss', '.less'}:
+        return 'frontend'
+    elif ext in {'.py', '.java', '.go', '.rs', '.rb', '.php', '.sql', '.sh'}:
+        return 'backend'
+    return 'general'
+
+
 def memorize(
     text: str,
     scope: str = "project",
@@ -559,6 +572,7 @@ def memorize(
     tech_stacks: list = None,
     exp_type: str = "general",
     scenario: str = "",
+    domain: str = "general",
 ):
     """
     向量化一段经验并存入长期记忆。
@@ -584,6 +598,7 @@ def memorize(
             tech_stacks=tech_stacks or [],
             exp_type=exp_type,
             scenario=scenario or None,
+            domain=domain or "general",
         )
         session.add(record)
         session.commit()
@@ -650,7 +665,7 @@ def _rerank(query: str, documents: List[str], top_n: int = 5) -> List[dict]:
         return [{"content": doc, "score": 0.0} for doc in documents[:top_n]]
 
 
-def _bm25_search(query: str, project_id: str, top_n: int = 15) -> List[Dict]:
+def _bm25_search(query: str, project_id: str, top_n: int = 15, domain: str = None) -> List[Dict]:
     """
     BM25 关键词粗排：从 memories 表全量加载后做 BM25 检索。
     返回 List[Dict] 含 id/content/s/u/r_last。
@@ -662,12 +677,19 @@ def _bm25_search(query: str, project_id: str, top_n: int = 15) -> List[Dict]:
     try:
         from sqlalchemy import text as sql_text
         
-        sql = sql_text("""
+        domain_clause = ""
+        params = {"pid": project_id}
+        if domain and domain != "general":
+            domain_clause = "AND (domain IS NULL OR domain = 'general' OR domain = :domain)"
+            params["domain"] = domain
+        
+        sql = sql_text(f"""
             SELECT id, content, success_count, usage_count, last_used_round
             FROM memories
             WHERE (scope = 'global' OR (scope = 'project' AND project_id = :pid))
+            {domain_clause}
         """)
-        result = session.execute(sql, {"pid": project_id})
+        result = session.execute(sql, params)
         all_rows = [(row[0], row[1], row[2] or 0, row[3] or 0, row[4] or 0) for row in result if row[1]]
         
         if not all_rows:
@@ -709,7 +731,7 @@ def _bm25_search(query: str, project_id: str, top_n: int = 15) -> List[Dict]:
 def _vector_search_with_filter(
     query_embedding, project_id: str, top_n: int,
     similarity_threshold: float, tech_stacks_filter: list = None,
-    universal_only: bool = False
+    universal_only: bool = False, domain: str = None
 ) -> List[Dict]:
     """
     pgvector 向量粗排（内部方法）。
@@ -720,14 +742,22 @@ def _vector_search_with_filter(
     try:
         from sqlalchemy import text as sql_text
         
+        # 域过滤子句（general 和 NULL 不被过滤，向后兼容旧数据）
+        domain_clause = ""
+        domain_params = {}
+        if domain and domain != "general":
+            domain_clause = "AND (domain IS NULL OR domain = 'general' OR domain = :domain)"
+            domain_params["domain"] = domain
+        
         if universal_only:
             # 副管线: 只捞 tech_stacks 为空数组的通用经验
-            sql = sql_text("""
+            sql = sql_text(f"""
                 SELECT id, content, success_count, usage_count, last_used_round,
                        1 - (embedding <=> CAST(:qvec AS vector)) AS similarity
                 FROM memories
                 WHERE (scope = 'global' OR (scope = 'project' AND project_id = :pid))
-                  AND (tech_stacks = '{}' OR tech_stacks IS NULL)
+                  AND (tech_stacks = '{{}}' OR tech_stacks IS NULL)
+                  {domain_clause}
                   AND 1 - (embedding <=> CAST(:qvec AS vector)) >= :threshold
                 ORDER BY embedding <=> CAST(:qvec AS vector)
                 LIMIT :n
@@ -735,15 +765,17 @@ def _vector_search_with_filter(
             result = session.execute(sql, {
                 "qvec": str(query_embedding), "pid": project_id,
                 "threshold": similarity_threshold, "n": top_n,
+                **domain_params,
             })
         elif tech_stacks_filter:
             # 主管线: 按 tech_stacks 过滤 + 通用经验
-            sql = sql_text("""
+            sql = sql_text(f"""
                 SELECT id, content, success_count, usage_count, last_used_round,
                        1 - (embedding <=> CAST(:qvec AS vector)) AS similarity
                 FROM memories
                 WHERE (scope = 'global' OR (scope = 'project' AND project_id = :pid))
-                  AND (tech_stacks && CAST(:stacks AS VARCHAR[]) OR tech_stacks = '{}' OR tech_stacks IS NULL)
+                  AND (tech_stacks && CAST(:stacks AS VARCHAR[]) OR tech_stacks = '{{}}' OR tech_stacks IS NULL)
+                  {domain_clause}
                   AND 1 - (embedding <=> CAST(:qvec AS vector)) >= :threshold
                 ORDER BY embedding <=> CAST(:qvec AS vector)
                 LIMIT :n
@@ -752,14 +784,16 @@ def _vector_search_with_filter(
                 "qvec": str(query_embedding), "pid": project_id,
                 "stacks": "{" + ",".join(tech_stacks_filter) + "}",
                 "threshold": similarity_threshold, "n": top_n,
+                **domain_params,
             })
         else:
             # 无过滤: 全量
-            sql = sql_text("""
+            sql = sql_text(f"""
                 SELECT id, content, success_count, usage_count, last_used_round,
                        1 - (embedding <=> CAST(:qvec AS vector)) AS similarity
                 FROM memories
                 WHERE (scope = 'global' OR (scope = 'project' AND project_id = :pid))
+                  {domain_clause}
                   AND 1 - (embedding <=> CAST(:qvec AS vector)) >= :threshold
                 ORDER BY embedding <=> CAST(:qvec AS vector)
                 LIMIT :n
@@ -767,6 +801,7 @@ def _vector_search_with_filter(
             result = session.execute(sql, {
                 "qvec": str(query_embedding), "pid": project_id,
                 "threshold": similarity_threshold, "n": top_n,
+                **domain_params,
             })
         
         rows = list(result)
@@ -818,7 +853,7 @@ def _apply_amc_and_fuse(items: List[Dict], global_r: int, alpha: float = 0.7) ->
 def _run_main_pipeline(
     query: str, query_embedding, project_id: str, 
     tech_stacks: list, top_n: int, similarity_threshold: float,
-    global_r: int, caller: str
+    global_r: int, caller: str, domain: str = None
 ) -> List[Dict]:
     """主管线: L0→L1(双路)→L2(Rerank)→L3(AMC)→L4(融合)→Top N"""
     t0 = time.time()
@@ -828,10 +863,11 @@ def _run_main_pipeline(
         query_embedding, project_id, top_n=15,
         similarity_threshold=similarity_threshold,
         tech_stacks_filter=tech_stacks if tech_stacks else None,
+        domain=domain,
     )
     
     # L1: BM25 (已返回 List[Dict] 含 id)
-    bm25_results = _bm25_search(query, project_id, top_n=15)
+    bm25_results = _bm25_search(query, project_id, top_n=15, domain=domain)
     
     # 合并去重
     seen = set()
@@ -870,7 +906,8 @@ def _run_main_pipeline(
 
 def _run_universal_pipeline(
     query: str, query_embedding, project_id: str,
-    similarity_threshold: float, global_r: int, caller: str
+    similarity_threshold: float, global_r: int, caller: str,
+    domain: str = None
 ) -> Optional[Dict]:
     """副管线: L0(通用)→L1(pgvector)→L3(AMC)→L4→Top 1 (跳过 Rerank)"""
     t0 = time.time()
@@ -878,7 +915,7 @@ def _run_universal_pipeline(
     vector_results = _vector_search_with_filter(
         query_embedding, project_id, top_n=3,
         similarity_threshold=similarity_threshold,
-        universal_only=True,
+        universal_only=True, domain=domain,
     )
     
     if not vector_results:
@@ -899,6 +936,7 @@ def recall(
     similarity_threshold: float = 0.6,
     caller: str = "Unknown",
     tech_stacks: list = None,
+    domain: str = None,
 ) -> List[Dict]:
     """
     四段式双管线长期记忆召回 (v1.2.2):
@@ -911,7 +949,7 @@ def recall(
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
-    logger.info(f"🔍 [{caller}] 四段式召回启动... query='{query[:50]}...' stacks={tech_stacks}")
+    logger.info(f"🔍 [{caller}] 四段式召回启动... query='{query[:50]}...' stacks={tech_stacks} domain={domain}")
     t0 = time.time()
     
     query_embedding = get_embedding(query)
@@ -928,11 +966,12 @@ def recall(
     with ThreadPoolExecutor(max_workers=2) as executor:
         future_main = executor.submit(
             _run_main_pipeline, query, query_embedding, project_id,
-            tech_stacks or [], n_results, similarity_threshold, global_r, caller
+            tech_stacks or [], n_results, similarity_threshold, global_r, caller,
+            domain=domain
         )
         future_univ = executor.submit(
             _run_universal_pipeline, query, query_embedding, project_id,
-            similarity_threshold, global_r, caller
+            similarity_threshold, global_r, caller, domain=domain
         )
         
         main_result = future_main.result()

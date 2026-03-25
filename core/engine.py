@@ -102,6 +102,9 @@ class AstreaEngine:
         global_broadcaster.emit_sync("System", "start_project", "AstreaEngine 启动...")
 
         try:
+            if self._is_existing_project():
+                return self._run_patch_mode(user_requirement)
+
             # Phase 1: 规划（含重命名 + sandbox 预热，与 plan_tasks 并行）
             self._phase_planning(user_requirement, out_dir=out_dir)
 
@@ -164,6 +167,94 @@ class AstreaEngine:
         engine._reviewer = None
         logger.info(f"🔄 AstreaEngine 从 Checkpoint 恢复: {project_id}")
         return engine
+
+    # ============================================================
+    # Patch Mode: 微调快速通道
+    # ============================================================
+
+    def _is_existing_project(self) -> bool:
+        """判断当前项目是否是已有项目（非新建）"""
+        if "新建项目" in self.project_id or self.project_id == "default_project":
+            return False
+        # 检查项目目录是否存在且有文件
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "projects", self.project_id))
+        if not os.path.isdir(base_dir):
+            return False
+        # 目录非空（排除 .sandbox 等元文件）
+        ignore = {'.sandbox', '.git', '__pycache__', '.venv'}
+        for item in os.listdir(base_dir):
+            if item not in ignore:
+                return True
+        return False
+
+    def _run_patch_mode(self, user_requirement: str) -> Tuple[bool, str]:
+        """
+        微调快速通道：跳过 Spec 生成 + Sandbox 预热。
+        Manager 只规划受影响文件，Coder 自动走 fix_with_editor 差量编辑。
+        """
+        logger.info(f"⚡ Patch Mode 启动: {self.project_id}")
+        global_broadcaster.emit_sync("System", "start_project", f"⚡ Patch Mode: {self.project_id}")
+        self.blackboard.set_project_status(ProjectStatus.PLANNING)
+
+        # 直接使用已有目录
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "projects"))
+        final_dir = os.path.join(base_dir, self.project_id)
+        self.blackboard.state.out_dir = final_dir
+        self.blackboard.state.project_name = self.project_id
+        self.vfs = VfsUtils(final_dir)
+
+        # Manager 精简规划（只规划受影响文件，不生成 Spec）
+        manager = self._get_manager()
+        plan = manager.plan_patch(user_requirement)
+
+        self.blackboard.set_tasks(plan.get("tasks", []))
+
+        # 设置轻量 spec（Coder fallback 时需要）
+        self.blackboard.state.spec_text = (
+            f"[Patch Mode] {plan.get('architecture_summary', '微调修改')}\n"
+            f"用户需求: {user_requirement}"
+        )
+
+        # 记录事件
+        append_event("manager", "patch_plan", json.dumps(plan, ensure_ascii=False),
+                     project_id=self.project_id)
+
+        if not self.blackboard.state.tasks:
+            logger.error("💥 [Patch Mode] 未规划任何任务")
+            self.blackboard.set_project_status(ProjectStatus.FAILED)
+            global_broadcaster.emit_sync("System", "error", "💥 Patch Mode 规划失败")
+            return False, final_dir
+
+        logger.info(f"⚡ [Patch Mode] {len(self.blackboard.state.tasks)} 个文件需修改")
+
+        # 复用 sandbox（已有 venv，无需重新安装依赖）
+        # 不调用 _warmup_sandbox
+
+        # Phase 2: 执行（复用现有 _phase_execution，
+        # Coder 会自动走 fix_with_editor 因为 existing_code 不为空）
+        self.blackboard.set_project_status(ProjectStatus.EXECUTING)
+        success = self._phase_execution()
+
+        if success:
+            self.blackboard.set_project_status(ProjectStatus.COMPLETED)
+            update_project_status(self.project_id, "success")
+            logger.info(f"✨ [Patch Mode] 修改完成: {final_dir}")
+            global_broadcaster.emit_sync("System", "success",
+                f"✨ Patch Mode 修改完成！{final_dir}", {"final_path": final_dir})
+        else:
+            self.blackboard.set_project_status(ProjectStatus.FAILED)
+            update_project_status(self.project_id, "failed")
+            global_broadcaster.emit_sync("System", "error", "💥 Patch Mode 存在熔断任务")
+
+        # 结算
+        self._phase_settlement(user_requirement, success)
+
+        # 清理
+        self.blackboard.delete_checkpoint()
+        if self.vfs:
+            self.vfs.clean_sandbox()
+
+        return success, final_dir
 
     # ============================================================
     # Phase 1: 规划 (唤醒 Manager)
@@ -667,12 +758,15 @@ class AstreaEngine:
                 # Synthesizer
                 plan_dict = bb_state.project_spec or {}
                 for item in milestones_list:
+                    tf = item["task"].get("target_file", "")
                     if item["success"]:
                         synthesizer.synthesize_success(
-                            item["milestones"], user_requirement, plan_dict)
+                            item["milestones"], user_requirement, plan_dict,
+                            target_file=tf)
                     elif item["task"].get("task_id"):
                         synthesizer.synthesize_failure(
-                            item["milestones"], user_requirement, plan_dict)
+                            item["milestones"], user_requirement, plan_dict,
+                            target_file=tf)
                 logger.info("✨ [后台] Synthesizer 知识提炼完毕")
 
                 # Auditor

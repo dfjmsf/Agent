@@ -13,7 +13,7 @@ from core.llm_client import default_llm
 from core.prompt import Prompts
 from tools.sandbox import sandbox_env
 from core.ws_broadcaster import global_broadcaster
-from core.database import get_recent_events, recall_reviewer_experience, memorize
+from core.database import get_recent_events, recall_reviewer_experience, memorize, infer_domain
 
 logger = logging.getLogger("ReviewerAgent")
 

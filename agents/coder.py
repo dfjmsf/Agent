@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any, List
 from core.llm_client import default_llm
 from core.prompt import Prompts
 from core.ws_broadcaster import global_broadcaster
-from core.database import recall, get_recent_events, recall_project_experience
+from core.database import recall, get_recent_events, recall_project_experience, infer_domain
 
 logger = logging.getLogger("CoderAgent")
 
@@ -96,7 +96,8 @@ class CoderAgent:
         past_tips = recall(
             f"{target_file} {description}", n_results=3,
             project_id=self.project_id, caller="Coder",
-            tech_stacks=tech_stacks
+            tech_stacks=tech_stacks,
+            domain=infer_domain(target_file),
         )
         if past_tips:
             # 缓存 recalled IDs（过滤 id > 0 的有效 ID）
@@ -241,6 +242,20 @@ class CoderAgent:
                         args = json.loads(tool_call.function.arguments)
                         edits = args.get("edits", [])
                         
+                        # 防御：LLM 有时返回双重序列化的 edits（字符串而非列表）
+                        if isinstance(edits, str):
+                            try:
+                                parsed = json.loads(edits)
+                                if isinstance(parsed, list):
+                                    logger.info(f"🔧 [Editor] edits 双重序列化，已修复解析")
+                                    edits = parsed
+                                else:
+                                    logger.warning(f"⚠️ [Editor] edits 解析后非列表: {type(parsed).__name__}")
+                                    edits = []
+                            except (json.JSONDecodeError, TypeError):
+                                logger.warning(f"⚠️ [Editor] edits 是不可解析的字符串，跳过: {edits[:100]}")
+                                edits = []
+                        
                         if edits:
                             # v1.3: 在内存中应用编辑，不写 VFS
                             patched_code = self._apply_edits_in_memory(existing_code, edits)
@@ -253,10 +268,11 @@ class CoderAgent:
                     except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
                         logger.warning(f"⚠️ [Editor] 工具参数解析失败: {e}，fallback 全量覆写")
 
-        # Fallback: 全量覆写
-        logger.warning(f"⚠️ [Editor] Fallback 全量覆写模式")
+        # Fallback: 基于现有代码的保守覆写
+        logger.warning(f"⚠️ [Editor] Fallback 保守覆写模式")
         return self._fallback_full_rewrite(
             target_file, description, feedback,
+            existing_code=existing_code,
             observer_context=task_meta.get("observer_context", "") if task_meta else "",
             memory_hint=memory_hint, task_meta=task_meta
         )
@@ -271,6 +287,19 @@ class CoderAgent:
         fail_count = 0
 
         for edit in edits:
+            # 防御：LLM 有时返回字符串而非字典
+            if isinstance(edit, str):
+                try:
+                    edit = json.loads(edit)
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(f"⚠️ [Editor] 跳过非法 edit (str): {edit[:80]}")
+                    fail_count += 1
+                    continue
+            if not isinstance(edit, dict):
+                logger.warning(f"⚠️ [Editor] 跳过非法 edit (type={type(edit).__name__})")
+                fail_count += 1
+                continue
+
             search = edit.get("search", "")
             replace = edit.get("replace", "")
             if not search:
@@ -305,10 +334,9 @@ class CoderAgent:
         return result
 
     def _fallback_full_rewrite(self, target_file: str, description: str, feedback: str,
-                               observer_context: str = "", memory_hint: str = "",
-                               task_meta: dict = None) -> str:
-        """降级方案：全量重写"""
-        # 注入项目规划书
+                               existing_code: str = "", observer_context: str = "",
+                               memory_hint: str = "", task_meta: dict = None) -> str:
+        """降级方案：基于现有代码的保守覆写（注入原始代码防止功能丢失）"""
         project_spec = task_meta.get("project_spec", "无规划书") if task_meta else "无规划书"
         vfs_str = observer_context if observer_context else "当前无依赖文件。"
 
@@ -320,7 +348,21 @@ class CoderAgent:
             vfs_context=vfs_str
         )
 
-        user_prompt = f"【🚨 紧急修复要求】你之前生成的代码被 Reviewer 测试出错了！\n以下是沙盒运行报错或审查人的建议：\n\n{feedback}\n\n请修复上述 bug，并重新输出该文件的完整纯净代码！不能偷懒只输出片段！"
+        if existing_code:
+            # Patch Mode 保守覆写：注入原始代码，要求只改必要部分
+            user_prompt = (
+                f"【⚠️ 保守修改要求】以下是 {target_file} 的完整现有代码，"
+                f"请你 **只修改下面描述中要求的部分**，其余代码必须原封不动地保留！\n\n"
+                f"【需要修改的内容】:\n{feedback}\n\n"
+                f"【现有完整代码（必须在此基础上修改，不允许重写）】:\n```\n{existing_code}\n```\n\n"
+                f"请输出修改后的完整文件代码。"
+            )
+        else:
+            user_prompt = (
+                f"【🚨 紧急修复要求】你之前生成的代码被 Reviewer 测试出错了！\n"
+                f"以下是沙盒运行报错或审查人的建议：\n\n{feedback}\n\n"
+                f"请修复上述 bug，并重新输出该文件的完整纯净代码！不能偷懒只输出片段！"
+            )
 
         messages = [
             {"role": "system", "content": system_content},

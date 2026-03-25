@@ -11,7 +11,7 @@ from typing import Dict, Any, Optional
 
 from core.llm_client import default_llm
 from core.prompt import Prompts
-from core.database import memorize, append_event
+from core.database import memorize, append_event, infer_domain
 
 logger = logging.getLogger("SynthesizerAgent")
 
@@ -58,7 +58,7 @@ class SynthesizerAgent:
         logger.warning(f"⚠️ Synthesizer JSON 解析失败，原始输出: {raw_text[:200]}")
         return None
 
-    def _write_experience(self, parsed: Dict[str, Any]):
+    def _write_experience(self, parsed: Dict[str, Any], target_file: str = ""):
         """
         将提炼的经验按 scope 写入不同存储：
         - scope=global → memories 表（长期记忆）
@@ -96,6 +96,7 @@ class SynthesizerAgent:
                 tech_stacks=tech_stacks,
                 exp_type=exp_type,
                 scenario=scenario,
+                domain=infer_domain(target_file) if target_file else "general",
             )
             logger.info(f"📝 经验写入 [长期记忆/global]: '{content[:50]}...' stacks={tech_stacks}")
         else:
@@ -114,7 +115,8 @@ class SynthesizerAgent:
         self,
         milestones: Dict[str, str],
         user_req: str,
-        plan: dict = None
+        plan: dict = None,
+        target_file: str = "",
     ):
         """
         成功时提炼 Contrastive Pair（对比对）。
@@ -147,7 +149,7 @@ class SynthesizerAgent:
             parsed = self._parse_json_response(resp.content)
             
             if parsed:
-                self._write_experience(parsed)
+                self._write_experience(parsed, target_file=target_file)
                 logger.info("✨ Synthesizer 成功经验提炼完毕！")
             else:
                 # JSON 解析失败时降级：以 project scope 存入短期记忆
@@ -165,7 +167,8 @@ class SynthesizerAgent:
         self,
         milestones: Dict[str, str],
         user_req: str,
-        plan: dict = None
+        plan: dict = None,
+        target_file: str = "",
     ):
         """
         熔断时提炼 Anti-pattern（反模式）。
