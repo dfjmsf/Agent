@@ -127,7 +127,7 @@ class ManagerAgent:
         # 3. 构造环境变量声明
         is_new_project = "新建项目" in self.project_id or self.project_id == "default_project"
         if is_new_project:
-            env_context = "【项目环境】\n这是基于主人的首个请求刚刚创建的全新宇宙草稿。请为它起一个酷炫、精简的纯英文字符串作为 JSON 中的 `project_name` 字段。"
+            env_context = "【项目环境】\n这是全新项目。项目名称已在规划书中确定。请专注于拆解任务列表，JSON 中的 `project_name` 使用规划书中的名称即可。"
         else:
             # v1.3: 直接从项目目录读取文件列表（不依赖 StateManager VFS）
             existing_files = []

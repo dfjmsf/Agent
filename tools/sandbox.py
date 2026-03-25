@@ -296,38 +296,169 @@ class PythonSandbox:
         self._warmup_events[project_id] = event
         
         # 规划书 tech_stack → pip 包名 映射（规划书名称 ≠ import 名 ≠ pip 包名）
+        # 设计原则：每个框架带上其最常见的伴生依赖，"一装到位"
         TECH_STACK_TO_PACKAGES = {
-            "fastapi": ["fastapi", "uvicorn", "httpx"],
-            "flask": ["flask"],
+            # ── Web 框架 ──
+            "fastapi": ["fastapi", "uvicorn", "httpx", "python-multipart"],
+            "flask": ["flask", "flask-cors"],
+            "flask-cors": ["flask-cors"],
+            "flask-sqlalchemy": ["flask-sqlalchemy", "flask"],
+            "flask-login": ["flask-login", "flask"],
+            "flask-restful": ["flask-restful", "flask"],
+            "flask-socketio": ["flask-socketio", "flask"],
+            "flask-migrate": ["flask-migrate", "flask", "alembic"],
+            "flask-wtf": ["flask-wtf", "flask"],
             "django": ["django"],
+            "django-rest-framework": ["djangorestframework", "django"],
+            "djangorestframework": ["djangorestframework", "django"],
+            "drf": ["djangorestframework", "django"],
+            "tornado": ["tornado"],
+            "sanic": ["sanic"],
+            "starlette": ["starlette", "uvicorn"],
+            "aiohttp": ["aiohttp"],
+            "bottle": ["bottle"],
             "express": [],  # Node.js，不走 pip
+
+            # ── 数据库 & ORM ──
             "sqlalchemy": ["sqlalchemy"],
+            "alembic": ["alembic", "sqlalchemy"],
             "sqlite": [], "sqlite3": [],  # 标准库
             "postgresql": ["psycopg2-binary"],
+            "postgres": ["psycopg2-binary"],
+            "psycopg2": ["psycopg2-binary"],
             "mysql": ["pymysql"],
+            "mariadb": ["pymysql"],
             "mongodb": ["pymongo"],
+            "pymongo": ["pymongo"],
+            "motor": ["motor", "pymongo"],         # 异步 MongoDB
             "redis": ["redis"],
-            "pydantic": ["pydantic"],
+            "peewee": ["peewee"],
+            "tortoise-orm": ["tortoise-orm"],
+            "prisma": [],  # Node.js ORM
+
+            # ── HTTP & 网络 ──
             "requests": ["requests"],
             "httpx": ["httpx"],
-            "beautifulsoup": ["beautifulsoup4"],
-            "selenium": ["selenium"],
+            "urllib3": ["urllib3"],
+            "websocket": ["websockets"],
+            "websockets": ["websockets"],
+            "socket.io": ["python-socketio"],
+            "grpc": ["grpcio", "protobuf"],
+            "graphql": ["graphene"],
+
+            # ── 认证 & 安全 ──
+            "jwt": ["PyJWT"],
+            "pyjwt": ["PyJWT"],
+            "python-jose": ["python-jose"],
+            "passlib": ["passlib", "bcrypt"],
+            "bcrypt": ["bcrypt"],
+            "cryptography": ["cryptography"],
+            "pycryptodome": ["pycryptodome"],
+            "oauth": ["authlib"],
+
+            # ── 数据科学 & ML ──
             "pandas": ["pandas"],
             "numpy": ["numpy"],
+            "scipy": ["scipy"],
             "matplotlib": ["matplotlib"],
+            "seaborn": ["seaborn", "matplotlib"],
+            "plotly": ["plotly"],
+            "scikit-learn": ["scikit-learn"],
+            "sklearn": ["scikit-learn"],
+            "tensorflow": ["tensorflow"],
+            "pytorch": ["torch"],
+            "torch": ["torch"],
+            "keras": ["keras"],
+            "xgboost": ["xgboost"],
+            "lightgbm": ["lightgbm"],
+            "opencv": ["opencv-python"],
+            "cv2": ["opencv-python"],
             "pillow": ["Pillow"],
+            "pil": ["Pillow"],
+
+            # ── 数据处理 & 序列化 ──
+            "pydantic": ["pydantic"],
+            "marshmallow": ["marshmallow"],
+            "pyyaml": ["PyYAML"],
+            "toml": ["toml"],
+            "beautifulsoup": ["beautifulsoup4"],
+            "bs4": ["beautifulsoup4"],
+            "lxml": ["lxml"],
+            "scrapy": ["scrapy"],
+            "openpyxl": ["openpyxl"],
+            "xlrd": ["xlrd"],
+            "python-docx": ["python-docx"],
+            "python-pptx": ["python-pptx"],
+            "reportlab": ["reportlab"],
+            "pypdf": ["pypdf"],
+
+            # ── 异步 & 任务队列 ──
+            "celery": ["celery", "redis"],
+            "rq": ["rq", "redis"],
+            "dramatiq": ["dramatiq"],
+            "apscheduler": ["apscheduler"],
+
+            # ── 测试 & 开发 ──
             "pytest": ["pytest"],
+            "unittest": [],  # 标准库
+            "selenium": ["selenium"],
+            "playwright": ["playwright"],
+            "coverage": ["coverage"],
+            "black": ["black"],
+            "flake8": ["flake8"],
+
+            # ── 模板 & 前端集成 ──
             "jinja2": ["jinja2"],
-            "celery": ["celery"],
-            "websocket": ["websockets"],
-            "cors": [],  # 通常随 fastapi 安装
+            "mako": ["mako"],
+            "markdown": ["markdown"],
+            "marked": [],  # JS 库，不走 pip
+
+            # ── CLI & TUI ──
+            "click": ["click"],
+            "typer": ["typer"],
+            "rich": ["rich"],
+            "tqdm": ["tqdm"],
+            "colorama": ["colorama"],
+            "tabulate": ["tabulate"],
+
+            # ── 环境 & 配置 ──
+            "dotenv": ["python-dotenv"],
+            "python-dotenv": ["python-dotenv"],
+            "decouple": ["python-decouple"],
+
+            # ── 日志 & 监控 ──
+            "loguru": ["loguru"],
+            "sentry": ["sentry-sdk"],
+
+            # ── 图像 & 多媒体 ──
+            "ffmpeg": ["ffmpeg-python"],
+            "pydub": ["pydub"],
+
+            # ── 空映射（标准库或非 pip）──
+            "cors": [],  # 通常随框架安装
+            "rest": [],  # 概念名
+            "api": [],   # 概念名
         }
         # 跳过的纯标识名（语言、前端技术等，不是 pip 包）
-        SKIP_NAMES = {'python', 'python3', 'python 3', 'html', 'html5', 'css', 'css3',
-                      'javascript', 'js', 'es6', 'es2015', 'vanilla',
-                      'typescript', 'ts', 'sql', 'sqlite', 'sqlite3', 'json', 'yaml', 'xml',
-                      'react', 'vue', 'angular', 'node', 'nodejs', 'npm',
-                      'tailwind', 'tailwindcss', 'bootstrap', 'sass', 'scss', 'less'}
+        SKIP_NAMES = {
+            # 编程语言
+            'python', 'python3', 'python 3', 'java', 'go', 'golang', 'rust', 'c', 'c++', 'ruby',
+            # 前端语言 & 标记
+            'html', 'html5', 'css', 'css3', 'javascript', 'js', 'es6', 'es2015', 'vanilla',
+            'typescript', 'ts', 'jsx', 'tsx',
+            # 数据格式
+            'sql', 'sqlite', 'sqlite3', 'json', 'yaml', 'xml', 'csv', 'toml', 'graphql',
+            # 前端框架（JS 生态，不走 pip）
+            'react', 'vue', 'angular', 'svelte', 'next', 'nextjs', 'nuxt', 'nuxtjs',
+            'node', 'nodejs', 'npm', 'yarn', 'pnpm', 'bun', 'deno',
+            'webpack', 'vite', 'rollup', 'esbuild', 'parcel',
+            # 前端 CSS 框架
+            'tailwind', 'tailwindcss', 'bootstrap', 'sass', 'scss', 'less',
+            'material', 'antd', 'chakra',
+            # 通用概念
+            'restful', 'rest', 'api', 'microservice', 'serverless', 'docker', 'kubernetes',
+            'git', 'github', 'ci', 'cd',
+        }
         
         try:
             logger.info(f"🔥 Sandbox 预热启动: {project_id}, tech_stacks={tech_stacks}")

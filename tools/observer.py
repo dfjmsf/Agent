@@ -187,6 +187,61 @@ class Observer:
         logger.info(f"👁️ get_skeleton({file_path}) → {len(result)} chars (Python AST)")
         return result
 
+    @staticmethod
+    def _extract_key_calls(func_node) -> list:
+        """
+        提取函数体内的关键函数调用（不递归进入嵌套函数）。
+        返回去重的调用表达式列表，如 ['register_routes(app)', 'init_db()']
+        """
+        # 过滤通用工具函数（不提供模块间依赖信息）
+        NOISE_CALLS = {
+            'str', 'int', 'float', 'bool', 'list', 'dict', 'set', 'tuple',
+            'len', 'print', 'repr', 'type', 'isinstance', 'hasattr', 'getattr',
+            'format', 'range', 'enumerate', 'zip', 'map', 'filter', 'sorted',
+            'jsonify', 'abort', 'redirect', 'url_for', 'render_template',
+            'get', 'strip', 'split', 'join', 'append', 'extend', 'update',
+            'replace', 'lower', 'upper', 'startswith', 'endswith',
+            'error', 'info', 'warning', 'debug', 'exception',
+            'dumps', 'loads', 'route', 'add_url_rule',
+        }
+
+        calls = []
+        seen = set()
+
+        for child in ast.iter_child_nodes(func_node):
+            # 跳过嵌套函数/类定义，只关注直接调用
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            # 递归搜索当前语句中的 Call 节点（但不进入嵌套函数）
+            for node in ast.walk(child):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue  # 不进入嵌套函数
+                if isinstance(node, ast.Call):
+                    # 提取函数名
+                    func = node.func
+                    if isinstance(func, ast.Name):
+                        name = func.id
+                    elif isinstance(func, ast.Attribute):
+                        name = func.attr
+                    else:
+                        continue
+
+                    if name not in seen and not name.startswith('_') and name not in NOISE_CALLS:
+                        seen.add(name)
+                        # 简化参数显示
+                        args_preview = []
+                        for arg in node.args[:3]:  # 最多显示 3 个参数
+                            if isinstance(arg, ast.Name):
+                                args_preview.append(arg.id)
+                            elif isinstance(arg, ast.Constant):
+                                args_preview.append(repr(arg.value)[:20])
+                        args_str = ', '.join(args_preview)
+                        if len(node.args) > 3:
+                            args_str += ', ...'
+                        calls.append(f"{name}({args_str})")
+
+        return calls[:8]  # 最多返回 8 个调用，防止骨架膨胀
+
     def _format_function(self, node, source: str, indent: str = "") -> str:
         """格式化函数签名 + 装饰器 + docstring"""
         parts = []
@@ -261,6 +316,11 @@ class Observer:
             if len(first_para) > 200:
                 first_para = first_para[:200] + "..."
             parts.append(f'{indent}    """{first_para}"""')
+
+        # 提取函数体内的关键调用（让 Coder 知道内部调用了什么）
+        calls = self._extract_key_calls(node)
+        if calls:
+            parts.append(f"{indent}    # calls: {', '.join(calls)}")
 
         parts.append(f"{indent}    ...")
 

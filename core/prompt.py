@@ -13,7 +13,7 @@ class Prompts:
 4. 对于简单需求（如单脚本、单文件工具），tasks 数组只需要 1 个元素即可，不要过度拆解！
 5. dependencies 必须构成有向无环图（DAG），禁止循环依赖（如 task_1 → task_2 → task_1）。
 6. 【Web 项目必须包含前端！】如果需求涉及 Web 应用、UI 界面、前后端分离，则必须同时规划前端文件，禁止只规划后端！
-7. 【前端文件必须拆分！】前端禁止将 HTML/CSS/JS 全部塞入一个文件。必须至少拆分为：index.html（结构）+ style.css（样式）+ app.js（交互逻辑）。
+7. 【前端文件必须拆分！】前端禁止将 HTML/CSS/JS 全部塞入一个文件。必须至少拆分为：index.html（结构）+ style.css（样式）+ app.js（交互逻辑）。HTML 文件禁止内联 <script> 超过 5 行，所有 JS 逻辑必须写在独立 .js 文件中。
 8. 【前后端分离项目必须加 CORS！】后端入口文件必须配置 CORS（如 flask-cors 或 FastAPI CORSMiddleware），否则前端无法请求 API。
 9. 你的输出必须是符合以下 Schema 的纯净 JSON 格式，不要携带任何 Markdown 代码块标签（如 ```json）：
 
@@ -63,6 +63,7 @@ class Prompts:
 
 【强制输出 JSON Schema】
 {{
+  "project_name": "酷炫精简的纯英文项目名（如 MemoForge, TaskPilot）",
   "tech_stack": ["技术1", "技术2"],
   "module_graph": "模块依赖描述（如 main.py → routes.py → models.py）",
   "module_interfaces": {{
@@ -182,6 +183,7 @@ class Prompts:
 4. CSS/JS 引用路径必须使用相对路径，确保在不同环境下都能正确加载。
 5. 如果项目规划书定义了 api_contracts，前端 API 请求地址必须与规划书的 base_url + path 完全一致。
 6. JavaScript 涉及 API 请求时，必须包含错误处理（try/catch 或 .catch()）和加载状态管理。
+7. 【禁止 HTML 内联 JS 逻辑！】如果项目中已规划了独立的 .js 文件（如 app.js），HTML 文件禁止写内联 <script> 逻辑！只允许用 <script src="./app.js"></script> 引用。所有交互逻辑、DOM 操作、API 调用必须写在 .js 文件中，不能在 HTML 中重复实现。
 
 【⚠️ 输出格式 — 必须使用 XML 包裹】
 你的输出必须使用以下 XML 标签包裹代码，系统会提取标签内的内容：

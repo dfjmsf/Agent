@@ -102,17 +102,11 @@ class AstreaEngine:
         global_broadcaster.emit_sync("System", "start_project", "AstreaEngine 启动...")
 
         try:
-            # Phase 1: 规划
-            self._phase_planning(user_requirement)
+            # Phase 1: 规划（含重命名 + sandbox 预热，与 plan_tasks 并行）
+            self._phase_planning(user_requirement, out_dir=out_dir)
 
-            # 计算输出目录
-            final_dir = self._resolve_output_dir(out_dir)
-            self.blackboard.state.out_dir = final_dir
-            os.makedirs(final_dir, exist_ok=True)
-            self.vfs = VfsUtils(final_dir)
-
-            # 预热 sandbox
-            self._warmup_sandbox()
+            # 输出目录已在 _phase_planning 中设置
+            final_dir = self.blackboard.state.out_dir
 
             # 防御：规划阶段未产出任何任务 → 直接失败（通常是网络异常）
             if not self.blackboard.state.tasks:
@@ -175,24 +169,39 @@ class AstreaEngine:
     # Phase 1: 规划 (唤醒 Manager)
     # ============================================================
 
-    def _phase_planning(self, user_requirement: str):
+    def _phase_planning(self, user_requirement: str, out_dir: str = None):
         """唤醒 Manager → 贴规划书 + 任务列表到 Blackboard → Manager 退场"""
         logger.info("📋 Phase 1: 规划阶段...")
         self.blackboard.set_project_status(ProjectStatus.PLANNING)
 
         manager = self._get_manager()
 
-        # 生成规划书
+        # Step 1: 生成规划书（含 project_name + tech_stack）
         project_spec = manager._generate_project_spec(user_requirement)
 
-        # 拆解任务
+        # Step 1.5: 从 spec 提取项目名 → 立即重命名 + 启动 sandbox 预热
+        project_name = (project_spec.get("project_name", "") or "").replace(" ", "_") if project_spec else ""
+        if not project_name:
+            project_name = "Unnamed_Project"
+
+        # 提前设置 project_name 到 blackboard（供 _resolve_output_dir 使用）
+        self.blackboard.state.project_name = project_name
+
+        # 立即计算输出目录 + 重命名
+        final_dir = self._resolve_output_dir(out_dir)
+        self.blackboard.state.out_dir = final_dir
+        os.makedirs(final_dir, exist_ok=True)
+        self.vfs = VfsUtils(final_dir)
+
+        # 立即启动 sandbox 预热（异步，不阻塞 plan_tasks）
+        self._warmup_sandbox(project_spec=project_spec)
+
+        # Step 2: 拆解任务（与 sandbox warmup 并行！）
         plan = manager.plan_tasks(user_requirement, project_spec=project_spec)
         plan["project_spec"] = project_spec
 
         # 贴上黑板
         spec_text = json.dumps(project_spec, ensure_ascii=False, indent=2) if project_spec else "无规划书"
-        project_name = plan.get("project_name", "Unnamed_Project").replace(" ", "_")
-
         self.blackboard.set_project_spec(project_spec, spec_text, project_name)
         self.blackboard.set_tasks(plan.get("tasks", []))
 
@@ -754,13 +763,13 @@ class AstreaEngine:
         base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "projects"))
         return os.path.join(base_dir, self.blackboard.state.project_id)
 
-    def _warmup_sandbox(self):
+    def _warmup_sandbox(self, project_spec: dict = None):
         """预热 Sandbox（安装依赖）"""
-        spec = self.blackboard.state.project_spec
+        spec = project_spec or self.blackboard.state.project_spec
         tech_stacks = spec.get("tech_stack", []) if spec else []
         if tech_stacks:
             from tools.sandbox import sandbox_env
-            pid = self.project_id
+            pid = self.blackboard.state.project_id
             def _bg():
                 sandbox_env.warm_up(pid, tech_stacks)
             threading.Thread(target=_bg, daemon=True).start()
