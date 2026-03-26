@@ -286,6 +286,8 @@ class PythonSandbox:
     def __init__(self):
         self.venv_manager = SandboxVenvManager()
         self._warmup_events: Dict[str, threading.Event] = {}
+        # PowerSandbox: 后台进程注册表 {project_id: [{"pid": int, "port": int, "proc": Popen, "cmd": str}]}
+        self._background_processes: Dict[str, list] = {}
     
     def warm_up(self, project_id: str, tech_stacks: List[str]):
         """
@@ -623,6 +625,149 @@ class PythonSandbox:
             package_name = IMPORT_TO_PACKAGE.get(imp, imp)
             self.venv_manager.install_package(project_id, package_name)
     
+    # ============================================================
+    # PowerSandbox: 后台进程 + 端口管理
+    # ============================================================
+
+    def alloc_port(self, project_id: str) -> int:
+        """
+        为项目分配一个可用端口（范围 5000-5999）。
+        基于 project_id 哈希分配基址，避免跨项目冲突。
+        """
+        import socket
+        base = 5000 + (hash(project_id) % 500)
+        for offset in range(100):
+            port = base + offset
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.5)
+                    if s.connect_ex(('localhost', port)) != 0:
+                        logger.info(f"🛋️ [PowerSandbox] 分配端口: {port}")
+                        return port
+            except Exception:
+                continue
+        raise RuntimeError(f"无可用端口 (base={base})")
+
+    def wait_port_ready(self, port: int, timeout: float = 15) -> bool:
+        """轮询检测端口是否就绪"""
+        import socket
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(1)
+                    if s.connect_ex(('localhost', port)) == 0:
+                        logger.info(f"✅ [PowerSandbox] 端口 {port} 已就绪 ({time.time()-start:.1f}s)")
+                        return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+        logger.warning(f"⚠️ [PowerSandbox] 端口 {port} 超时未就绪 ({timeout}s)")
+        return False
+
+    def start_background(self, cmd: list, project_id: str,
+                         port: int = None, cwd: str = None,
+                         wait_ready: bool = True, timeout: float = 15) -> dict:
+        """
+        后台启动一个服务进程。
+
+        Args:
+            cmd: 命令列表，如 [python_path, "main.py"]
+            project_id: 项目 ID
+            port: 服务监听端口（可选，用于就绪检测）
+            cwd: 工作目录
+            wait_ready: 是否等待端口就绪
+            timeout: 等待超时
+
+        Returns:
+            {"pid": int, "port": int, "success": bool}
+        """
+        # 环境变量清洗
+        env = {k: v for k, v in os.environ.items() if k not in SENSITIVE_ENV_KEYS}
+        env["PYTHONIOENCODING"] = "utf-8"
+
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creationflags,
+            )
+
+            # 注册到进程池
+            entry = {"pid": proc.pid, "port": port, "proc": proc, "cmd": " ".join(cmd)}
+            if project_id not in self._background_processes:
+                self._background_processes[project_id] = []
+            self._background_processes[project_id].append(entry)
+
+            logger.info(f"🚀 [PowerSandbox] 后台启动: PID={proc.pid}, cmd={' '.join(cmd)}")
+
+            # 等待端口就绪
+            if port and wait_ready:
+                ready = self.wait_port_ready(port, timeout)
+                if not ready:
+                    # 检查进程是否已崩溃
+                    if proc.poll() is not None:
+                        _, stderr = proc.communicate(timeout=3)
+                        logger.error(f"❌ [PowerSandbox] 服务启动崩溃 (exit={proc.returncode}): {stderr[:500]}")
+                    return {"pid": proc.pid, "port": port, "success": False, "error": "端口未就绪"}
+
+            return {"pid": proc.pid, "port": port, "success": True}
+
+        except Exception as e:
+            logger.error(f"❌ [PowerSandbox] 后台启动失败: {e}")
+            return {"pid": -1, "port": port, "success": False, "error": str(e)}
+
+    def stop_background(self, pid: int):
+        """终止指定后台进程"""
+        self._kill_process_tree(pid)
+        # 从注册表中移除
+        for project_id, entries in self._background_processes.items():
+            self._background_processes[project_id] = [e for e in entries if e["pid"] != pid]
+        logger.info(f"🔪 [PowerSandbox] 已停止后台进程 PID={pid}")
+
+    def cleanup_all(self, project_id: str = None):
+        """清理项目的所有后台进程（或全部）"""
+        if project_id:
+            entries = self._background_processes.pop(project_id, [])
+            for entry in entries:
+                try:
+                    self._kill_process_tree(entry["pid"])
+                except Exception:
+                    pass
+            if entries:
+                logger.info(f"🧹 [PowerSandbox] 已清理 {len(entries)} 个后台进程 (project={project_id})")
+        else:
+            total = 0
+            for pid_list in self._background_processes.values():
+                for entry in pid_list:
+                    try:
+                        self._kill_process_tree(entry["pid"])
+                    except Exception:
+                        pass
+                    total += 1
+            self._background_processes.clear()
+            if total:
+                logger.info(f"🧹 [PowerSandbox] 已清理全部 {total} 个后台进程")
+
+    def get_background_info(self, project_id: str) -> list:
+        """获取项目的后台进程信息"""
+        return [
+            {"pid": e["pid"], "port": e["port"], "cmd": e["cmd"]}
+            for e in self._background_processes.get(project_id, [])
+        ]
+
+    # ============================================================
+    # 核心执行
+    # ============================================================
+
     def execute_code(self, code_string: str, project_id: str, stdin_data: str = None,
                      sandbox_dir: str = None) -> Dict[str, Any]:
         """

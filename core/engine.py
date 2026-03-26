@@ -123,6 +123,17 @@ class AstreaEngine:
             self.blackboard.set_project_status(ProjectStatus.EXECUTING)
             success = self._phase_execution()
 
+            # Phase 2.5: 集成测试
+            if success and self._needs_integration_test():
+                integration_ok = self._phase_integration_test()
+                if not integration_ok:
+                    # 重试一轮失败的 task
+                    logger.info("🔄 [Phase 2.5] 集成测试失败，重新执行失败的 task...")
+                    success = self._phase_execution()
+                    if success:
+                        integration_ok = self._phase_integration_test()
+                        success = integration_ok
+
             # Phase 3: 结算
             if success:
                 self.blackboard.set_project_status(ProjectStatus.COMPLETED)
@@ -235,6 +246,16 @@ class AstreaEngine:
         self.blackboard.set_project_status(ProjectStatus.EXECUTING)
         success = self._phase_execution()
 
+        # Phase 2.5: 集成测试
+        if success and self._needs_integration_test():
+            integration_ok = self._phase_integration_test()
+            if not integration_ok:
+                logger.info("🔄 [Patch Mode] 集成测试失败，重新执行...")
+                success = self._phase_execution()
+                if success:
+                    integration_ok = self._phase_integration_test()
+                    success = integration_ok
+
         if success:
             self.blackboard.set_project_status(ProjectStatus.COMPLETED)
             update_project_status(self.project_id, "success")
@@ -255,6 +276,80 @@ class AstreaEngine:
             self.vfs.clean_sandbox()
 
         return success, final_dir
+
+    # ============================================================
+    # Phase 2.5: 集成测试
+    # ============================================================
+
+    def _needs_integration_test(self) -> bool:
+        """判断是否需要集成测试（仅包含后端 Python 服务的项目）"""
+        files = [t.target_file for t in self.blackboard.state.tasks]
+        has_backend = any(f.endswith('.py') for f in files)
+        # 纯 Python 脚本项目（如算法题）不需要集成测试
+        # 只有 Web 服务项目才需要：有后端 + 有前端或 API 相关文件
+        has_frontend = any(f.endswith(('.html', '.js', '.jsx', '.ts', '.tsx', '.vue')) for f in files)
+        # 也检查规划书中是否有 API 关键词
+        spec = self.blackboard.state.spec_text or ""
+        has_api = any(kw in spec.lower() for kw in ['api', 'flask', 'fastapi', 'uvicorn', 'express', 'http'])
+        return has_backend and (has_frontend or has_api)
+
+    def _phase_integration_test(self) -> bool:
+        """Phase 2.5: 端到端集成测试"""
+        from agents.integration_tester import IntegrationTester
+
+        logger.info("🧪 [Phase 2.5] 集成测试启动...")
+        global_broadcaster.emit_sync("System", "integration_test", "🧪 Phase 2.5: 启动集成测试")
+
+        tester = IntegrationTester(self.project_id)
+
+        # 收集所有已完成代码
+        all_code = {}
+        for task in self.blackboard.state.tasks:
+            code = ""
+            if self.vfs:
+                try:
+                    truth_path = os.path.join(self.blackboard.state.out_dir, task.target_file)
+                    if os.path.isfile(truth_path):
+                        with open(truth_path, "r", encoding="utf-8") as f:
+                            code = f.read()
+                except Exception:
+                    pass
+            all_code[task.target_file] = code
+
+        sandbox_dir = self.vfs.sandbox_dir if self.vfs else ""
+
+        result = tester.run_integration_test(
+            project_spec=self.blackboard.state.spec_text,
+            all_code=all_code,
+            sandbox_dir=sandbox_dir,
+        )
+
+        if result["passed"]:
+            logger.info("✅ [Phase 2.5] 集成测试通过！")
+            global_broadcaster.emit_sync("System", "integration_passed", "✅ 集成测试通过！")
+            return True
+        else:
+            # 将失败信息写入对应 task，并重置为 TODO 以便 _phase_execution 重新调度
+            from core.blackboard import TaskStatus
+            for tf in result.get("failed_files", []):
+                for task in self.blackboard.state.tasks:
+                    if task.target_file == tf:
+                        task.log_error(f"[集成测试] {result['feedback'][:500]}")
+                        task.status = TaskStatus.TODO  # 重置为 TODO 让调度器可以重新选取
+                        break
+
+            # 如果 failed_files 为空但测试确实失败，标记所有 py 文件
+            if not result.get("failed_files"):
+                for task in self.blackboard.state.tasks:
+                    if task.target_file.endswith('.py') and task.status == TaskStatus.DONE:
+                        task.log_error(f"[集成测试] {result['feedback'][:500]}")
+                        task.status = TaskStatus.TODO
+                        break  # 只重置第一个后端文件
+
+            logger.warning(f"❌ [Phase 2.5] 集成测试失败: {result['feedback'][:200]}")
+            global_broadcaster.emit_sync("System", "integration_failed",
+                f"❌ 集成测试失败: {result['feedback'][:100]}")
+            return False
 
     # ============================================================
     # Phase 1: 规划 (唤醒 Manager)
