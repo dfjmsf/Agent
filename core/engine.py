@@ -127,9 +127,8 @@ class AstreaEngine:
             if success and self._needs_integration_test():
                 integration_ok = self._phase_integration_test()
                 if not integration_ok:
-                    # 重试一轮失败的 task
-                    logger.info("🔄 [Phase 2.5] 集成测试失败，重新执行失败的 task...")
-                    success = self._phase_execution()
+                    # 回 Manager 做 mini re-plan 后精确重试
+                    success = self._retry_from_integration()
                     if success:
                         integration_ok = self._phase_integration_test()
                         success = integration_ok
@@ -250,8 +249,7 @@ class AstreaEngine:
         if success and self._needs_integration_test():
             integration_ok = self._phase_integration_test()
             if not integration_ok:
-                logger.info("🔄 [Patch Mode] 集成测试失败，重新执行...")
-                success = self._phase_execution()
+                success = self._retry_from_integration()
                 if success:
                     integration_ok = self._phase_integration_test()
                     success = integration_ok
@@ -325,8 +323,13 @@ class AstreaEngine:
         )
 
         if result["passed"]:
-            logger.info("✅ [Phase 2.5] 集成测试通过！")
-            global_broadcaster.emit_sync("System", "integration_passed", "✅ 集成测试通过！")
+            if result.get("warning"):
+                logger.warning("⚠️ [Phase 2.5] 集成测试未能执行（脚本问题），项目仍交付但标注警告")
+                global_broadcaster.emit_sync("System", "integration_warning",
+                    "⚠️ 集成测试未能执行，项目已交付但未经端到端验证")
+            else:
+                logger.info("✅ [Phase 2.5] 集成测试通过！")
+                global_broadcaster.emit_sync("System", "integration_passed", "✅ 集成测试通过！")
             return True
         else:
             # 将失败信息写入对应 task，并重置为 TODO 以便 _phase_execution 重新调度
@@ -350,6 +353,78 @@ class AstreaEngine:
             global_broadcaster.emit_sync("System", "integration_failed",
                 f"❌ 集成测试失败: {result['feedback'][:100]}")
             return False
+
+    def _retry_from_integration(self) -> bool:
+        """
+        集成测试失败后的精确回退：
+        1. 收集所有文件的当前代码
+        2. 回 Manager 做 mini re-plan（全局分诊）
+        3. 只重置 Manager 指定的文件为 TODO（带精确修复指令）
+        4. 重新执行 TDD
+        """
+        from core.blackboard import TaskStatus
+
+        logger.info("🔄 [Phase 2.5] 集成测试失败，回 Manager 做精确分诊...")
+        global_broadcaster.emit_sync("System", "integration_retry",
+            "🔄 集成测试失败，Manager 正在分析需修复的文件...")
+
+        # 1. 收集集成测试的反馈信息（从 task error_logs 中提取）
+        feedback_parts = []
+        for task in self.blackboard.state.tasks:
+            if task.error_logs:
+                last_err = task.error_logs[-1] if isinstance(task.error_logs, list) else str(task.error_logs)
+                if "[集成测试]" in str(last_err):
+                    feedback_parts.append(f"{task.target_file}: {last_err}")
+        feedback = "\n".join(feedback_parts) if feedback_parts else "集成测试失败（无详细信息）"
+
+        # 2. 回 Manager 做 mini re-plan
+        try:
+            from agents.manager import ManagerAgent
+            manager = ManagerAgent(project_id=self.project_id)
+
+            # 将集成测试反馈作为 "修改需求"传给 Manager
+            patch_requirement = (
+                f"[集成测试失败，需要修复]\n{feedback}\n\n"
+                f"请根据以上错误信息，精确判断哪些文件需要修改、如何修改。"
+            )
+            patch_plan = manager.plan_patch(patch_requirement)
+
+            tasks_to_fix = patch_plan.get("tasks", [])
+
+            if not tasks_to_fix:
+                logger.warning("⚠️ Manager 未识别出需要修复的文件，使用原始回退逻辑")
+                # Fallback：重置所有之前被标记的 TODO task
+                return self._phase_execution()
+
+            # 3. 只重置 Manager 指定的文件为 TODO
+            reset_count = 0
+            for patch_task in tasks_to_fix:
+                target = patch_task.get("target_file", "")
+                desc = patch_task.get("description", "")
+                for task in self.blackboard.state.tasks:
+                    if task.target_file == target:
+                        task.description = desc  # 覆盖为精确修复指令
+                        task.status = TaskStatus.TODO
+                        task.retry_count = 0  # 重置熔断计数，集成测试回退不继承之前的重试次数
+                        reset_count += 1
+                        logger.info(f"🎯 [Mini Re-plan] {target}: {desc[:80]}")
+                        break
+
+            if reset_count == 0:
+                logger.warning("⚠️ Manager 指定的文件不在任务列表中，使用原始回退逻辑")
+                return self._phase_execution()
+
+            logger.info(f"🔄 [Mini Re-plan] Manager 分诊完成: {reset_count} 个文件需修复")
+            global_broadcaster.emit_sync("System", "integration_replan",
+                f"🔄 Manager 精确分诊: {reset_count} 个文件需修复")
+
+        except Exception as e:
+            logger.error(f"❌ [Mini Re-plan] Manager 调用异常: {e}，使用原始回退逻辑")
+            # Fallback：直接重新执行
+            return self._phase_execution()
+
+        # 4. 重新执行（只有 Manager 指定的文件进入 TDD）
+        return self._phase_execution()
 
     # ============================================================
     # Phase 1: 规划 (唤醒 Manager)

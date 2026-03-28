@@ -515,6 +515,15 @@ class PythonSandbox:
             return text
         return f"\n...[Output Truncated (输出过长已截断)]...\n{text[-MAX_OUTPUT_LENGTH:]}"
     
+    @staticmethod
+    def _read_file_safe(path: str) -> str:
+        """安全读取临时输出文件"""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except Exception:
+            return ""
+    
     def _kill_process_tree(self, pid: int):
         """
         强制终止进程及其所有子进程。
@@ -769,7 +778,7 @@ class PythonSandbox:
     # ============================================================
 
     def execute_code(self, code_string: str, project_id: str, stdin_data: str = None,
-                     sandbox_dir: str = None) -> Dict[str, Any]:
+                     sandbox_dir: str = None, timeout: int = None) -> Dict[str, Any]:
         """
         核心执行方法：
         1. 等待预热完成（如有）
@@ -813,7 +822,7 @@ class PythonSandbox:
                 
                 with open(script_path, "w", encoding="utf-8") as f:
                     f.write(code_string)
-                logger.info(f"⏳ 使用 sandbox venv 执行: {script_name} (Timeout: {EXECUTION_TIMEOUT}s)")
+                logger.info(f"⏳ 使用 sandbox venv 执行: {script_name} (Timeout: {timeout or EXECUTION_TIMEOUT}s)")
                 
                 # stdin 处理
                 stdin_pipe = subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL
@@ -827,46 +836,71 @@ class PythonSandbox:
                 # subprocess.run(timeout=N) 只杀父进程，子进程持有管道导致 communicate() 永远挂死
                 creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
                 
-                process = subprocess.Popen(
-                    [sandbox_python, script_path],
-                    cwd=temp_dir,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    stdin=stdin_pipe,
-                    env=env,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    creationflags=creationflags,
-                )
+                # 使用临时文件替代 PIPE 捕获输出
+                # 原因：communicate() 等待 PIPE 关闭，子进程（如 uvicorn worker）
+                # 继承 PIPE 句柄后会阻塞 communicate() 直到超时。
+                # wait() 只等进程退出，不受子进程句柄影响。
+                stdout_path = os.path.join(temp_dir, "_stdout.txt")
+                stderr_path = os.path.join(temp_dir, "_stderr.txt")
+                
+                stdout_file = open(stdout_path, "w", encoding="utf-8", errors="replace")
+                stderr_file = open(stderr_path, "w", encoding="utf-8", errors="replace")
                 
                 try:
-                    # 如果有 stdin 数据则传入
-                    stdout_str, stderr_str = process.communicate(
-                        input=stdin_data,
-                        timeout=EXECUTION_TIMEOUT
+                    process = subprocess.Popen(
+                        [sandbox_python, script_path],
+                        cwd=temp_dir,
+                        stdout=stdout_file,
+                        stderr=stderr_file,
+                        stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+                        env=env,
+                        creationflags=creationflags,
                     )
-                except subprocess.TimeoutExpired:
-                    logger.error(f"⚠️ 执行超时 (>{EXECUTION_TIMEOUT}s)，正在强制终止进程树...")
-                    # Windows: 用 taskkill /T /F 杀整棵进程树（包括 Flask reloader 等子进程）
-                    self._kill_process_tree(process.pid)
                     
-                    # 读取已有的输出（短超时防止再次挂死）
+                    # 如果有 stdin 数据则写入
+                    if stdin_data is not None:
+                        try:
+                            process.stdin.write(stdin_data.encode("utf-8"))
+                            process.stdin.close()
+                        except Exception:
+                            pass
+                    
+                    effective_timeout = timeout or EXECUTION_TIMEOUT
                     try:
-                        stdout_str, stderr_str = process.communicate(timeout=5)
-                    except Exception:
-                        stdout_str, stderr_str = "", ""
-                    
-                    # Windows: 等待文件句柄释放
-                    if os.name == 'nt':
-                        time.sleep(0.3)
-                    
-                    return {
-                        "success": False,
-                        "stdout": self._truncate_output(stdout_str),
-                        "stderr": f"Execution timed out after {EXECUTION_TIMEOUT} seconds. (可能存在死循环或阻塞式服务器，进程树已被强制终止)\n{self._truncate_output(stderr_str)}",
-                        "returncode": -1
-                    }
+                        process.wait(timeout=effective_timeout)
+                    except subprocess.TimeoutExpired:
+                        logger.error(f"⚠️ 执行超时 (>{effective_timeout}s)，正在强制终止进程树...")
+                        self._kill_process_tree(process.pid)
+                        try:
+                            process.wait(timeout=5)
+                        except Exception:
+                            pass
+                        
+                        if os.name == 'nt':
+                            time.sleep(0.3)
+                        
+                        # 关闭文件后读取
+                        stdout_file.close()
+                        stderr_file.close()
+                        stdout_str = self._read_file_safe(stdout_path)
+                        stderr_str = self._read_file_safe(stderr_path)
+                        
+                        return {
+                            "success": False,
+                            "stdout": self._truncate_output(stdout_str),
+                            "stderr": f"Execution timed out after {effective_timeout} seconds. (可能存在死循环或阻塞式服务器，进程树已被强制终止)\n{self._truncate_output(stderr_str)}",
+                            "returncode": -1
+                        }
+                finally:
+                    # 确保文件句柄关闭
+                    if not stdout_file.closed:
+                        stdout_file.close()
+                    if not stderr_file.closed:
+                        stderr_file.close()
+                
+                # 正常完成，读取输出
+                stdout_str = self._read_file_safe(stdout_path)
+                stderr_str = self._read_file_safe(stderr_path)
                 
                 stdout_truncated = self._truncate_output(stdout_str or "")
                 stderr_truncated = self._truncate_output(stderr_str or "")
