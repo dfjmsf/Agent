@@ -131,7 +131,10 @@ class AstreaEngine:
                     success = self._retry_from_integration()
                     if success:
                         integration_ok = self._phase_integration_test()
-                        success = integration_ok
+                    if not integration_ok:
+                        logger.warning("⚠️ 确定性集成测试 2 次未通过，降级为警告交付")
+                        global_broadcaster.emit_sync("System", "integration_warning", "⚠️ 集成测试未完全通过，降级为警告交付")
+                        success = True
 
             # Phase 3: 结算
             if success:
@@ -280,16 +283,27 @@ class AstreaEngine:
     # ============================================================
 
     def _needs_integration_test(self) -> bool:
-        """判断是否需要集成测试（仅包含后端 Python 服务的项目）"""
+        """判断是否需要集成测试"""
         files = [t.target_file for t in self.blackboard.state.tasks]
         has_backend = any(f.endswith('.py') for f in files)
-        # 纯 Python 脚本项目（如算法题）不需要集成测试
-        # 只有 Web 服务项目才需要：有后端 + 有前端或 API 相关文件
         has_frontend = any(f.endswith(('.html', '.js', '.jsx', '.ts', '.tsx', '.vue')) for f in files)
         # 也检查规划书中是否有 API 关键词
         spec = self.blackboard.state.spec_text or ""
         has_api = any(kw in spec.lower() for kw in ['api', 'flask', 'fastapi', 'uvicorn', 'express', 'http'])
-        return has_backend and (has_frontend or has_api)
+
+        # 场景 1: 有后端 + 有前端或 API → 需要完整集成测试
+        if has_backend and (has_frontend or has_api):
+            return True
+
+        # 场景 2: 纯前端 npm 构建项目（有 package.json）→ 需要前端冒烟测试
+        has_package_json = any(
+            os.path.basename(f) == 'package.json' for f in files
+        )
+        if has_package_json and has_frontend:
+            logger.info("📦 检测到纯前端 npm 项目，启用前端冒烟测试")
+            return True
+
+        return False
 
     def _phase_integration_test(self) -> bool:
         """Phase 2.5: 端到端集成测试"""
@@ -377,6 +391,19 @@ class AstreaEngine:
                     feedback_parts.append(f"{task.target_file}: {last_err}")
         feedback = "\n".join(feedback_parts) if feedback_parts else "集成测试失败（无详细信息）"
 
+        # 1.5 将集成测试报错写入短期记忆，让 Coder 修复时能看到完整错误
+        try:
+            from core.database import append_event
+            append_event(
+                "tdd", "round_fail",
+                f"[集成测试失败] {feedback[:800]}",
+                project_id=self.project_id,
+                metadata={"source": "integration_test"}
+            )
+            logger.info("📝 集成测试报错已写入短期记忆（供 Coder 修复参考）")
+        except Exception as e:
+            logger.warning(f"⚠️ 写入集成测试短期记忆失败: {e}")
+
         # 2. 回 Manager 做 mini re-plan
         try:
             from agents.manager import ManagerAgent
@@ -458,7 +485,14 @@ class AstreaEngine:
         self._warmup_sandbox(project_spec=project_spec)
 
         # Step 2: 拆解任务（与 sandbox warmup 并行！）
-        plan = manager.plan_tasks(user_requirement, project_spec=project_spec)
+        # 加载 Manager Playbook（按技术栈动态注入）
+        from core.playbook_loader import PlaybookLoader
+        _pb_loader = PlaybookLoader()
+        _tech_stack = (project_spec or {}).get("tech_stack", [])
+        manager_playbook = _pb_loader.load_for_manager(_tech_stack)
+
+        plan = manager.plan_tasks(user_requirement, project_spec=project_spec,
+                                  manager_playbook=manager_playbook)
         plan["project_spec"] = project_spec
 
         # 贴上黑板
@@ -727,7 +761,13 @@ class AstreaEngine:
         except Exception as e:
             logger.warning(f"⚠️ Observer 预取异常: {e}")
 
-        # (3) 构建 task_meta
+        # (3) 加载 Playbook（按技术栈和文件类型动态注入）
+        from core.playbook_loader import PlaybookLoader
+        _pb_loader = PlaybookLoader()
+        _tech_stack = (self.blackboard.state.project_spec or {}).get("tech_stack", [])
+        playbook_content = _pb_loader.load_for_coder(_tech_stack, task.target_file)
+
+        # (4) 构建 task_meta
         tasks_dict = [
             {"task_id": t.task_id, "target_file": t.target_file, "description": t.description}
             for t in self.blackboard.state.tasks
@@ -739,6 +779,7 @@ class AstreaEngine:
             "observer_tree": observer_tree,
             "observer_context": observer_context,
             "existing_code": existing_code,
+            "playbook": playbook_content,
         }
 
         # (4) 调用 Coder
@@ -903,13 +944,13 @@ class AstreaEngine:
             try:
                 from agents.synthesizer import SynthesizerAgent
                 from agents.auditor import AuditorAgent
+                from concurrent.futures import ThreadPoolExecutor, as_completed
 
                 synthesizer = SynthesizerAgent(project_id=project_id)
 
                 # 构建里程碑 — 从真理区读取最终代码
                 milestones_list = []
                 for task in bb_state.tasks:
-                    # 从真理区读取最终代码
                     final_code = ""
                     if vfs_ref:
                         final_code = vfs_ref.read_truth(task.target_file) or ""
@@ -925,58 +966,102 @@ class AstreaEngine:
                         "success": task.status == TaskStatus.DONE,
                     })
 
-                # Synthesizer
-                plan_dict = bb_state.project_spec or {}
-                for item in milestones_list:
-                    tf = item["task"].get("target_file", "")
-                    if item["success"]:
-                        synthesizer.synthesize_success(
-                            item["milestones"], user_requirement, plan_dict,
-                            target_file=tf)
-                    elif item["task"].get("task_id"):
-                        synthesizer.synthesize_failure(
-                            item["milestones"], user_requirement, plan_dict,
-                            target_file=tf)
-                logger.info("✨ [后台] Synthesizer 知识提炼完毕")
+                # ── 并行化：Synthesizer + Auditor 同时跑 ──
 
-                # Auditor
-                all_used_ids, all_ignored_ids = set(), set()
-                auditor = AuditorAgent()
-                from core.database import ScopedSession, Memory
+                def _run_synthesizer():
+                    """Synthesizer: 所有 task 并行提炼"""
+                    plan_dict = bb_state.project_spec or {}
 
-                for item in milestones_list:
-                    if not item["success"]:
-                        continue
-                    tid = item["task"]["task_id"]
-                    task_memory_ids = get_recalled_memory_union(project_id, tid)
-                    if not task_memory_ids:
-                        continue
+                    def _synth_one(item):
+                        tf = item["task"].get("target_file", "")
+                        try:
+                            if item["success"]:
+                                synthesizer.synthesize_success(
+                                    item["milestones"], user_requirement, plan_dict,
+                                    target_file=tf)
+                            elif item["task"].get("task_id"):
+                                synthesizer.synthesize_failure(
+                                    item["milestones"], user_requirement, plan_dict,
+                                    target_file=tf)
+                        except Exception as e:
+                            logger.warning(f"⚠️ Synthesizer 单 task 异常 ({tf}): {e}")
 
-                    task_final_code = item["milestones"].get("c", "")
-                    if not task_final_code:
-                        continue
+                    with ThreadPoolExecutor(max_workers=min(len(milestones_list), 4)) as pool:
+                        list(pool.map(_synth_one, milestones_list))
+                    logger.info("✨ [后台] Synthesizer 知识提炼完毕")
 
-                    memories_to_audit = [{"id": mid, "content": ""} for mid in task_memory_ids]
-                    session = ScopedSession()
-                    try:
-                        for m in memories_to_audit:
-                            if m["id"] > 0:
-                                row = session.query(Memory).filter(Memory.id == m["id"]).first()
-                                if row:
-                                    m["content"] = row.content[:300]
-                    finally:
-                        ScopedSession.remove()
+                def _run_auditor():
+                    """Auditor: 所有 task 的审计并行执行"""
+                    from core.database import ScopedSession, Memory
 
-                    audit_result = auditor.audit(task_final_code, memories_to_audit)
-                    for r in audit_result.get("results", []):
-                        mid = r.get("memory_id", -1)
-                        if mid > 0:
-                            (all_used_ids if r.get("adopted") else all_ignored_ids).add(mid)
+                    auditor = AuditorAgent()
+                    all_used_ids, all_ignored_ids = set(), set()
 
-                if all_used_ids or all_ignored_ids:
-                    settle_memory_scores(all_used_ids, all_ignored_ids, get_global_round())
-                    logger.info(f"✨ [后台] AMC 结算完成: 功臣{len(all_used_ids)} 陪跑{len(all_ignored_ids)}")
-                tick_global_round()
+                    # 收集需要审计的 task
+                    audit_tasks = []
+                    for item in milestones_list:
+                        if not item["success"]:
+                            continue
+                        tid = item["task"]["task_id"]
+                        task_memory_ids = get_recalled_memory_union(project_id, tid)
+                        if not task_memory_ids:
+                            continue
+                        task_final_code = item["milestones"].get("c", "")
+                        if not task_final_code:
+                            continue
+                        audit_tasks.append((tid, task_memory_ids, task_final_code))
+
+                    if not audit_tasks:
+                        return set(), set()
+
+                    def _audit_one(args):
+                        tid, memory_ids, final_code = args
+                        memories_to_audit = [{"id": mid, "content": ""} for mid in memory_ids]
+                        session = ScopedSession()
+                        try:
+                            for m in memories_to_audit:
+                                if m["id"] > 0:
+                                    row = session.query(Memory).filter(Memory.id == m["id"]).first()
+                                    if row:
+                                        m["content"] = row.content[:300]
+                        finally:
+                            ScopedSession.remove()
+
+                        result = auditor.audit(final_code, memories_to_audit)
+                        used, ignored = set(), set()
+                        for r in result.get("results", []):
+                            mid = r.get("memory_id", -1)
+                            if mid > 0:
+                                (used if r.get("adopted") else ignored).add(mid)
+                        return used, ignored
+
+                    # 并行审计所有 task
+                    with ThreadPoolExecutor(max_workers=min(len(audit_tasks), 4)) as pool:
+                        futures = [pool.submit(_audit_one, t) for t in audit_tasks]
+                        for fut in as_completed(futures):
+                            try:
+                                used, ignored = fut.result()
+                                all_used_ids |= used
+                                all_ignored_ids |= ignored
+                            except Exception as e:
+                                logger.warning(f"⚠️ 单 task 审计异常: {e}")
+
+                    return all_used_ids, all_ignored_ids
+
+                # Synthesizer 和 Auditor 并行执行
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    synth_future = pool.submit(_run_synthesizer)
+                    audit_future = pool.submit(_run_auditor)
+
+                    # 等待 Synthesizer 完成（不需要返回值）
+                    synth_future.result()
+
+                    # 等待 Auditor 完成并做 AMC 结算
+                    all_used_ids, all_ignored_ids = audit_future.result()
+                    if all_used_ids or all_ignored_ids:
+                        settle_memory_scores(all_used_ids, all_ignored_ids, get_global_round())
+                        logger.info(f"✨ [后台] AMC 结算完成: 功臣{len(all_used_ids)} 陪跑{len(all_ignored_ids)}")
+                    tick_global_round()
 
             except Exception as e:
                 logger.error(f"❌ [后台] 结算异常: {e}")

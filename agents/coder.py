@@ -178,12 +178,16 @@ class CoderAgent:
         # v1.3: 依赖文件上下文来自 Observer（骨架 + 关键片段）
         vfs_str = observer_context if observer_context else "当前无依赖文件，你是写的第一个文件。"
 
+        # Playbook: 技术栈编码规范（由 Engine 按文件类型动态加载）
+        playbook = task_meta.get("playbook", "") if task_meta else ""
+
         system_content = self._get_coder_prompt(target_file).format(
             target_file=target_file,
             description=description,
             memory_hint=memory_hint,
             project_spec=project_spec,
-            vfs_context=vfs_str
+            vfs_context=vfs_str,
+            playbook=playbook
         )
         
         user_prompt = "请开始编写该文件的代码。只输出这一个文件的代码内容。"
@@ -326,11 +330,12 @@ class CoderAgent:
             if not found:
                 fail_count += 1
 
-        if fail_count > 0 and success_count == 0:
-            return None  # 全部失败，触发 fallback
-        
         result = "\n".join(lines)
         logger.info(f"🔧 [Editor] 内存编辑: {success_count} 成功, {fail_count} 失败")
+
+        if success_count == 0:
+            return None  # 零有效编辑 = 无实质修改，触发 fallback
+
         return result
 
     def _fallback_full_rewrite(self, target_file: str, description: str, feedback: str,
@@ -339,13 +344,15 @@ class CoderAgent:
         """降级方案：基于现有代码的保守覆写（注入原始代码防止功能丢失）"""
         project_spec = task_meta.get("project_spec", "无规划书") if task_meta else "无规划书"
         vfs_str = observer_context if observer_context else "当前无依赖文件。"
+        playbook = task_meta.get("playbook", "") if task_meta else ""
 
         system_content = self._get_coder_prompt(target_file).format(
             target_file=target_file,
             description=description,
             memory_hint=memory_hint,
             project_spec=project_spec,
-            vfs_context=vfs_str
+            vfs_context=vfs_str,
+            playbook=playbook
         )
 
         if existing_code:
@@ -436,13 +443,25 @@ class CoderAgent:
         global_broadcaster.emit_sync("Coder", "coding_start", f"[{mode}] 正在为 {target_file} 编写代码", {"target": target_file})
         
         if edit_instruction:
-            # 修复模式：精简记忆（不重新召回全局 RAG，节省 ~1500 tokens/次）
-            fix_hint = self._build_fix_hint(target_file, description, observer_context)
-            result = self._fix_with_editor(
-                target_file, description, edit_instruction,
-                existing_code=existing_code,
-                memory_hint=fix_hint, task_meta=task_meta
-            )
+            ext = os.path.splitext(target_file)[1].lower()
+            if ext in self.FRONTEND_EXTENSIONS:
+                # 前端文件直接全量覆写（Editor search/replace 对 CSS/JS 匹配率极低）
+                logger.info(f"🎨 [前端] 跳过 Editor 模式，直接全量覆写: {target_file}")
+                fix_hint = self._build_fix_hint(target_file, description, observer_context)
+                result = self._fallback_full_rewrite(
+                    target_file, description, edit_instruction,
+                    existing_code=existing_code,
+                    observer_context=observer_context,
+                    memory_hint=fix_hint, task_meta=task_meta
+                )
+            else:
+                # 后端文件：精简记忆 + Editor 差量编辑
+                fix_hint = self._build_fix_hint(target_file, description, observer_context)
+                result = self._fix_with_editor(
+                    target_file, description, edit_instruction,
+                    existing_code=existing_code,
+                    memory_hint=fix_hint, task_meta=task_meta
+                )
         else:
             # 首次生成：完整记忆（含全局 RAG 3+1 + 项目经验 + TDD 窗口）
             memory_hint = self._build_memory_hint(target_file, description, task_meta)

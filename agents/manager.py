@@ -107,7 +107,8 @@ class ManagerAgent:
             logger.error(f"规划书生成异常: {e}")
             return {}
 
-    def plan_tasks(self, user_requirement: str, project_spec: dict = None) -> dict:
+    def plan_tasks(self, user_requirement: str, project_spec: dict = None,
+                   manager_playbook: str = "") -> dict:
         """
         步骤 2: 基于规划书拆解任务列表。
         """
@@ -153,7 +154,9 @@ class ManagerAgent:
             spec_str = json.dumps(project_spec, ensure_ascii=False, indent=2)
             spec_context = f"\n\n【项目规划书 — 你必须基于此架构拆解任务】\n{spec_str}"
 
-        system_prompt = Prompts.MANAGER_SYSTEM + f"\n\n【近期用户需求历史】\n{history_str}\n\n【RAG 检索到的过往血泪经验】\n{experience_str}\n\n{env_context}{spec_context}"
+        # 5. 注入 Playbook（技术栈专用拆分规则）
+        manager_system = Prompts.MANAGER_SYSTEM.format(manager_playbook=manager_playbook)
+        system_prompt = manager_system + f"\n\n【近期用户需求历史】\n{history_str}\n\n【RAG 检索到的过往血泪经验】\n{experience_str}\n\n{env_context}{spec_context}"
         user_prompt = f"主人的开发需求：\n{user_requirement}\n请严格按照 JSON Schema 输出。"
         
         try:

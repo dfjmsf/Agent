@@ -92,6 +92,18 @@ class ReviewerAgent:
                 return False, l03_error
             logger.info(f"✅ [L0.3] 导入检查通过: {target_file}")
 
+        # --- L0.4 FastAPI POST/PUT 参数检查（所有 Python 文件，因为路由可能写在 main.py 中）---
+        if is_python and tree:
+            l04_pass, l04_error = self._l0_fastapi_param_check(tree, target_file, code_content)
+            if not l04_pass:
+                return False, l04_error
+
+        # --- L0.5 路由装饰器检查（routes.py 必须有 @router.xxx 装饰器）---
+        if is_python and tree:
+            l05_pass, l05_error = self._l0_route_decorator_check(tree, target_file, code_content)
+            if not l05_pass:
+                return False, l05_error
+
         return True, ""
 
     def _l0_js_syntax_check(self, target_file: str, sandbox_dir: str) -> Tuple[bool, str]:
@@ -125,7 +137,167 @@ class ReviewerAgent:
             logger.warning(f"⚠️ [L0.1 JS] 检查异常: {e}，跳过")
             return True, ""
 
+    @staticmethod
+    def _l0_fastapi_param_check(tree: ast.AST, target_file: str,
+                                 code_content: str) -> Tuple[bool, str]:
+        """
+        L0.4: 检测 FastAPI POST/PUT 路由是否使用了裸参数（会导致 422）。
+        
+        FastAPI 对 POST/PUT 的 str/int 参数默认解析为 query parameter，
+        但前端通常发 JSON body → 导致 422 Unprocessable Entity。
+        
+        正确做法：用 Pydantic BaseModel 接收 JSON body。
+        """
+        import re
+
+        # 用正则找所有 @app.post / @router.post / @app.put / @router.put 装饰的函数
+        # 匹配模式：装饰器行 + 紧跟的 async def / def 行
+        pattern = re.compile(
+            r'@\w+\.(post|put)\s*\([^)]*\)\s*\n'       # 装饰器行
+            r'\s*(?:async\s+)?def\s+\w+\(([^)]*)\)',    # 函数签名（async def 或 def）
+            re.IGNORECASE
+        )
+
+        violations = []
+        for m in pattern.finditer(code_content):
+            method = m.group(1).upper()  # POST / PUT
+            params_str = m.group(2).strip()
+
+            if not params_str:
+                continue
+
+            # 解析参数列表
+            params = [p.strip() for p in params_str.split(',')]
+            bare_params = []
+            for param in params:
+                # 跳过 self, request, req, db 等常见非业务参数
+                param_name = param.split(':')[0].split('=')[0].strip()
+                if param_name in ('self', 'request', 'req', 'db', 'session'):
+                    continue
+                # 跳过路径参数（在装饰器 URL 中出现的 {id} 类参数）
+                if param_name in ('id', 'memo_id', 'item_id', 'user_id'):
+                    continue
+
+                # 检测裸类型注解（无 Body/Depends 等注解的基础类型）
+                if ':' in param:
+                    type_and_default = param.split(':', 1)[1].strip()
+                    # 如果有 = Body(...) 或 = Depends(...) 注解，跳过
+                    if '=' in type_and_default:
+                        default_val = type_and_default.split('=', 1)[1].strip()
+                        if any(kw in default_val for kw in ('Body', 'Depends', 'Form', 'File')):
+                            continue
+                    type_hint = type_and_default.split('=')[0].strip()
+                    bare_types = ('str', 'int', 'float', 'bool', 'dict', 'list',
+                                  'List', 'Dict', 'Optional[str]', 'Optional[int]',
+                                  'Optional[dict]', 'Optional[list]')
+                    if type_hint in bare_types:
+                        bare_params.append(param.strip())
+                elif '=' not in param:
+                    # 无类型注解也无默认值的裸参数
+                    bare_params.append(param.strip())
+
+            if bare_params:
+                violations.append(
+                    f"{method} 路由函数参数 [{', '.join(bare_params)}] "
+                    f"使用了裸类型，FastAPI 会解析为 query parameter 导致前端 JSON 请求 422"
+                )
+
+        if violations:
+            fix_hint = ("修复方法：用 Pydantic BaseModel 类接收 JSON body，"
+                       "例如 class CreateRequest(BaseModel): title: str; content: str")
+            error = (f"[L0.4 FastAPI 参数错误] {target_file}: "
+                    f"{'; '.join(violations)}。{fix_hint}")
+            logger.warning(f"❌ {error}")
+            global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+            return False, error
+
+        return True, ""
+
+    @staticmethod
+    def _l0_route_decorator_check(tree: ast.AST, target_file: str,
+                                   code_content: str) -> Tuple[bool, str]:
+        """
+        L0.5: 检测 routes.py 是否有 APIRouter 但无路由装饰器。
+
+        常见 Bug: Coder 创建 `router = APIRouter()`，但函数没有 @router.get/@router.post
+        装饰器，导致路由为空 → 所有请求返回 405 Method Not Allowed。
+        """
+        basename = os.path.basename(target_file).lower()
+
+        # 仅对路由相关文件生效
+        if basename not in ('routes.py', 'router.py', 'api.py'):
+            return True, ""
+
+        # 检查是否有 APIRouter() 或 FastAPI() 赋值给 router 变量
+        has_api_router = False
+        has_fastapi_as_router = False
+        router_var_name = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and isinstance(node.value, ast.Call):
+                        func = node.value.func
+                        func_name = ""
+                        if isinstance(func, ast.Name):
+                            func_name = func.id
+                        elif isinstance(func, ast.Attribute):
+                            func_name = func.attr
+                        if func_name == "APIRouter":
+                            has_api_router = True
+                            router_var_name = target.id
+                        elif func_name == "FastAPI" and target.id in ("router", "app_router"):
+                            has_fastapi_as_router = True
+                            router_var_name = target.id
+
+        # 致命错误：router = FastAPI()
+        if has_fastapi_as_router:
+            error = (f"[L0.5 路由致命错误] {target_file}: "
+                     f"`{router_var_name} = FastAPI()` 应改为 "
+                     f"`{router_var_name} = APIRouter()`。"
+                     f"FastAPI() 是应用实例，不能作为 router 使用，"
+                     f"app.include_router() 无法注册其路由，导致所有 API 返回 405。")
+            logger.warning(f"❌ {error}")
+            global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+            return False, error
+
+        if not has_api_router:
+            return True, ""  # 不是路由文件，跳过
+
+        # 检查是否有 @router.xxx 装饰器
+        has_route_decorator = False
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for deco in node.decorator_list:
+                    # @router.get(...) / @router.post(...)
+                    if isinstance(deco, ast.Call) and isinstance(deco.func, ast.Attribute):
+                        if isinstance(deco.func.value, ast.Name):
+                            if deco.func.value.id == router_var_name:
+                                if deco.func.attr in ('get', 'post', 'put', 'delete', 'patch'):
+                                    has_route_decorator = True
+                                    break
+                    # @router.get (无括号，不太常见)
+                    elif isinstance(deco, ast.Attribute):
+                        if isinstance(deco.value, ast.Name) and deco.value.id == router_var_name:
+                            if deco.attr in ('get', 'post', 'put', 'delete', 'patch'):
+                                has_route_decorator = True
+                                break
+                if has_route_decorator:
+                    break
+
+        if not has_route_decorator:
+            error = (f"[L0.5 路由装饰器缺失] {target_file}: "
+                     f"发现 `{router_var_name} = APIRouter()` 但没有任何 "
+                     f"`@{router_var_name}.get/post/put/delete` 装饰器。"
+                     f"所有函数都未注册为 HTTP 端点，将导致 405 Method Not Allowed。"
+                     f"修复方法：在每个处理 HTTP 请求的函数上添加 @{router_var_name}.post('/api/xxx') 等装饰器。")
+            logger.warning(f"❌ {error}")
+            global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+            return False, error
+
+        return True, ""
+
     def _l0_import_check(self, target_file: str, sandbox_dir: str) -> Tuple[bool, str]:
+
         """L0.3: 在沙盒中尝试 import 模块，超时 10 秒"""
         # 从文件路径提取模块名
         module_name = os.path.splitext(os.path.basename(target_file))[0]
@@ -174,6 +346,10 @@ except Exception as e:
                 "relative import",        # from .models import X（包内相对导入）
                 "No module named",         # 兄弟模块还没写好 / 第三方未装
                 "cannot import name",      # 兄弟模块接口未就绪
+                "Invalid args for response field",  # FastAPI Pydantic 模型校验
+                "is not a valid Pydantic field",    # FastAPI 响应模型类型错误
+                "ValidationError",                   # Pydantic 校验错误
+                "value is not a valid",              # Pydantic 字段校验
             ]
             if any(p in fail_detail for p in benign_patterns):
                 logger.warning(f"⚠️ [L0.3] 良性导入错误（跳过）: {fail_detail[:200]}")

@@ -494,6 +494,13 @@ class PythonSandbox:
                 self.venv_manager.install_package(project_id, pkg)
             
             logger.info(f"✅ Sandbox 预热完成: {project_id}")
+
+            # 检测 Node.js 环境并记录（仅日志，不阻塞）
+            node_info = self._detect_node()
+            if node_info["node"]:
+                logger.info(f"📦 Node.js 可用: node={node_info['node']}, npm={node_info['npm']}")
+            else:
+                logger.info("ℹ️ Node.js 未检测到（npm 构建项目将不可用）")
         except Exception as e:
             logger.warning(f"⚠️ Sandbox 预热异常: {e}")
         finally:
@@ -634,6 +641,117 @@ class PythonSandbox:
             package_name = IMPORT_TO_PACKAGE.get(imp, imp)
             self.venv_manager.install_package(project_id, package_name)
     
+    # ============================================================
+    # Node.js / npm 构建支持
+    # ============================================================
+
+    def _detect_node(self) -> dict:
+        """检测 Node.js 和 npm 是否可用，返回版本信息"""
+        result = {"node": None, "npm": None}
+        _shell = (os.name == 'nt')  # Windows 上 npm 是 .cmd，需要 shell=True
+        try:
+            node_out = subprocess.run(
+                ["node", "--version"],
+                capture_output=True, text=True, timeout=5, shell=_shell
+            )
+            if node_out.returncode == 0:
+                result["node"] = node_out.stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        try:
+            npm_out = subprocess.run(
+                ["npm", "--version"],
+                capture_output=True, text=True, timeout=5, shell=_shell
+            )
+            if npm_out.returncode == 0:
+                result["npm"] = npm_out.stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        return result
+
+    def npm_build(self, sandbox_dir: str, timeout: int = 120) -> dict:
+        """
+        在项目目录中执行 npm install + npm run build。
+
+        触发条件：sandbox_dir 中存在 package.json
+        产出：dist/ 或 build/ 目录
+
+        Args:
+            sandbox_dir: 项目文件所在目录（含 package.json）
+            timeout: npm 命令超时（秒）
+
+        Returns:
+            {"success": bool, "dist_dir": str|None, "error": str}
+        """
+        pkg_json = os.path.join(sandbox_dir, "package.json")
+        if not os.path.isfile(pkg_json):
+            return {"success": True, "dist_dir": None, "error": ""}
+
+        node_info = self._detect_node()
+        if not node_info["npm"]:
+            logger.error("❌ npm 未安装，无法构建前端项目")
+            return {
+                "success": False, "dist_dir": None,
+                "error": "npm 未安装。请安装 Node.js: https://nodejs.org"
+            }
+
+        logger.info(f"📦 [npm] 开始构建... (dir={sandbox_dir})")
+        _shell = (os.name == 'nt')  # Windows 上 npm 是 .cmd
+
+        # npm install
+        try:
+            install_result = subprocess.run(
+                ["npm", "install", "--legacy-peer-deps"],
+                cwd=sandbox_dir, capture_output=True, text=True,
+                timeout=timeout, encoding="utf-8", errors="replace",
+                shell=_shell
+            )
+            if install_result.returncode != 0:
+                err = install_result.stderr[:500] if install_result.stderr else "未知错误"
+                logger.error(f"❌ npm install 失败: {err}")
+                return {"success": False, "dist_dir": None,
+                        "error": f"npm install 失败: {err}"}
+            logger.info("✅ npm install 完成")
+        except subprocess.TimeoutExpired:
+            logger.error(f"❌ npm install 超时 (>{timeout}s)")
+            return {"success": False, "dist_dir": None,
+                    "error": f"npm install 超时 (>{timeout}s)"}
+        except Exception as e:
+            return {"success": False, "dist_dir": None,
+                    "error": f"npm install 异常: {e}"}
+
+        # npm run build
+        try:
+            build_result = subprocess.run(
+                ["npm", "run", "build"],
+                cwd=sandbox_dir, capture_output=True, text=True,
+                timeout=timeout, encoding="utf-8", errors="replace",
+                shell=_shell
+            )
+            if build_result.returncode != 0:
+                err = build_result.stderr[:500] if build_result.stderr else "未知错误"
+                logger.error(f"❌ npm run build 失败: {err}")
+                return {"success": False, "dist_dir": None,
+                        "error": f"npm run build 失败: {err}"}
+            logger.info("✅ npm run build 完成")
+        except subprocess.TimeoutExpired:
+            logger.error(f"❌ npm run build 超时 (>{timeout}s)")
+            return {"success": False, "dist_dir": None,
+                    "error": f"npm run build 超时 (>{timeout}s)"}
+        except Exception as e:
+            return {"success": False, "dist_dir": None,
+                    "error": f"npm run build 异常: {e}"}
+
+        # 查找构建产物目录
+        for candidate in ["dist", "build", "out", ".next"]:
+            dist_path = os.path.join(sandbox_dir, candidate)
+            if os.path.isdir(dist_path):
+                logger.info(f"✅ [npm] 构建产物: {dist_path}")
+                return {"success": True, "dist_dir": dist_path, "error": ""}
+
+        return {"success": False, "dist_dir": None,
+                "error": "构建成功但未找到 dist/build 产物目录"}
+
     # ============================================================
     # PowerSandbox: 后台进程 + 端口管理
     # ============================================================
