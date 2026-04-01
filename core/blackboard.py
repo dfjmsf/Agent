@@ -110,6 +110,13 @@ class BlackboardState(BaseModel):
     tasks: List[TaskItem] = Field(default_factory=list)
     user_requirement: Optional[str] = None
     out_dir: Optional[str] = None
+
+    # --- Phase 0.3: Observer 全局快照 ---
+    global_schema: Dict[str, Any] = Field(default_factory=dict)
+    # 格式: {"models.py": [{"name":"User","fields":["id:int","name:str"],"table":"users"}]}
+    global_routes: Dict[str, Any] = Field(default_factory=dict)
+    # 格式: {"routes.py": [{"method":"GET","path":"/api/users","function":"get_users"}]}
+
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -177,6 +184,58 @@ class Blackboard:
         self._touch()
         logger.info(f"📌 任务列表已贴上黑板: {len(task_items)} 个子任务")
         self.checkpoint()
+
+    # --- Phase 0.3: 全局快照 ---
+
+    def update_global_snapshot(self, file_path: str, truth_dir: str):
+        """
+        增量更新全局快照：对单个文件提取 schema/routes。
+        在 Engine commit 到真理区后调用。
+        """
+        try:
+            from tools.observer import Observer
+            obs = Observer(truth_dir)
+
+            # 提取数据模型
+            schema = obs.extract_schema(file_path)
+            if schema:
+                self._state.global_schema[file_path] = schema
+            elif file_path in self._state.global_schema:
+                del self._state.global_schema[file_path]
+
+            # 提取路由
+            routes = obs.extract_routes(file_path)
+            if routes:
+                self._state.global_routes[file_path] = routes
+            elif file_path in self._state.global_routes:
+                del self._state.global_routes[file_path]
+
+            total_models = sum(len(v) for v in self._state.global_schema.values())
+            total_routes = sum(len(v) for v in self._state.global_routes.values())
+            if schema or routes:
+                logger.info(f"📊 全局快照更新: {file_path} → {len(schema)} 模型, {len(routes)} 路由 "
+                            f"(全局: {total_models} 模型, {total_routes} 路由)")
+        except Exception as e:
+            logger.warning(f"⚠️ 全局快照更新异常: {e}")
+
+    def get_global_snapshot_text(self) -> str:
+        """格式化全局快照为文本（注入 Coder prompt）"""
+        parts = []
+        if self._state.global_schema:
+            parts.append("【全局数据模型】")
+            for file_path, models in self._state.global_schema.items():
+                for m in models:
+                    table = f" (表: {m['table']})" if m.get('table') else ""
+                    fields = ", ".join(m.get("fields", []))
+                    parts.append(f"  {file_path} → {m['name']}{table}: {fields}")
+
+        if self._state.global_routes:
+            parts.append("【全局 API 路由】")
+            for file_path, routes in self._state.global_routes.items():
+                for r in routes:
+                    parts.append(f"  {file_path} → {r['method']} {r['path']} → {r.get('function', '?')}")
+
+        return "\n".join(parts) if parts else ""
 
     # --- 子任务级操作 ---
 

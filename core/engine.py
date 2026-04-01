@@ -881,6 +881,10 @@ class AstreaEngine:
 
                 if self.vfs:
                     self.vfs.commit_to_truth(task.target_file, merged)
+                    # Phase 0.3: 增量更新全局快照
+                    self.blackboard.update_global_snapshot(
+                        task.target_file, self.vfs.truth_dir
+                    )
 
                 # 更新文件树
                 if self.vfs:
@@ -981,6 +985,8 @@ class AstreaEngine:
             "observer_context": observer_context,
             "existing_code": existing_code,
             "playbook": playbook_content,
+            # Phase 0.3: 全局快照
+            "global_snapshot": self.blackboard.get_global_snapshot_text(),
         }
 
         # (4.5) 如果是 fill 阶段，注入骨架代码
@@ -1017,8 +1023,8 @@ class AstreaEngine:
 
     def _invoke_coder_skeleton(self, task: TaskItem) -> str:
         """
-        骨架先行：使用 CODER_SKELETON_SYSTEM 生成函数签名骨架。
-        只需要 project_spec + description，不需要完整的记忆/依赖注入。
+        骨架先行：生成函数签名骨架。
+        上下文 = Playbook + Observer 依赖骨架 + project_spec（完整上下文，确保签名正确）。
         """
         from core.prompt import Prompts
         from core.playbook_loader import PlaybookLoader
@@ -1030,12 +1036,34 @@ class AstreaEngine:
         _tech_stack = (self.blackboard.state.project_spec or {}).get("tech_stack", [])
         playbook_content = _pb_loader.load_for_coder(_tech_stack, task.target_file)
 
+        # Observer 依赖注入（确保骨架能看到上游模块的接口签名）
+        dep_context = ""
+        try:
+            from tools.observer import Observer
+            if self.vfs:
+                obs = Observer(self.vfs.truth_dir)
+                dep_files = self._resolve_smart_deps(task)
+                if dep_files:
+                    parts = []
+                    for dep_path in dep_files:
+                        skeleton = obs.get_skeleton(dep_path)
+                        if skeleton and "Error" not in skeleton:
+                            parts.append(f"--- [依赖文件: {dep_path}] ---\n{skeleton}")
+                    if parts:
+                        dep_context = "\n\n【依赖文件签名（你的函数签名必须与这些接口对齐）】\n" + "\n\n".join(parts)
+                        logger.info(f"🦴 骨架依赖注入: {dep_files}")
+        except Exception as e:
+            logger.warning(f"⚠️ 骨架依赖注入异常: {e}")
+
         system_content = Prompts.CODER_SKELETON_SYSTEM.format(
             target_file=task.target_file,
             description=task.description,
             project_spec=project_spec,
             coder_playbook=playbook_content,
         )
+        # 追加依赖上下文
+        if dep_context:
+            system_content += dep_context
 
         user_prompt = "请生成该文件的完整代码骨架。只输出函数签名和占位符，不写任何业务实现。"
 
@@ -1050,10 +1078,10 @@ class AstreaEngine:
                 messages=messages,
                 model=model,
             )
-            raw = response_msg.get("content", "")
+            raw = response_msg.content if hasattr(response_msg, 'content') else response_msg.get("content", "")
 
             # 提取代码（XML 或 markdown）
-            from tools.xml_extractor import extract_xml_files
+            from core.code_patcher import extract_xml_files
             xml_files = extract_xml_files(raw)
             if xml_files and xml_files[0].get("content"):
                 code = xml_files[0]["content"]

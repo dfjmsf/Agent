@@ -110,6 +110,161 @@ class Observer:
         return tree_str
 
     # ============================================================
+    # 1.5 全局快照提取（Phase 0.3）— 零 LLM 成本
+    # ============================================================
+
+    def extract_schema(self, file_path: str) -> list:
+        """
+        AST 提取数据模型定义（SQLAlchemy / Pydantic BaseModel）。
+        返回: [{"name": "User", "fields": ["id:int", "name:str"], "table": "users"}]
+        """
+        abs_path = self._safe_resolve(file_path)
+        if not abs_path or not os.path.isfile(abs_path):
+            return []
+        if not file_path.endswith('.py'):
+            return []
+
+        try:
+            with open(abs_path, 'r', encoding='utf-8') as f:
+                source = f.read()
+            tree = ast.parse(source)
+        except Exception:
+            return []
+
+        models = []
+        for node in ast.iter_child_nodes(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+
+            # 检测是否继承了 Model/BaseModel/Base 等
+            bases = [self._get_base_name(b) for b in node.bases]
+            is_model = any(kw in b for b in bases for kw in
+                          ('Model', 'BaseModel', 'Base', 'db.Model', 'DeclarativeBase'))
+            if not is_model:
+                continue
+
+            fields = []
+            table_name = ""
+            for item in ast.iter_child_nodes(node):
+                # SQLAlchemy: Column 赋值
+                if isinstance(item, ast.Assign):
+                    # __tablename__ 特殊处理
+                    if (len(item.targets) == 1 and
+                        isinstance(item.targets[0], ast.Name) and
+                        item.targets[0].id == '__tablename__'):
+                        if isinstance(item.value, ast.Constant):
+                            table_name = str(item.value.value)
+                        continue  # 不作为字段
+                    # 跳过其他 dunder 属性
+                    if (len(item.targets) == 1 and
+                        isinstance(item.targets[0], ast.Name) and
+                        item.targets[0].id.startswith('__')):
+                        continue
+                    for t in item.targets:
+                        if isinstance(t, ast.Name):
+                            type_hint = self._infer_column_type(item.value, source)
+                            fields.append(f"{t.id}:{type_hint}")
+
+                # Pydantic: 类型注解
+                if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                    type_str = ast.get_source_segment(source, item.annotation) or "Any"
+                    fields.append(f"{item.target.id}:{type_str}")
+
+            if fields:
+                entry = {"name": node.name, "fields": fields}
+                if table_name:
+                    entry["table"] = table_name
+                models.append(entry)
+
+        if models:
+            logger.info(f"📊 extract_schema({file_path}) → {len(models)} 个模型")
+        return models
+
+    def extract_routes(self, file_path: str) -> list:
+        """
+        AST/正则提取 API 路由定义（FastAPI / Flask）。
+        返回: [{"method": "GET", "path": "/api/users", "function": "get_users"}]
+        """
+        abs_path = self._safe_resolve(file_path)
+        if not abs_path or not os.path.isfile(abs_path):
+            return []
+        if not file_path.endswith('.py'):
+            return []
+
+        try:
+            with open(abs_path, 'r', encoding='utf-8') as f:
+                source = f.read()
+            tree = ast.parse(source)
+        except Exception:
+            return []
+
+        routes = []
+        # 遍历所有函数定义，检查装饰器
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for dec in node.decorator_list:
+                route_info = self._parse_route_decorator(dec, source)
+                if route_info:
+                    route_info["function"] = node.name
+                    routes.append(route_info)
+
+        if routes:
+            logger.info(f"🛤️ extract_routes({file_path}) → {len(routes)} 个路由")
+        return routes
+
+    @staticmethod
+    def _get_base_name(node) -> str:
+        """从 AST 节点提取基类名"""
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return f"{Observer._get_base_name(node.value)}.{node.attr}"
+        return ""
+
+    @staticmethod
+    def _infer_column_type(value_node, source: str) -> str:
+        """从 Column(...) 调用推断字段类型"""
+        segment = ast.get_source_segment(source, value_node) or ""
+        # Column(Integer, ...) → Integer
+        for t in ('Integer', 'String', 'Text', 'Boolean', 'Float', 'DateTime',
+                  'Date', 'JSON', 'JSONB', 'LargeBinary', 'Numeric'):
+            if t in segment:
+                return t
+        # Field(...) → 从注解推断（Pydantic）
+        if 'Field' in segment:
+            return "Field"
+        return "Any"
+
+    @staticmethod
+    def _parse_route_decorator(dec_node, source: str) -> dict:
+        """解析路由装饰器，提取 method + path"""
+        segment = ast.get_source_segment(source, dec_node) or ""
+        # FastAPI: @router.get("/path") / @app.post("/path")
+        route_pattern = re.compile(
+            r'\.(?P<method>get|post|put|delete|patch)\s*\(\s*["\'](?P<path>[^"\']+)["\']',
+            re.IGNORECASE
+        )
+        m = route_pattern.search(segment)
+        if m:
+            return {"method": m.group("method").upper(), "path": m.group("path")}
+
+        # Flask: @app.route("/path", methods=["GET"])
+        flask_pattern = re.compile(
+            r'\.route\s*\(\s*["\'](?P<path>[^"\']+)["\']',
+            re.IGNORECASE
+        )
+        m2 = flask_pattern.search(segment)
+        if m2:
+            method = "GET"
+            methods_match = re.search(r'methods\s*=\s*\[([^\]]+)\]', segment)
+            if methods_match:
+                method = methods_match.group(1).strip().strip("'\"").upper()
+            return {"method": method, "path": m2.group("path")}
+
+        return {}
+
+    # ============================================================
     # 2. get_skeleton — 代码骨架提取
     # ============================================================
 

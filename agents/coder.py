@@ -128,6 +128,11 @@ class CoderAgent:
         if observer_tree:
             memory_hint += f"\n\n【📂 当前项目文件结构 (Observer)】\n{observer_tree}"
         
+        # Phase 0.3: 全局快照（已 commit 的数据模型 + API 路由）
+        global_snapshot = task_meta.get("global_snapshot", "") if task_meta else ""
+        if global_snapshot:
+            memory_hint += f"\n\n【📊 全局快照 — 已完成文件的数据模型与路由（必须对齐）】\n{global_snapshot}"
+        
         return memory_hint
 
     def _build_fix_hint(self, target_file: str, description: str, observer_context: str = "") -> str:
@@ -473,8 +478,19 @@ class CoderAgent:
                     memory_hint=fix_hint, task_meta=task_meta
                 )
         else:
-            # 首次生成：完整记忆（含全局 RAG 3+1 + 项目经验 + TDD 窗口）
-            memory_hint = self._build_memory_hint(target_file, description, task_meta)
+            # 首次生成
+            is_fill = (task_meta or {}).get("is_fill_mode", False)
+            if is_fill:
+                # Fill 模式：精简上下文（骨架 + 依赖签名 + Playbook，跳过完整 RAG）
+                logger.info(f"🔧 Fill 模式: 精简上下文（跳过全局 RAG）")
+                memory_hint = ""
+                # 只注入依赖签名和项目文件树
+                observer_tree = (task_meta or {}).get("observer_tree", "")
+                if observer_tree:
+                    memory_hint += f"\n\n【📂 项目文件结构】\n{observer_tree}"
+            else:
+                # 完整记忆（含全局 RAG 3+1 + 项目经验 + TDD 窗口）
+                memory_hint = self._build_memory_hint(target_file, description, task_meta)
             result = self._generate_full(
                 target_file, description,
                 memory_hint=memory_hint,
