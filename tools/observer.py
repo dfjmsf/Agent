@@ -322,6 +322,17 @@ class Observer:
         if calls:
             parts.append(f"{indent}    # calls: {', '.join(calls)}")
 
+        # 🎯 路由函数：提取 return 结构（解决跨文件数据契约不一致）
+        is_route_func = any(
+            isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute)
+            and d.func.attr in ('get', 'post', 'put', 'delete', 'patch')
+            for d in node.decorator_list
+        )
+        if is_route_func:
+            ret_hint = self._extract_return_structure(node)
+            if ret_hint:
+                parts.append(f"{indent}    # → returns: {ret_hint}")
+
         parts.append(f"{indent}    ...")
 
         # 递归提取有装饰器的嵌套函数（如 Flask @app.route 路由）
@@ -331,6 +342,40 @@ class Observer:
                     parts.append(self._format_function(child, source, indent=indent + "    "))
 
         return "\n".join(parts)
+
+    @staticmethod
+    def _extract_return_structure(func_node) -> str:
+        """
+        从路由函数的 return 语句提取返回结构。
+        例如 return {"recipes": recipes} → '{"recipes": List}'
+        """
+        for node in ast.walk(func_node):
+            if not isinstance(node, ast.Return) or node.value is None:
+                continue
+            val = node.value
+
+            # return {"key": value, ...}
+            if isinstance(val, ast.Dict):
+                keys = []
+                for k in val.keys:
+                    if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                        keys.append(f'"{k.value}"')
+                if keys:
+                    return "{" + ", ".join(f"{k}: ..." for k in keys) + "}"
+
+            # return result  (变量名暗示类型)
+            if isinstance(val, ast.Name):
+                return f"{val.id}"
+
+            # return {"items": items, "total": count}  via dict()
+            if isinstance(val, ast.Call):
+                func = val.func
+                if isinstance(func, ast.Name) and func.id == 'dict':
+                    keys = [kw.arg for kw in val.keywords if kw.arg]
+                    if keys:
+                        return "{" + ", ".join(f'"{k}": ...' for k in keys) + "}"
+
+        return ""
 
     def _format_class(self, node, source: str) -> str:
         """格式化类定义 + 方法签名"""
@@ -342,6 +387,21 @@ class Observer:
                 bases.append(b)
         bases_str = f"({', '.join(bases)})" if bases else ""
         lines = [f"class {node.name}{bases_str}:"]
+
+        # 🎯 Pydantic BaseModel: 提取字段摘要（解决前后端字段名一致性）
+        is_basemodel = any(
+            b in ('BaseModel', 'pydantic.BaseModel') for b in
+            [ast.get_source_segment(source, base) or '' for base in node.bases]
+        )
+        if is_basemodel:
+            fields = []
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.AnnAssign) and isinstance(child.target, ast.Name):
+                    fname = child.target.id
+                    ann = ast.get_source_segment(source, child.annotation) or '?'
+                    fields.append(f"{fname}: {ann}")
+            if fields:
+                lines.append(f"    # 📋 fields: {', '.join(fields)}")
 
         # Docstring
         docstring = ast.get_docstring(node)

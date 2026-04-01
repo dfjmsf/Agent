@@ -148,6 +148,15 @@ onMounted(() => {
 - **组件文件名大驼峰**：`UserList.vue`、`MealForm.vue`
 - **CSS 可用 scoped**：`<style scoped>` 限制样式只作用于当前组件
 - **构建产物在 dist/**：`npm run build` 后生成 `dist/index.html` + `dist/assets/`
+- **🚨 GET API 返回值必须解包**：后端返回 `{"recipes": [...]}` 而非裸数组，前端必须用 `data.recipes || []` 解包：
+  ```javascript
+  // ✅ 正确：解包嵌套字段
+  const data = await res.json()
+  recipes.value = data.recipes || []
+
+  // ❌ 错误：直接赋值整个响应对象
+  recipes.value = data  // data 是 {recipes: [...]} 对象，不是数组！
+  ```
 
 ### 7. 🚨 子组件向父组件传值：必须用 emit，严禁用 props 回调
 
