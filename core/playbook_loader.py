@@ -48,6 +48,8 @@ class PlaybookLoader:
         "vue3 vite": "vue3_vite.md",
         "vue 3 vite": "vue3_vite.md",
         "vue vite": "vue3_vite.md",
+        "composition api": "vue3_vite.md",  # Composition API → Vite 模式
+        "composition": "vue3_vite.md",
         "react": "react_vite.md",
         "react vite": "react_vite.md",
         "react.js": "react_vite.md",
@@ -71,6 +73,8 @@ class PlaybookLoader:
         "vue3 vite": "vue3_vite.md",
         "vue 3 vite": "vue3_vite.md",
         "vue vite": "vue3_vite.md",
+        "composition api": "vue3_vite.md",  # Composition API → Vite 模式
+        "composition": "vue3_vite.md",
         "react": "vue3_vite.md",        # React 复用 Vite 任务拆分规则
         "react vite": "vue3_vite.md",
         # CDN 模式
@@ -96,7 +100,7 @@ class PlaybookLoader:
 
     # 文件后缀分类
     BACKEND_EXTS = {".py"}
-    FRONTEND_EXTS = {".html", ".htm", ".css", ".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte"}
+    FRONTEND_EXTS = {".html", ".htm", ".css", ".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte", ".json"}
 
     # Addon 补丁映射（仅当 tech_stack 包含关键词时激活，不会默认注入）
     # 格式：{"tech_stack关键词": ("_patches/文件名", "显示名", “限定后缀集”)}
@@ -152,7 +156,7 @@ class PlaybookLoader:
 
         # 上下文检测：是否是 Vite 构建项目（影响 Tailwind 补丁选择）
         all_tech_lower = " ".join(t.lower() for t in tech_stack)
-        is_vite_project = any(kw in all_tech_lower for kw in ["vite", "react"])
+        is_vite_project = any(kw in all_tech_lower for kw in ["vite", "react", "composition"])
 
         for tech in tech_stack:
             tech_lower = tech.lower().strip()
@@ -245,8 +249,8 @@ class PlaybookLoader:
         2. 精确匹配：小写 + 去空格 → 在 mapping 中查找
         3. 包含匹配：模糊包含关系
         """
-        # 优先级关键词：构建工具 > 框架（防止 "Vue 3" 遮蔽 "Vite"）
-        PRIORITY_KEYWORDS = ["vite", "react"]
+        # 优先级关键词：构建工具/API风格 > 框架名（防止 "Vue 3" 遮蔽 "Vite" 或 "Composition API"）
+        PRIORITY_KEYWORDS = ["vite", "react", "composition"]
 
         # Pass 1: 优先级扫描（合并所有 tech_stack 文本查找构建工具）
         all_tech_lower = " ".join(t.lower() for t in tech_stack)

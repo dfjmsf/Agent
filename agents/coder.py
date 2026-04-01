@@ -181,16 +181,26 @@ class CoderAgent:
         # Playbook: 技术栈编码规范（由 Engine 按文件类型动态加载）
         playbook = task_meta.get("playbook", "") if task_meta else ""
 
-        system_content = self._get_coder_prompt(target_file).format(
-            target_file=target_file,
-            description=description,
-            memory_hint=memory_hint,
-            project_spec=project_spec,
-            vfs_context=vfs_str,
-            playbook=playbook
-        )
-        
-        user_prompt = "请开始编写该文件的代码。只输出这一个文件的代码内容。"
+        # Phase 0: Fill 模式 — 使用骨架填充 prompt
+        if task_meta and task_meta.get("is_fill_mode") and task_meta.get("skeleton_code"):
+            logger.info(f"🔧 Fill 模式: 使用 CODER_FILL_SYSTEM")
+            system_content = Prompts.CODER_FILL_SYSTEM.format(
+                skeleton_code=task_meta["skeleton_code"],
+                project_spec=project_spec,
+                vfs_context=vfs_str,
+                coder_playbook=playbook,
+            )
+            user_prompt = "请将骨架中的所有 `...` 占位替换为完整的业务实现。输出完整文件代码。"
+        else:
+            system_content = self._get_coder_prompt(target_file).format(
+                target_file=target_file,
+                description=description,
+                memory_hint=memory_hint,
+                project_spec=project_spec,
+                vfs_context=vfs_str,
+                playbook=playbook
+            )
+            user_prompt = "请开始编写该文件的代码。只输出这一个文件的代码内容。"
 
         messages = [
             {"role": "system", "content": system_content},

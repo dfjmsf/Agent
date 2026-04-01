@@ -20,6 +20,7 @@ from core.blackboard import Blackboard, BlackboardState, TaskItem, TaskStatus, P
 from core.code_patcher import CodePatcher, PatchFailedError, extract_xml_files
 from core.vfs_utils import VfsUtils
 from core.ws_broadcaster import global_broadcaster
+from core.llm_client import default_llm
 from core.database import (
     append_event, get_recent_events, rename_project_events,
     recall, recall_project_experience, upsert_file_tree,
@@ -32,6 +33,69 @@ from core.database import (
 logger = logging.getLogger("AstreaEngine")
 
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", 5))
+
+# 单一职责阈值（超过此数量的文件建议骨架先行）
+_SRP_ENDPOINT_THRESHOLD = 5   # 一个文件中 API 端点数 ≥ 此值 → 复杂
+_SRP_MODEL_THRESHOLD = 3      # 一个文件中数据模型数 ≥ 此值 → 复杂
+
+
+def identify_complex_files(project_spec: dict, tasks: List[dict]) -> Dict[str, str]:
+    """
+    根据 project_spec 的 api_contracts / data_models 数量，
+    识别结构复杂度高的后端文件。
+
+    Returns:
+        {target_file: reason} — 被标记为复杂的文件及原因。
+        前端文件永远不标记（前端靠拆组件解决）。
+    """
+    if not project_spec:
+        return {}
+
+    complex_files: Dict[str, str] = {}
+
+    # 前端文件后缀（永不标记）
+    frontend_exts = {'.html', '.css', '.js', '.jsx', '.ts', '.tsx', '.vue', '.svelte'}
+
+    # 收集所有 target_file
+    task_files = {t.get("target_file", "") for t in tasks}
+
+    # 1. 统计每个文件关联的 API 端点数
+    api_contracts = project_spec.get("api_contracts", [])
+    if api_contracts:
+        # 按文件聚合端点数：通过 task description 中的路由关键词匹配
+        # 更可靠的方式：统计总端点数 / 路由类文件数
+        route_files = [f for f in task_files
+                       if any(kw in f.lower() for kw in ('route', 'api', 'app', 'view', 'endpoint'))
+                       and not any(f.endswith(ext) for ext in frontend_exts)]
+
+        if route_files:
+            # 均分策略：如果只有 1 个路由文件，所有端点都在它身上
+            endpoints_per_file = len(api_contracts) / len(route_files)
+            if endpoints_per_file >= _SRP_ENDPOINT_THRESHOLD:
+                for f in route_files:
+                    complex_files[f] = f"API端点密度高({endpoints_per_file:.0f}个端点)"
+
+    # 2. 统计数据模型数
+    data_models = project_spec.get("data_models", [])
+    if data_models:
+        model_files = [f for f in task_files
+                       if any(kw in f.lower() for kw in ('model', 'schema', 'entity', 'db'))
+                       and not any(f.endswith(ext) for ext in frontend_exts)]
+
+        if model_files:
+            models_per_file = len(data_models) / len(model_files)
+            if models_per_file >= _SRP_MODEL_THRESHOLD:
+                for f in model_files:
+                    reason = f"数据模型密度高({models_per_file:.0f}个模型)"
+                    if f in complex_files:
+                        complex_files[f] += f" + {reason}"
+                    else:
+                        complex_files[f] = reason
+
+    if complex_files:
+        logger.info(f"🔍 复杂文件识别: {complex_files}")
+
+    return complex_files
 
 
 class AstreaEngine:
@@ -491,8 +555,27 @@ class AstreaEngine:
         _tech_stack = (project_spec or {}).get("tech_stack", [])
         manager_playbook = _pb_loader.load_for_manager(_tech_stack)
 
-        plan = manager.plan_tasks(user_requirement, project_spec=project_spec,
-                                  manager_playbook=manager_playbook)
+        # Step 2.1: 预估文件数，判断是否启用两阶段规划
+        estimated_files = self._estimate_file_count(project_spec)
+        TWO_STAGE_THRESHOLD = 20
+
+        if estimated_files >= TWO_STAGE_THRESHOLD:
+            # ═══ 两阶段规划（大项目） ═══
+            logger.info(f"🧩 预估 {estimated_files} 文件 ≥ {TWO_STAGE_THRESHOLD}，启动两阶段规划")
+            plan = self._two_stage_planning(
+                manager, user_requirement, project_spec, manager_playbook
+            )
+        else:
+            # ═══ 单阶段规划（常规项目，不变） ═══
+            logger.info(f"📋 预估 {estimated_files} 文件 < {TWO_STAGE_THRESHOLD}，单阶段规划")
+            # 生成复杂文件提示（辅助 Manager 决策 sub_tasks）
+            complex_hint = self._build_complex_files_hint(project_spec)
+            plan = manager.plan_tasks(
+                user_requirement, project_spec=project_spec,
+                manager_playbook=manager_playbook,
+                complex_files_hint=complex_hint
+            )
+
         plan["project_spec"] = project_spec
 
         # 贴上黑板
@@ -505,6 +588,103 @@ class AstreaEngine:
                       project_id=self.project_id)
 
         logger.info(f"📋 规划完成: {project_name}, {len(plan.get('tasks', []))} 个子任务")
+
+    def _estimate_file_count(self, project_spec: dict) -> int:
+        """从 project_spec 预估项目文件数。"""
+        if not project_spec:
+            return 0
+        # 从 module_interfaces 的键数预估
+        mi = project_spec.get("module_interfaces", {})
+        if mi:
+            return len(mi)
+        # 降级：从 api_contracts + data_models 粗估
+        apis = len(project_spec.get("api_contracts", []))
+        models = len(project_spec.get("data_models", []))
+        # 经验公式：1 models 文件 + ceil(apis/5) routes 文件 + 1 main + 3 前端 = ~6 基础
+        return max(6, apis // 3 + models + 5)
+
+    def _build_complex_files_hint(self, project_spec: dict) -> str:
+        """生成复杂文件提示文本，注入到 Manager prompt 中。"""
+        # 使用已有的 identify_complex_files 函数做预检测
+        # 但 plan_tasks 还没有 tasks，所以用 module_interfaces 的键做推测
+        if not project_spec:
+            return ""
+        mi = project_spec.get("module_interfaces", {})
+        apis = project_spec.get("api_contracts", [])
+        models = project_spec.get("data_models", [])
+
+        hints = []
+        if len(apis) >= 5:
+            hints.append(f"⚠️ 项目有 {len(apis)} 个 API 端点，路由文件可能结构复杂，建议使用 sub_tasks 骨架先行")
+        if len(models) >= 3:
+            hints.append(f"⚠️ 项目有 {len(models)} 个数据模型，models 文件可能结构复杂，建议使用 sub_tasks 骨架先行")
+
+        if hints:
+            return "\n【⚠️ 复杂度预警（Engine 静态分析）】\n" + "\n".join(hints)
+        return ""
+
+    def _two_stage_planning(self, manager, user_requirement: str,
+                            project_spec: dict, manager_playbook: str) -> dict:
+        """两阶段规划：Stage 1 分模块组 → Stage 2 逐组规划 tasks → 合并"""
+        global_broadcaster.emit_sync("Engine", "two_stage_start",
+            "🧩 大型项目: 启动两阶段规划...")
+
+        # Stage 1: 模块分组
+        module_groups = manager.plan_module_groups(user_requirement, project_spec)
+
+        if not module_groups:
+            # 降级：Stage 1 失败，回退到单阶段
+            logger.warning("⚠️ 两阶段 Stage 1 失败，降级为单阶段规划")
+            complex_hint = self._build_complex_files_hint(project_spec)
+            return manager.plan_tasks(
+                user_requirement, project_spec=project_spec,
+                manager_playbook=manager_playbook,
+                complex_files_hint=complex_hint
+            )
+
+        # Stage 2: 逐模块组规划 tasks（并行，因为只产出描述不产出代码）
+        complex_hint = self._build_complex_files_hint(project_spec)
+        all_tasks = []
+        task_counter = 0
+
+        for group in module_groups:
+            group_tasks = manager.plan_group_tasks(
+                user_requirement, project_spec, group,
+                manager_playbook=manager_playbook,
+                complex_files_hint=complex_hint
+            )
+            # 重新编号 task_id 避免跨组冲突
+            for t in group_tasks:
+                task_counter += 1
+                old_id = t.get("task_id", "")
+                new_id = f"task_{task_counter}"
+                t["task_id"] = new_id
+                # 同时将 dependencies 中的旧 ID 映射
+                # 注意：跨组依赖通过 DAG 的文件名解析处理（现有机制）
+            all_tasks.extend(group_tasks)
+
+        # 全局去重（跨组）
+        seen_files = set()
+        deduped = []
+        for t in all_tasks:
+            tf = t.get("target_file", "")
+            if tf not in seen_files:
+                seen_files.add(tf)
+                deduped.append(t)
+            else:
+                logger.warning(f"⚠️ [两阶段] 跨组去重: 跳过重复文件 {tf}")
+
+        logger.info(f"✅ [两阶段] 合并完成: {len(module_groups)} 组 → {len(deduped)} 个 tasks")
+        global_broadcaster.emit_sync("Engine", "two_stage_done",
+            f"🧩 两阶段规划完成: {len(deduped)} 个任务")
+
+        # 取第一组的 project_name（或从 spec 取）
+        project_name = (project_spec or {}).get("project_name", "AutoGen_Project")
+        return {
+            "project_name": project_name,
+            "architecture_summary": f"两阶段规划: {len(module_groups)} 模块组",
+            "tasks": deduped,
+        }
 
     # ============================================================
     # Phase 2: 执行 (状态机主循环)
@@ -581,6 +761,27 @@ class AstreaEngine:
             existing = self.vfs.read_truth(task.target_file)
             if existing and not task.code_draft:
                 task.log_action(f"从真理区预加载: {task.target_file}")
+
+        # === Phase 0: 骨架先行 ===
+        # 如果 Manager 标记了 sub_tasks，先执行 skeleton 阶段
+        if task.sub_tasks and task.current_sub_task_index == 0:
+            skeleton_sub = next((s for s in task.sub_tasks if s.get("type") == "skeleton"), None)
+            if skeleton_sub:
+                logger.info(f"🦴 [{task.task_id}] 骨架先行: {skeleton_sub.get('description', '')}")
+                global_broadcaster.emit_sync("Engine", "task_skeleton",
+                    f"骨架生成: {task.target_file}", {"task_id": task.task_id})
+
+                skeleton_code = self._invoke_coder_skeleton(task)
+                if skeleton_code:
+                    # 骨架写入真理区作为基础
+                    if self.vfs:
+                        self.vfs.commit_to_truth(task.target_file, skeleton_code)
+                    task.log_action(f"骨架代码已生成并写入真理区 ({len(skeleton_code)} chars)")
+                    task.current_sub_task_index = 1  # 推进到 fill 阶段
+                    logger.info(f"🦴 [{task.task_id}] 骨架完成，进入 fill 阶段")
+                else:
+                    task.log_error("骨架生成失败，降级为普通模式")
+                    task.sub_tasks = []  # 清空 sub_tasks，走普通流程
 
         feedback = None
 
@@ -782,7 +983,17 @@ class AstreaEngine:
             "playbook": playbook_content,
         }
 
-        # (4) 调用 Coder
+        # (4.5) 如果是 fill 阶段，注入骨架代码
+        if task.sub_tasks and task.current_sub_task_index >= 1:
+            skeleton_code = ""
+            if self.vfs:
+                skeleton_code = self.vfs.read_truth(task.target_file) or ""
+            if skeleton_code:
+                task_meta["skeleton_code"] = skeleton_code
+                task_meta["is_fill_mode"] = True
+                logger.info(f"🔧 [{task.task_id}] Fill 模式: 注入骨架 {len(skeleton_code)} chars")
+
+        # (5) 调用 Coder
         try:
             result = coder.generate_code(
                 target_file=task.target_file,
@@ -802,6 +1013,60 @@ class AstreaEngine:
                 return ""
             logger.error(f"❌ Coder 调用异常: {e}")
             task.log_error(f"Coder 异常: {e}")
+            return ""
+
+    def _invoke_coder_skeleton(self, task: TaskItem) -> str:
+        """
+        骨架先行：使用 CODER_SKELETON_SYSTEM 生成函数签名骨架。
+        只需要 project_spec + description，不需要完整的记忆/依赖注入。
+        """
+        from core.prompt import Prompts
+        from core.playbook_loader import PlaybookLoader
+
+        project_spec = self.blackboard.state.spec_text or "无规划书"
+
+        # 加载 Playbook
+        _pb_loader = PlaybookLoader()
+        _tech_stack = (self.blackboard.state.project_spec or {}).get("tech_stack", [])
+        playbook_content = _pb_loader.load_for_coder(_tech_stack, task.target_file)
+
+        system_content = Prompts.CODER_SKELETON_SYSTEM.format(
+            target_file=task.target_file,
+            description=task.description,
+            project_spec=project_spec,
+            coder_playbook=playbook_content,
+        )
+
+        user_prompt = "请生成该文件的完整代码骨架。只输出函数签名和占位符，不写任何业务实现。"
+
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_prompt}
+        ]
+
+        try:
+            model = os.getenv("MODEL_CODER", "qwen3-coder-plus")
+            response_msg = default_llm.chat_completion(
+                messages=messages,
+                model=model,
+            )
+            raw = response_msg.get("content", "")
+
+            # 提取代码（XML 或 markdown）
+            from tools.xml_extractor import extract_xml_files
+            xml_files = extract_xml_files(raw)
+            if xml_files and xml_files[0].get("content"):
+                code = xml_files[0]["content"]
+            else:
+                # fallback: 清洗 markdown
+                import re
+                md_match = re.search(r"```(?:python|py)?\s*(.*?)\s*```", raw, re.DOTALL)
+                code = md_match.group(1).strip() if md_match else raw.strip()
+
+            logger.info(f"🦴 骨架生成完毕: {len(code)} chars")
+            return code
+        except Exception as e:
+            logger.error(f"❌ 骨架生成异常: {e}")
             return ""
 
     def _resolve_smart_deps(self, task: TaskItem, existing_code: str = "") -> list:

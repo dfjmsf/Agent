@@ -183,7 +183,8 @@ def get_embedding(text: str) -> Optional[List[float]]:
     t0 = time.time()
     try:
         from core.llm_client import default_llm
-        response = default_llm.client.embeddings.create(
+        qwen_client = default_llm.get_provider_client("Qwen")
+        response = qwen_client.embeddings.create(
             model="text-embedding-v4",
             input=[text]
         )

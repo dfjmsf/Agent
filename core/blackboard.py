@@ -63,6 +63,10 @@ class TaskItem(BaseModel):
     dependencies: List[str] = Field(default_factory=list)
     tech_stack: Optional[str] = None
 
+    # --- 骨架先行 sub_tasks (Phase 0) ---
+    sub_tasks: List[Dict[str, str]] = Field(default_factory=list)  # [{"sub_id","type","description"}]
+    current_sub_task_index: int = 0  # 当前执行到哪个 sub_task
+
     # --- 状态机 ---
     status: TaskStatus = TaskStatus.TODO
     retry_count: int = 0
@@ -166,6 +170,7 @@ class Blackboard:
                 description=t.get("description", ""),
                 dependencies=t.get("dependencies", []),
                 tech_stack=t.get("tech_stack"),
+                sub_tasks=t.get("sub_tasks", []),
             )
             task_items.append(item)
         self._state.tasks = task_items

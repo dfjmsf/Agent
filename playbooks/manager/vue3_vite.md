@@ -15,7 +15,7 @@ Vite 构建项目的文件拆分必须遵循以下规则：
 | `index.html` | 高 | 入口 HTML（在根目录） |
 | `src/main.js` 或 `src/main.jsx` | 中 | 应用入口 |
 | `src/App.vue` 或 `src/App.jsx` | 中 | 根组件 |
-| `src/style.css` 或 `src/index.css` | 低 | 全局样式 |
+| `src/style.css` | 高 | **必须！** main.js 中 `import './style.css'` 硬引用，缺失会构建失败 |
 
 > 🚨 **如果使用 Tailwind CSS，必须将 `tailwind.config.js` 和 `postcss.config.js` 加入任务列表，否则所有 Tailwind 类名无效，页面无样式！**
 
@@ -38,12 +38,14 @@ package.json → vite.config.js → tailwind.config.js → postcss.config.js
 - `src/main.js(x)` 依赖 `index.html`
 - `src/App.vue(jsx)` 依赖 `src/main.js(x)`
 
-### 3. 后端文件照常
+### 3. 后端文件必须在项目根目录（禁止放入 src/！）
 
-后端文件（`models.py`, `routes.py`, `main.py`）的 DAG 规则不变：
-- `models.py` 最先
-- `routes.py` 依赖 `models.py`
-- `main.py` 依赖 `routes.py`，并在最后追加前端构建产物 `dist/` 的静态挂载
+后端文件（`models.py`, `routes.py`, `main.py`）必须放在**项目根目录**，不是 `src/` 目录！
+`src/` 目录专属前端文件（.vue/.js/.css），后端 Python 文件严禁放入 `src/`。
+
+- `models.py` 最先（根目录）
+- `routes.py` 依赖 `models.py`（根目录）
+- `main.py` 依赖 `routes.py`（根目录），并在最后追加前端构建产物 `dist/` 的静态挂载
 
 ### 4. 与 CDN 模式的区别
 

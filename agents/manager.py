@@ -108,7 +108,7 @@ class ManagerAgent:
             return {}
 
     def plan_tasks(self, user_requirement: str, project_spec: dict = None,
-                   manager_playbook: str = "") -> dict:
+                   manager_playbook: str = "", complex_files_hint: str = "") -> dict:
         """
         步骤 2: 基于规划书拆解任务列表。
         """
@@ -152,11 +152,21 @@ class ManagerAgent:
         spec_context = ""
         if project_spec:
             spec_str = json.dumps(project_spec, ensure_ascii=False, indent=2)
-            spec_context = f"\n\n【项目规划书 — 你必须基于此架构拆解任务】\n{spec_str}"
+            spec_context = f"\n\n═══ P1 — 项目契约（覆盖一切 P2 指南，冲突时以此为准）═══\n【项目规划书 — 你必须基于此架构拆解任务，禁止 Playbook 模板覆盖规划书的文件结构】\n{spec_str}"
 
-        # 5. 注入 Playbook（技术栈专用拆分规则）
-        manager_system = Prompts.MANAGER_SYSTEM.format(manager_playbook=manager_playbook)
-        system_prompt = manager_system + f"\n\n【近期用户需求历史】\n{history_str}\n\n【RAG 检索到的过往血泪经验】\n{experience_str}\n\n{env_context}{spec_context}"
+        # 5. 组装 system_prompt（按优先级排列：规则 > P1 规划书 > 环境 > P2 经验）
+        manager_system = Prompts.MANAGER_SYSTEM.format(
+            manager_playbook=manager_playbook,
+            complex_files_hint=complex_files_hint or ""
+        )
+        system_prompt = (
+            manager_system
+            + spec_context  # P1: 规划书紧跟规则之后
+            + f"\n\n{env_context}"  # 环境信息
+            + f"\n\n═══ P2 — 参考信息（仅供参考，与 P1 规划书冲突时必须服从 P1）═══"
+            + f"\n【近期用户需求历史】\n{history_str}"
+            + f"\n\n【RAG 检索到的过往经验】\n{experience_str}"
+        )
         user_prompt = f"主人的开发需求：\n{user_requirement}\n请严格按照 JSON Schema 输出。"
         
         try:
@@ -208,6 +218,119 @@ class ManagerAgent:
         except Exception as e:
             logger.error(f"Manager 拆解任务时发生异常: {e}")
             return {"project_name": "Error_Project", "architecture_summary": "API异常", "tasks": []}
+
+    # ============================================================
+    # 两阶段规划（Phase 0.1: 20+ 文件大项目）
+    # ============================================================
+
+    def plan_module_groups(self, user_requirement: str, project_spec: dict) -> list:
+        """
+        Stage 1: 将大项目拆分为 3-5 个模块组。
+        返回: [{group_id, name, description, files, dependencies}]
+        """
+        logger.info("🧩 [两阶段] Stage 1: 模块分组规划...")
+        global_broadcaster.emit_sync("Manager", "module_group_start",
+            "🧩 大型项目: 启动两阶段规划 — Stage 1 模块分组")
+
+        spec_str = json.dumps(project_spec, ensure_ascii=False, indent=2) if project_spec else "无规划书"
+
+        system_prompt = (
+            Prompts.MANAGER_MODULE_GROUP_SYSTEM
+            + f"\n\n【项目规划书】\n{spec_str}"
+        )
+        user_prompt = f"主人的开发需求：\n{user_requirement}\n请将项目拆分为模块组，严格按照 JSON Schema 输出。"
+
+        try:
+            raw_response = self.llm_client.chat_completion(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+            )
+            json_str = raw_response.content
+            if "```json" in json_str:
+                json_str = json_str.split("```json")[1].split("```")[0].strip()
+            elif "```" in json_str:
+                json_str = json_str.split("```")[1].split("```")[0].strip()
+
+            result = json.loads(json_str)
+            groups = result.get("module_groups", [])
+            logger.info(f"✅ [两阶段] Stage 1 完成: {len(groups)} 个模块组")
+            for g in groups:
+                logger.info(f"  📦 {g.get('group_id')}: {g.get('name')} ({len(g.get('files', []))} 文件) deps={g.get('dependencies', [])}")
+            return groups
+
+        except Exception as e:
+            logger.error(f"❌ [两阶段] Stage 1 失败: {e}，降级为单阶段")
+            return []
+
+    def plan_group_tasks(self, user_requirement: str, project_spec: dict,
+                        module_group: dict, manager_playbook: str = "",
+                        complex_files_hint: str = "") -> list:
+        """
+        Stage 2: 对单个模块组规划任务列表。
+        返回: [task_dict] （不含 project_name，由调用者合并）
+        """
+        group_id = module_group.get("group_id", "unknown")
+        group_name = module_group.get("name", "")
+        group_files = module_group.get("files", [])
+
+        logger.info(f"🧩 [两阶段] Stage 2: 规划模块组 [{group_id}: {group_name}] ({len(group_files)} 文件)")
+        global_broadcaster.emit_sync("Manager", "group_plan_start",
+            f"🧩 Stage 2: 规划模块组 {group_name}")
+
+        spec_str = json.dumps(project_spec, ensure_ascii=False, indent=2) if project_spec else "无规划书"
+        group_str = json.dumps(module_group, ensure_ascii=False, indent=2)
+
+        manager_system = Prompts.MANAGER_SYSTEM.format(
+            manager_playbook=manager_playbook,
+            complex_files_hint=complex_files_hint or ""
+        )
+        system_prompt = (
+            manager_system
+            + f"\n\n═══ P1 — 项目契约 ═══\n{spec_str}"
+            + f"\n\n【当前模块组信息 — 你只需要规划这个模块组内的文件】\n{group_str}"
+            + f"\n\n⚠️ 重要：你只需要为以下文件创建 tasks: {group_files}"
+            + f"\n不要为其他模块组的文件创建 task！"
+        )
+        user_prompt = (
+            f"主人的开发需求：\n{user_requirement}\n"
+            f"请只为模块组 [{group_name}] 中的文件规划 tasks，严格按照 JSON Schema 输出。"
+        )
+
+        try:
+            raw_response = self.llm_client.chat_completion(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ]
+            )
+            json_str = raw_response.content
+            if "```json" in json_str:
+                json_str = json_str.split("```json")[1].split("```")[0].strip()
+            elif "```" in json_str:
+                json_str = json_str.split("```")[1].split("```")[0].strip()
+
+            plan = json.loads(json_str)
+            tasks = plan.get("tasks", [])
+
+            # 去重
+            seen_files = set()
+            deduped = []
+            for t in tasks:
+                tf = t.get("target_file", "")
+                if tf not in seen_files:
+                    seen_files.add(tf)
+                    deduped.append(t)
+
+            logger.info(f"✅ [两阶段] Stage 2 [{group_id}] 完成: {len(deduped)} 个 tasks")
+            return deduped
+
+        except Exception as e:
+            logger.error(f"❌ [两阶段] Stage 2 [{group_id}] 失败: {e}")
+            return []
 
     def plan_patch(self, user_requirement: str) -> dict:
         """

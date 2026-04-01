@@ -511,6 +511,158 @@ class IntegrationTester:
         return body
 
     @staticmethod
+    def _parse_get_query_params_from_code(all_code: Dict[str, str], path: str) -> dict:
+        """
+        从实际代码中解析 GET 路由的 Query 参数及类型。
+        支持 FastAPI 风格: param: type = Query(...)
+        """
+        params = {}
+        for fname, code in all_code.items():
+            if not fname.endswith('.py') or not code:
+                continue
+            # 匹配 GET 路由装饰器 + 函数 def 起始
+            escaped_path = re.escape(path)
+            route_match = re.search(
+                r'@\w+\.get\(["\']' + escaped_path + r'["\']',
+                code
+            )
+            if not route_match:
+                continue
+
+            # 从 def 行开始，找到完整的参数括号（平衡括号匹配）
+            rest = code[route_match.end():]
+            def_match = re.search(r'def\s+\w+\(', rest)
+            if not def_match:
+                continue
+
+            # 从 ( 开始计数括号深度
+            start = def_match.end()
+            depth = 1
+            i = start
+            while i < len(rest) and depth > 0:
+                if rest[i] == '(':
+                    depth += 1
+                elif rest[i] == ')':
+                    depth -= 1
+                i += 1
+            params_str = rest[start:i-1]  # 去掉最外层的 )
+
+            type_samples = {
+                'str': 'test', 'string': 'test',
+                'int': 1, 'integer': 1,
+                'float': 1.5,
+                'bool': True, 'boolean': True,
+            }
+
+            # 按逗号分割（但忽略括号内的逗号）
+            param_parts = []
+            current = []
+            paren_depth = 0
+            for ch in params_str:
+                if ch == '(':
+                    paren_depth += 1
+                elif ch == ')':
+                    paren_depth -= 1
+                elif ch == ',' and paren_depth == 0:
+                    param_parts.append(''.join(current))
+                    current = []
+                    continue
+                current.append(ch)
+            if current:
+                param_parts.append(''.join(current))
+
+            # 预提取代码中的字典常量 keys（用于推断合法字符串值）
+            code_dict_keys = IntegrationTester._extract_dict_keys_from_code(code)
+
+            for param in param_parts:
+                param = param.strip()
+                if not param or param.startswith('request') or param.startswith('db'):
+                    continue
+                if ':' in param:
+                    pname, ptype_full = param.split(':', 1)
+                    pname = pname.strip()
+                    ptype_full = ptype_full.strip()
+                    # 提取基础类型（忽略 = Query(...) 部分）
+                    ptype = ptype_full.split('=')[0].strip().lower()
+                    # 跳过 Request, Response 等非参数类型
+                    if ptype in ('request', 'response', 'session'):
+                        continue
+                    if ptype == 'str':
+                        # 尝试从代码常量中推断合法值
+                        smart_val = IntegrationTester._infer_str_sample(pname, code_dict_keys)
+                        params[pname] = smart_val
+                    else:
+                        params[pname] = type_samples.get(ptype, 'test')
+
+            if params:
+                logger.info(f"📋 [Phase 2.5] 从代码解析 GET {path} query params: {list(params.keys())}")
+                return params
+        return params
+
+    @staticmethod
+    def _extract_dict_keys_from_code(code: str) -> Dict[str, list]:
+        """
+        从代码中提取顶层字典常量的 keys。
+        例如: EXCHANGE_RATES = {'USD': 1.0, 'EUR': 0.93}
+        返回: {'exchange_rates': ['USD', 'EUR']}
+        """
+        result = {}
+        # 匹配 SOME_DICT = {'key1': ..., 'key2': ...} 或 {"key1": ...}
+        for m in re.finditer(r'(\w+)\s*[=:]\s*\{([^}]+)\}', code):
+            var_name = m.group(1).lower()
+            body = m.group(2)
+            keys = re.findall(r"['\"](\w+)['\"]", body)
+            if keys:
+                result[var_name] = keys
+        return result
+
+    @staticmethod
+    def _infer_str_sample(param_name: str, code_dict_keys: Dict[str, list]) -> str:
+        """
+        根据参数名和代码中的字典常量 keys 推断合法的字符串值。
+        例如 param_name='from_currency', 代码中有 EXCHANGE_RATES={'USD','EUR'}
+        → 返回 'USD'
+        """
+        if not code_dict_keys:
+            return 'test'
+
+        pname_lower = param_name.lower()
+
+        # 策略 1: 关键词子串匹配
+        for var_name, keys in code_dict_keys.items():
+            name_parts = re.split(r'[_\s]', pname_lower)
+            var_parts = re.split(r'[_\s]', var_name)
+
+            stop_words = {'from', 'to', 'the', 'a', 'is', 'in', 'of', 'by', 'get', 'set'}
+            name_keywords = {p for p in name_parts if p not in stop_words and len(p) > 1}
+            var_keywords = {p for p in var_parts if p not in stop_words and len(p) > 1}
+
+            matched = False
+            for nk in name_keywords:
+                for vk in var_keywords:
+                    if nk in vk or vk in nk:
+                        matched = True
+                        break
+                if matched:
+                    break
+
+            if matched and keys:
+                logger.info(f"🎯 参数 '{param_name}' 从 {var_name} 推断样本值: '{keys[0]}'")
+                return keys[0]
+
+        # 策略 2: 如果只有一个字典常量，且 keys 像枚举（全大写/短字符串），直接采用
+        enum_like_dicts = {
+            vn: ks for vn, ks in code_dict_keys.items()
+            if ks and all(k.isupper() or len(k) <= 5 for k in ks)
+        }
+        if len(enum_like_dicts) == 1:
+            var_name, keys = next(iter(enum_like_dicts.items()))
+            logger.info(f"🎯 参数 '{param_name}' 从唯一枚举字典 {var_name} 采样: '{keys[0]}'")
+            return keys[0]
+
+        return 'test'
+
+    @staticmethod
     def _generate_deterministic_test(api_contracts: list, all_code: Dict[str, str] = None) -> str:
         """从 api_contracts + 实际代码自动生成测试代码"""
         if all_code is None:
@@ -539,7 +691,15 @@ class IntegrationTester:
                 
             lines.append(f"    print('Testing {method} {path} ...')")
             if method == "GET":
-                lines.append(f"    resp = requests.get(f'{{base_url}}{path}', timeout=10)")
+                # 优先从代码解析 Query 参数，fallback 到 api_contracts 的 request_params
+                query_params = IntegrationTester._parse_get_query_params_from_code(all_code, path)
+                if not query_params:
+                    query_params = IntegrationTester._build_fallback_body(api.get("request_params", {}))
+                if query_params:
+                    params_json = json.dumps(query_params)
+                    lines.append(f"    resp = requests.get(f'{{base_url}}{path}', params={params_json}, timeout=10)")
+                else:
+                    lines.append(f"    resp = requests.get(f'{{base_url}}{path}', timeout=10)")
                 lines.append(f"    assert 200 <= resp.status_code < 300, f'GET {path} 返回 {{resp.status_code}}: {{resp.text[:200]}}'")
             elif method == "POST":
                 # 优先从实际代码解析 body 类型，fallback 到 spec
@@ -678,19 +838,50 @@ class IntegrationTester:
         global_broadcaster.emit_sync("IntegrationTester", "frontend_smoke",
             "🌐 前端冒烟测试: 启动 headless 浏览器")
 
-        # 启动临时 HTTP 服务器 serve 前端文件
-        fe_port = self._find_free_port()
-        http_proc = _sp.Popen(
-            ["python", "-m", "http.server", str(fe_port)],
-            cwd=frontend_dir,
-            stdout=_sp.DEVNULL, stderr=_sp.DEVNULL
-        )
+        # Vite 项目（有 dist/）：需要启动后端进程（Phase 2.5 测试完会杀掉后端）
+        # CDN 项目（无 dist/）：启动独立 HTTP 服务器
+        is_vite_dist = frontend_dir and frontend_dir.endswith("dist")
+        http_proc = None
 
-        # 等待静态服务器就绪
-        time.sleep(1)
-        if http_proc.poll() is not None:
-            logger.warning("⚠️ [Phase 2.6] 静态文件服务器启动失败，跳过")
-            return True, "⚠️ 前端静态服务器启动失败"
+        if is_vite_dist:
+            # Vite 项目：启动后端进程，它会挂载 dist/ 并提供 /api 路由
+            fe_port = port
+            logger.info(f"📦 [Phase 2.6] Vite 项目，启动后端进程并用端口 {fe_port} 访问")
+
+            # 在 sandbox 目录下启动后端
+            entry_file = None
+            for name in ["main.py", "app.py", "server.py", "run.py"]:
+                if os.path.isfile(os.path.join(sandbox_dir, name)):
+                    entry_file = name
+                    break
+            if entry_file:
+                http_proc = _sp.Popen(
+                    ["python", entry_file],
+                    cwd=sandbox_dir,
+                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL
+                )
+                # 等待后端启动
+                time.sleep(3)
+                if http_proc.poll() is not None:
+                    logger.warning("⚠️ [Phase 2.6] 后端进程启动失败，跳过")
+                    return True, "⚠️ Vite 后端进程启动失败"
+            else:
+                logger.warning("⚠️ [Phase 2.6] 找不到后端入口文件，跳过")
+                return True, "⚠️ 找不到后端入口文件"
+        else:
+            # CDN 项目：启动临时 HTTP 服务器 serve 前端文件
+            fe_port = self._find_free_port()
+            http_proc = _sp.Popen(
+                ["python", "-m", "http.server", str(fe_port)],
+                cwd=frontend_dir,
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL
+            )
+
+            # 等待静态服务器就绪
+            time.sleep(1)
+            if http_proc.poll() is not None:
+                logger.warning("⚠️ [Phase 2.6] 静态文件服务器启动失败，跳过")
+                return True, "⚠️ 前端静态服务器启动失败"
 
         js_console_errors = []
         missing_dom_ids = []
@@ -757,12 +948,13 @@ class IntegrationTester:
             logger.warning(f"⚠️ [Phase 2.6] Playwright 异常: {e}，跳过")
             return True, f"⚠️ Playwright 执行异常: {e}"
         finally:
-            # 清理临时 HTTP 服务器
-            try:
-                http_proc.kill()
-                http_proc.wait(timeout=3)
-            except Exception:
-                pass
+            # 清理临时 HTTP 服务器（Vite 项目不启动独立服务器，http_proc 为 None）
+            if http_proc is not None:
+                try:
+                    http_proc.kill()
+                    http_proc.wait(timeout=3)
+                except Exception:
+                    pass
 
         # 汇总结果
         errors = []
