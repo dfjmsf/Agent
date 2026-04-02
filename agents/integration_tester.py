@@ -421,8 +421,48 @@ class IntegrationTester:
         for fname, code in all_code.items():
             if not fname.endswith('.py') or not code:
                 continue
-            # 在代码中查找匹配 path 的 POST 路由
+            
+            # ---- Flask 路由检测 ----
+            # 匹配 @xxx.route('/path', methods=['POST']) 或 @bp.post('/path')
             escaped_path = re.escape(path)
+            flask_route = re.search(
+                r'@\w+\.(?:route|post)\s*\(\s*["\']' + escaped_path + r'["\']',
+                code
+            )
+            if flask_route and 'get_json' in code:
+                # 从 data.get('key') 或 data['key'] 提取字段名
+                # 匹配 data.get('amount'), data.get("category_id") 等
+                field_matches = re.findall(
+                    r'data(?:\.get)?\s*\[\s*["\'](\w+)["\']\s*\]|data\.get\s*\(\s*["\'](\w+)["\']',
+                    code
+                )
+                type_hints_from_code = {}
+                for m in field_matches:
+                    field_name = m[0] or m[1]
+                    if field_name not in type_hints_from_code:
+                        type_hints_from_code[field_name] = 'str'  # 默认
+                
+                # 尝试从 float(data.get('x')) / int(data.get('x')) 推断类型
+                float_fields = re.findall(r'float\s*\(\s*data\.get\s*\(\s*["\'](\w+)["\']', code)
+                int_fields = re.findall(r'int\s*\(\s*data\.get\s*\(\s*["\'](\w+)["\']', code)
+                
+                type_samples = {
+                    'str': 'test_value', 'int': 1, 'float': 99.99, 'bool': True,
+                }
+                for fn in type_hints_from_code:
+                    if fn in float_fields:
+                        type_hints_from_code[fn] = 'float'
+                    elif fn in int_fields:
+                        type_hints_from_code[fn] = 'int'
+                
+                for fn, ft in type_hints_from_code.items():
+                    body[fn] = type_samples.get(ft, 'test_value')
+                
+                if body:
+                    logger.info(f"📋 [Phase 2.5] Flask 路由解析 POST {path} body: {body}")
+                    return body
+            
+            # ---- FastAPI 路由检测 (原有逻辑) ----
             route_match = re.search(
                 r'@\w+\.post\(["\']' + escaped_path + r'["\'].*?\)\s*\n\s*async\s+def\s+\w+\(([^)]+)\)',
                 code, re.DOTALL
@@ -501,13 +541,36 @@ class IntegrationTester:
 
     @staticmethod
     def _build_fallback_body(request_params: dict) -> dict:
-        """当无法从代码解析时，使用 api_contracts 推断（全部降级为字符串安全模式）"""
+        """当无法从代码解析时，使用 api_contracts 推断（根据字段名智能推断类型）"""
         if not isinstance(request_params, dict):
             return {}
+        
+        # 字段名 → 类型推断规则
+        _FLOAT_HINTS = {'amount', 'price', 'total', 'balance', 'cost', 'salary',
+                        'rate', 'score', 'weight', 'height', 'lat', 'lng',
+                        'longitude', 'latitude', 'discount', 'tax', 'fee'}
+        _INT_HINTS = {'id', 'count', 'quantity', 'qty', 'num', 'number',
+                      'age', 'year', 'month', 'day', 'page', 'limit',
+                      'offset', 'size', 'category_id', 'user_id', 'order_id',
+                      'parent_id', 'group_id', 'type_id', 'status_id'}
+        _BOOL_HINTS = {'active', 'enabled', 'is_active', 'is_admin', 'is_public',
+                       'completed', 'done', 'published', 'verified', 'deleted'}
+        
         body = {}
         for k, v in request_params.items():
-            # 全部降级为字符串，避免类型不匹配
-            body[k] = 'test_string'
+            k_lower = k.lower()
+            if k_lower in _FLOAT_HINTS or k_lower.endswith('_amount') or k_lower.endswith('_price'):
+                body[k] = 99.99
+            elif k_lower in _INT_HINTS or k_lower.endswith('_id') or k_lower.endswith('_count'):
+                body[k] = 1
+            elif k_lower in _BOOL_HINTS or k_lower.startswith('is_') or k_lower.startswith('has_'):
+                body[k] = True
+            elif k_lower in ('date', 'created_at', 'updated_at', 'start_date', 'end_date'):
+                body[k] = '2025-01-15'
+            elif k_lower in ('email',):
+                body[k] = 'test@example.com'
+            else:
+                body[k] = 'test_value'
         return body
 
     @staticmethod
@@ -922,6 +985,10 @@ class IntegrationTester:
                     "status: 404",             # API 404
                     "status: 500",             # API 500（后端没启动）
                     "ERR_CONNECTION_REFUSED",  # 后端没启动
+                    "is not valid JSON",       # API 返回 HTML 而非 JSON（404/500 页面）
+                    "Unexpected token '<'",    # JSON.parse 收到 HTML（<!DOCTYPE）
+                    "JSON.parse",              # JSON 解析失败（API 返回非 JSON）
+                    "SyntaxError: Unexpected token", # JSON 解析语法错误
                 ]
                 benign_errors = [e for e in js_console_errors
                                  if any(p in e for p in _benign_patterns)]

@@ -49,6 +49,29 @@ class ReviewerAgent:
         is_python = target_file.endswith('.py')
         is_js = target_file.endswith('.js')
 
+        # --- L0.0 骨架残留检测（Fill 阶段失败兜底）---
+        if is_python:
+            # 检测函数体是否仍然是 ... 占位（骨架未被填充）
+            try:
+                tree_pre = ast.parse(code_content)
+                stub_funcs = []
+                for node in ast.walk(tree_pre):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        # 函数体只有一个 Expr(Constant(Ellipsis)) 或 Expr(Constant('...'))
+                        if len(node.body) == 1:
+                            stmt = node.body[0]
+                            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
+                                if stmt.value.value is ...:
+                                    stub_funcs.append(node.name)
+                if stub_funcs:
+                    error = (f"[L0.0 骨架残留] {target_file}: 以下函数仍是 `...` 占位未实现: "
+                             f"{', '.join(stub_funcs)}。请将所有 `...` 替换为完整的业务实现代码。")
+                    logger.warning(f"❌ {error}")
+                    global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+                    return False, error
+            except SyntaxError:
+                pass  # 语法错误由 L0.1 捕获
+
         # --- L0.1 语法检查（仅 Python）---
         tree = None
         if is_python:

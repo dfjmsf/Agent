@@ -411,6 +411,7 @@ class PythonSandbox:
 
             # ── 模板 & 前端集成 ──
             "jinja2": ["jinja2"],
+            "jinja": ["jinja2"],  # Manager 可能写 Jinja 而不是 Jinja2
             "mako": ["mako"],
             "markdown": ["markdown"],
             "marked": [],  # JS 库，不走 pip

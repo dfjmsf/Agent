@@ -37,18 +37,29 @@ class PlaybookLoader:
         "fastapi": "fastapi.md",
         "fast api": "fastapi.md",
         "fast-api": "fastapi.md",
-        # 未来扩展：
-        # "flask": "flask.md",
-        # "django": "django.md",
+        "flask": "flask.md",
+        "django": "django.md",
+        "django rest framework": "django.md",
+        "drf": "django.md",
+        "express": "express.md",
+        "express.js": "express.md",
+        "expressjs": "express.md",
+        "node": "express.md",
+        "node.js": "express.md",
+        "nodejs": "express.md",
     }
 
     FRONTEND_MAP = {
+        # Next.js（优先级最高，因为包含 react 关键词）
+        "next": "nextjs.md",
+        "next.js": "nextjs.md",
+        "nextjs": "nextjs.md",
         # Vite 构建模式（优先级高于 CDN 模式）
         "vite": "vue3_vite.md",
         "vue3 vite": "vue3_vite.md",
         "vue 3 vite": "vue3_vite.md",
         "vue vite": "vue3_vite.md",
-        "composition api": "vue3_vite.md",  # Composition API → Vite 模式
+        "composition api": "vue3_vite.md",
         "composition": "vue3_vite.md",
         "react": "react_vite.md",
         "react vite": "react_vite.md",
@@ -96,10 +107,13 @@ class PlaybookLoader:
     DEFAULT_MANAGER_FRONTEND = "vanilla_frontend.md"
 
     # 入口文件名集合（触发跨栈补丁）
-    ENTRY_FILENAMES = {"main.py", "app.py", "server.py", "run.py"}
+    ENTRY_FILENAMES = {"main.py", "app.py", "server.py", "run.py",
+                       "index.js", "server.js", "app.js"}
 
     # 文件后缀分类
     BACKEND_EXTS = {".py"}
+    # Express.js 后端的 .js 会先匹配 FRONTEND_MAP，但如果 tech_stack 有 express/node，
+    # _match_tech 会优先走 BACKEND_MAP（在 load_for_coder 中筛选）
     FRONTEND_EXTS = {".html", ".htm", ".css", ".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte", ".json"}
 
     # Addon 补丁映射（仅当 tech_stack 包含关键词时激活，不会默认注入）
@@ -111,6 +125,9 @@ class PlaybookLoader:
         "tailwind css": ("tailwind_cdn.md", "Tailwind CSS CDN", FRONTEND_EXTS),
         "composition api": ("composition_api.md", "Vue3 Composition API", FRONTEND_EXTS),
         "composition": ("composition_api.md", "Vue3 Composition API", FRONTEND_EXTS),
+        "sqlalchemy": ("sqlalchemy_orm.md", "SQLAlchemy ORM", {".py"}),
+        "sql alchemy": ("sqlalchemy_orm.md", "SQLAlchemy ORM", {".py"}),
+        "orm": ("sqlalchemy_orm.md", "SQLAlchemy ORM", {".py"}),
     }
 
     # ============================
@@ -131,10 +148,21 @@ class PlaybookLoader:
         ext = os.path.splitext(target_file)[1].lower()
         parts = []
 
-        # 第一层：按文件后缀路由
+        # 检测是否是 Node.js 后端项目（.js 文件应走后端路由）
+        _all_tech = " ".join(t.lower() for t in tech_stack)
+        is_node_backend = any(kw in _all_tech for kw in
+                              ("express", "node", "koa", "nestjs", "nest"))
+
+        # 第一层：按文件后缀路由（Node.js 后端的 .js 走 BACKEND_MAP）
         if ext in self.BACKEND_EXTS:
             pb = self._match_and_load(tech_stack, self.BACKEND_MAP,
                                       "coder", self.DEFAULT_BACKEND)
+            if pb:
+                parts.append(pb)
+        elif ext in {".js", ".ts"} and is_node_backend:
+            # Node.js 后端 .js/.ts 文件
+            pb = self._match_and_load(tech_stack, self.BACKEND_MAP,
+                                      "coder", "express.md")
             if pb:
                 parts.append(pb)
         elif ext in self.FRONTEND_EXTS:
@@ -179,6 +207,12 @@ class PlaybookLoader:
 
         content = "\n\n".join(parts)
         if content:
+            # Phase 1.2: P1 技术规范声明
+            content = (
+                "⚠️ 以下是当前技术栈的编码规范（P1 级别），你必须严格遵守！\n"
+                "仅当与项目规划书（Spec）直接矛盾时以 Spec 为准。\n\n"
+                + content
+            )
             logger.info(f"📖 Coder Playbook 加载完成 ({len(content)} chars) for {target_file}")
         else:
             logger.warning(f"⚠️ 未找到匹配的 Coder Playbook for {target_file}")
@@ -213,6 +247,10 @@ class PlaybookLoader:
 
         content = "\n\n".join(parts)
         if content:
+            content = (
+                "ℹ️ 以下是任务拆分规范（P1.5 级别），必须遵守。\n\n"
+                + content
+            )
             logger.info(f"📖 Manager Playbook 加载完成 ({len(content)} chars)")
         return content
 

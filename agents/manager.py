@@ -65,6 +65,7 @@ class ManagerAgent:
         
         try:
             raw_response = self.llm_client.chat_completion(
+                enable_thinking=False,
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -172,6 +173,7 @@ class ManagerAgent:
         try:
             # Planner 不使用任何工具，只输出纯文本 JSON
             raw_response = self.llm_client.chat_completion(
+                enable_thinking=False,
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -242,6 +244,7 @@ class ManagerAgent:
 
         try:
             raw_response = self.llm_client.chat_completion(
+                enable_thinking=False,
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -301,6 +304,7 @@ class ManagerAgent:
 
         try:
             raw_response = self.llm_client.chat_completion(
+                enable_thinking=False,
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -380,6 +384,7 @@ class ManagerAgent:
         # 4. 调用 LLM
         try:
             raw_response = self.llm_client.chat_completion(
+                enable_thinking=False,
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},

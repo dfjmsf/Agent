@@ -35,6 +35,7 @@
    - HTML 中如果有 `<form>`，form 内的 `<button>` 必须设置 `type="button"`（不是 `type="submit"`），否则点击会触发表单默认提交导致页面刷新！
    - 或者在 JS 中监听 form 的 submit 事件并调用 `event.preventDefault()`。
    - 所有数据提交必须通过 JS 的 `fetch`/`XMLHttpRequest` 异步完成，禁止依赖表单的原生 submit 行为。
+   - **例外：如果后端使用 Jinja 模板渲染（render_template），则表单应使用原生 `<form action="/xxx" method="post">` + `type="submit"`，由后端处理重定向。此时不需要 fetch。**
 
 5. **JS 初始化铁律**
    - 每个 .js 文件必须在末尾包含 `DOMContentLoaded` 初始化代码：
@@ -47,3 +48,27 @@
 6. **事件绑定方式**
    - 使用 `document.getElementById('xxx').addEventListener('click', ...)` 绑定交互事件。
    - 或者在 HTML 中使用 `onclick="myApp.handleClick()"` 内联绑定（需确保实例挂到 window 上）。
+
+## Jinja 模板规则（如果 HTML 包含 `{% %}` / `{{ }}` 语法）
+
+7. **Jinja 数据字段一致性铁律**
+   - `{{ expense.xxx }}` 中的 xxx 必须是**后端传入数据中实际存在的字段**。
+   - **查看依赖文件中 models.py 的 SQL 查询返回了哪些字段**来确定可用字段名。
+   - 数据是 dict（来自 `sqlite3.Row`），不是对象！禁止用 `expense.category.name` 这种嵌套访问！
+   - 如果 SQL 用了 `AS category_name`，模板中用 `{{ expense.category_name }}`，不是 `{{ expense.category.name }}`。
+
+8. **Jinja 表单字段名一致性**
+   - `<input name="xxx">` 的 name 必须与依赖文件中 routes.py 的 `request.form['xxx']` 完全一致！
+   - 写 HTML 前**先查看 routes.py 中的 request.form key**，严格对齐。
+
+9. **Jinja 禁止在序列化数据上调用方法**
+   - 如果后端用了 `to_dict()` 转换数据，所有字段都是 str/int/float/dict，**不是 Python 对象**！
+   - `{{ expense.timestamp.strftime('%Y-%m-%d') }}` → ❌ 崩溃（str 没有 strftime）
+   - `{{ expense.timestamp }}` → ✅ 直接显示字符串
+   - **规则：Jinja 模板中只做 `{{ xxx }}` 显示和 `{% for %}` 循环，禁止调用 `.strftime()` / `.lower()` 等 Python 方法**
+
+10. **禁止引用不存在的模板文件**
+    - `{% extends "base.html" %}` 和 `{% include "header.html" %}` 会引用其他模板文件。
+    - **如果 base.html / header.html 不在当前项目的文件列表中 → 绝对禁止使用 extends/include！**
+    - 所有 HTML 内容必须写在单个 index.html 中（包含完整的 `<!DOCTYPE html>` 结构）。
+    - `{% extends "base.html" %}` + base.html 不存在 = `TemplateNotFound` 崩溃！

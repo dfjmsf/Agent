@@ -719,6 +719,17 @@ class AstreaEngine:
                 logger.info("🏆 所有任务均已完成！")
                 return True
 
+            # 熔断即停：任何任务熔断 → 整体终止，不再浪费 Token
+            if self.blackboard.has_fused_tasks():
+                fused_tasks = [t.target_file for t in self.blackboard.state.tasks
+                               if t.status == TaskStatus.FUSED]
+                remaining = [t.target_file for t in self.blackboard.state.tasks
+                             if t.status not in (TaskStatus.DONE, TaskStatus.FUSED)]
+                logger.error(f"🛑 熔断即停：{fused_tasks} 已熔断，跳过剩余 {len(remaining)} 个任务 {remaining}")
+                global_broadcaster.emit_sync("Engine", "project_fused",
+                    f"项目因 {', '.join(fused_tasks)} 熔断而终止", {})
+                return False
+
             # 依赖图调度：找下一个可运行的任务
             task = self.blackboard.get_next_runnable_task()
             if task is None:

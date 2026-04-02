@@ -58,7 +58,7 @@ class LLMClient:
         if qwen_key and qwen_key != "your_qwen_api_key_here":
             qwen_url = os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
             # Qwen 支持的模型列表（可通过 QWEN_MODELS 环境变量扩展）
-            qwen_models_str = os.getenv("QWEN_MODELS", "qwen-max,qwen-plus,qwen-turbo,qwen3-max,qwen3-plus,qwen3-coder-plus,qwen-long")
+            qwen_models_str = os.getenv("QWEN_MODELS", "qwen-max,qwen-plus,qwen-turbo,qwen3-max,qwen3-plus,qwen3-coder-plus,qwen-long,qwen3.5-plus,qwen3.5-max,qwen3.5-coder-plus")
             qwen_models = [m.strip() for m in qwen_models_str.split(",") if m.strip()]
             self.providers.append(LLMProvider("Qwen", qwen_key, qwen_url, qwen_models))
             logger.info(f"✅ Provider [Qwen] 已加载 ({len(qwen_models)} 个模型)")
@@ -73,7 +73,16 @@ class LLMClient:
                 self.providers.append(LLMProvider("OpenAI-Compatible", openai_key, openai_url, openai_models))
                 logger.info(f"✅ Provider [OpenAI-Compatible] 已加载 ({len(openai_models)} 个模型)")
         
-        # Provider 3: GPT 中转端点
+        # Provider 3: DeepSeek
+        ds_key = os.getenv("DEEPSEEK_API_KEY", "")
+        if ds_key:
+            ds_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+            ds_models_str = os.getenv("DEEPSEEK_MODELS", "deepseek-chat")
+            ds_models = [m.strip() for m in ds_models_str.split(",") if m.strip()]
+            self.providers.append(LLMProvider("DeepSeek", ds_key, ds_url, ds_models))
+            logger.info(f"✅ Provider [DeepSeek] 已加载 ({len(ds_models)} 个模型)")
+
+        # Provider 4: GPT 中转端点
         gpt_key = os.getenv("GPT_API_KEY", "")
         if gpt_key:
             gpt_url = os.getenv("GPT_BASE_URL", "https://api.openai.com/v1")
@@ -133,7 +142,8 @@ class LLMClient:
         messages: List[Dict[str, str]], 
         model: str, 
         tools: Optional[List[Dict[str, Any]]] = None,
-        temperature: float = 0.2
+        temperature: float = 0.2,
+        enable_thinking: bool = False,
     ) -> Any:
         """
         向大语言模型发送聊天补全请求（同步）。
@@ -144,6 +154,7 @@ class LLMClient:
             model: 目标模型名称 (如 qwen3-max, Gemini3.1pro, glm-5)
             tools: 可选的工具定义列表，用于 Function Calling
             temperature: 生成温度系数
+            enable_thinking: 是否启用深度思考（仅 qwen3 系列有效）
             
         返回:
             原始响应的 message 对象 (其中可能包含 tool_calls)
@@ -159,8 +170,13 @@ class LLMClient:
         if tools:
             kwargs["tools"] = tools
 
+        # qwen3/3.5 系列：通过 enable_thinking 控制深度思考
+        if "qwen3" in model:
+            kwargs["extra_body"] = {"enable_thinking": enable_thinking}
+
         try:
-            logger.info(f"正在向 [{provider.name}] 模型 {model} 发送请求...")
+            thinking_hint = " [思考模式]" if enable_thinking and "qwen3" in model else ""
+            logger.info(f"正在向 [{provider.name}] 模型 {model}{thinking_hint} 发送请求...")
             response = provider.client.chat.completions.create(**kwargs)
             
             # 更新 Token 账户

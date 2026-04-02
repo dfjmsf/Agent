@@ -625,45 +625,61 @@ def _rerank(query: str, documents: List[str], top_n: int = 5) -> List[dict]:
         return [{"content": doc, "score": 0.0} for doc in documents[:top_n]]
     
     t0 = time.time()
-    try:
-        resp = httpx.post(
-            "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": os.getenv("MODEL_RERANKER", "gte-rerank-v2"),
-                "input": {
-                    "query": query,
-                    "documents": documents,
+    max_retries = 2
+    last_err = None
+    
+    for attempt in range(max_retries + 1):
+        try:
+            resp = httpx.post(
+                "https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
                 },
-                "parameters": {
-                    "top_n": top_n,
-                    "return_documents": True,
+                json={
+                    "model": os.getenv("MODEL_RERANKER", "gte-rerank-v2"),
+                    "input": {
+                        "query": query,
+                        "documents": documents,
+                    },
+                    "parameters": {
+                        "top_n": top_n,
+                        "return_documents": True,
+                    },
                 },
-            },
-            timeout=10.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        
-        results = data.get("output", {}).get("results", [])
-        elapsed = (time.time() - t0) * 1000
-        
-        ranked = []
-        for item in results:
-            ranked.append({
-                "content": item.get("document", {}).get("text", documents[item.get("index", 0)]),
-                "score": item.get("relevance_score", 0.0),
-            })
-        
-        scores = ', '.join([f"{r['score']:.3f}" for r in ranked])
-        logger.info(f"🎯 Rerank 精排完成 ({elapsed:.0f}ms): {len(documents)} → {len(ranked)} 条, scores=[{scores}]")
-        return ranked
-    except Exception as e:
-        logger.warning(f"⚠️ Rerank 调用失败 ({e})，fallback 到粗排直出")
-        return [{"content": doc, "score": 0.0} for doc in documents[:top_n]]
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            
+            results = data.get("output", {}).get("results", [])
+            elapsed = (time.time() - t0) * 1000
+            
+            ranked = []
+            for item in results:
+                ranked.append({
+                    "content": item.get("document", {}).get("text", documents[item.get("index", 0)]),
+                    "score": item.get("relevance_score", 0.0),
+                })
+            
+            scores = ', '.join([f"{r['score']:.3f}" for r in ranked])
+            retry_hint = f" (retry {attempt})" if attempt > 0 else ""
+            logger.info(f"🎯 Rerank 精排完成{retry_hint} ({elapsed:.0f}ms): {len(documents)} → {len(ranked)} 条, scores=[{scores}]")
+            return ranked
+        except (httpx.ConnectError, httpx.ReadError, ConnectionError, OSError) as e:
+            # SSL/连接错误：可重试
+            last_err = e
+            if attempt < max_retries:
+                logger.warning(f"⚠️ Rerank 连接异常 (第{attempt+1}次)，0.5s 后重试: {e}")
+                time.sleep(0.5)
+                continue
+        except Exception as e:
+            # 其他错误（HTTP 4xx 等）：不重试
+            last_err = e
+            break
+    
+    logger.warning(f"⚠️ Rerank 调用失败 ({last_err})，fallback 到粗排直出")
+    return [{"content": doc, "score": 0.0} for doc in documents[:top_n]]
 
 
 def _bm25_search(query: str, project_id: str, top_n: int = 15, domain: str = None) -> List[Dict]:
