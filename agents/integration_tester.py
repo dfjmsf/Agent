@@ -429,38 +429,85 @@ class IntegrationTester:
                 r'@\w+\.(?:route|post)\s*\(\s*["\']' + escaped_path + r'["\']',
                 code
             )
-            if flask_route and 'get_json' in code:
-                # 从 data.get('key') 或 data['key'] 提取字段名
-                # 匹配 data.get('amount'), data.get("category_id") 等
-                field_matches = re.findall(
-                    r'data(?:\.get)?\s*\[\s*["\'](\w+)["\']\s*\]|data\.get\s*\(\s*["\'](\w+)["\']',
+            # ---- Flask request.form 检测（不依赖装饰器，兼容 add_url_rule）----
+            if 'request.form' in code and not body:
+                _form_fields = re.findall(
+                    r"request\.form(?:\.get)?\s*[\[(]['\"](\w+)['\"]",
                     code
                 )
-                type_hints_from_code = {}
-                for m in field_matches:
-                    field_name = m[0] or m[1]
-                    if field_name not in type_hints_from_code:
-                        type_hints_from_code[field_name] = 'str'  # 默认
-                
-                # 尝试从 float(data.get('x')) / int(data.get('x')) 推断类型
-                float_fields = re.findall(r'float\s*\(\s*data\.get\s*\(\s*["\'](\w+)["\']', code)
-                int_fields = re.findall(r'int\s*\(\s*data\.get\s*\(\s*["\'](\w+)["\']', code)
-                
-                type_samples = {
-                    'str': 'test_value', 'int': 1, 'float': 99.99, 'bool': True,
+                _type_map = {
+                    'amount': 99.99, 'price': 99.99, 'total': 99.99, 'cost': 99.99,
+                    'date': '2025-01-15',
                 }
-                for fn in type_hints_from_code:
-                    if fn in float_fields:
-                        type_hints_from_code[fn] = 'float'
-                    elif fn in int_fields:
-                        type_hints_from_code[fn] = 'int'
-                
-                for fn, ft in type_hints_from_code.items():
-                    body[fn] = type_samples.get(ft, 'test_value')
-                
+                for _fn in _form_fields:
+                    if _fn not in body:
+                        _fn_lower = _fn.lower()
+                        if _fn_lower in _type_map:
+                            body[_fn] = _type_map[_fn_lower]
+                        elif _fn_lower.endswith('_id'):
+                            body[_fn] = 1
+                        else:
+                            body[_fn] = 'test_value'
                 if body:
-                    logger.info(f"📋 [Phase 2.5] Flask 路由解析 POST {path} body: {body}")
+                    body['__form__'] = True
                     return body
+
+            if flask_route:
+                # 先检查 request.form（Flask SSR 表单）
+                if 'request.form' in code:
+                    form_fields = re.findall(
+                        r"request\.form(?:\.get)?\s*[\[(]\s*['\"](\w+)['\"\s*[\])]]",
+                        code
+                    )
+                    for fn in form_fields:
+                        if fn not in body:
+                            fn_lower = fn.lower()
+                            if fn_lower in ('amount', 'price', 'total', 'cost'):
+                                body[fn] = 99.99
+                            elif fn_lower.endswith('_id') or fn_lower in ('id', 'count', 'quantity'):
+                                body[fn] = 1
+                            elif fn_lower == 'date':
+                                body[fn] = '2025-01-15'
+                            else:
+                                body[fn] = 'test_value'
+                    if body:
+                        body['__form__'] = True
+                        logger.info(f"\U0001f4cb [Phase 2.5] Flask request.form 解析 POST {path} body: {body}")
+                        return body
+
+                # 再检查 get_json（REST API JSON）
+                if 'get_json' in code:
+                    # 从 data.get('key') 或 data['key'] 提取字段名
+                    # 匹配 data.get('amount'), data.get("category_id") 等
+                    field_matches = re.findall(
+                        r'data(?:\.get)?\s*\[\s*["\'](\w+)["\']\s*\]|data\.get\s*\(\s*["\'](\w+)["\']',
+                        code
+                    )
+                    type_hints_from_code = {}
+                    for m in field_matches:
+                        field_name = m[0] or m[1]
+                        if field_name not in type_hints_from_code:
+                            type_hints_from_code[field_name] = 'str'  # 默认
+                
+                    # 尝试从 float(data.get('x')) / int(data.get('x')) 推断类型
+                    float_fields = re.findall(r'float\s*\(\s*data\.get\s*\(\s*["\'](\w+)["\']', code)
+                    int_fields = re.findall(r'int\s*\(\s*data\.get\s*\(\s*["\'](\w+)["\']', code)
+                
+                    type_samples = {
+                        'str': 'test_value', 'int': 1, 'float': 99.99, 'bool': True,
+                    }
+                    for fn in type_hints_from_code:
+                        if fn in float_fields:
+                            type_hints_from_code[fn] = 'float'
+                        elif fn in int_fields:
+                            type_hints_from_code[fn] = 'int'
+                
+                    for fn, ft in type_hints_from_code.items():
+                        body[fn] = type_samples.get(ft, 'test_value')
+                
+                    if body:
+                        logger.info(f"📋 [Phase 2.5] Flask 路由解析 POST {path} body: {body}")
+                        return body
             
             # ---- FastAPI 路由检测 (原有逻辑) ----
             route_match = re.search(
@@ -769,10 +816,14 @@ class IntegrationTester:
                 body = IntegrationTester._parse_post_body_from_code(all_code, path)
                 if not body:
                     body = IntegrationTester._build_fallback_body(api.get("request_params", {}))
+                is_form = body.pop('__form__', False)
                 body_json = json.dumps(body)
                 lines.append(f"    payload = {body_json}")
-                lines.append(f"    resp = requests.post(f'{{base_url}}{path}', json=payload, timeout=10)")
-                lines.append(f"    assert 200 <= resp.status_code < 300, f'POST {path} 返回 {{resp.status_code}}: {{resp.text[:200]}}'")
+                if is_form:
+                    lines.append(f"    resp = requests.post(f'{{base_url}}{path}', data=payload, timeout=10, allow_redirects=True)")
+                else:
+                    lines.append(f"    resp = requests.post(f'{{base_url}}{path}', json=payload, timeout=10)")
+                lines.append(f"    assert 200 <= resp.status_code < 400, f'POST {path} 返回 {{resp.status_code}}: {{resp.text[:200]}}'")
             elif method in ("PUT", "DELETE"):
                 lines.append(f"    resp = requests.request('{method}', f'{{base_url}}{path}', timeout=10)")
                 lines.append(f"    assert 200 <= resp.status_code < 300, f'{method} {path} 返回 {{resp.status_code}}: {{resp.text[:200]}}'")

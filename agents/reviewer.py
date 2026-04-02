@@ -127,6 +127,20 @@ class ReviewerAgent:
             if not l05_pass:
                 return False, l05_error
 
+        # --- L0.6 跨文件字段一致性检查（Flask SSR 项目 + 表单字段）---
+        if sandbox_dir:
+            l06_pass, l06_error = self._l0_cross_file_check(
+                target_file, code_content, sandbox_dir)
+            if not l06_pass:
+                return False, l06_error
+
+        # --- L0.7 Flask template_folder 检查 ---
+        if sandbox_dir and target_file.endswith('.py'):
+            l07_pass, l07_error = self._l0_template_folder_check(
+                target_file, code_content, sandbox_dir)
+            if not l07_pass:
+                return False, l07_error
+
         return True, ""
 
     def _l0_js_syntax_check(self, target_file: str, sandbox_dir: str) -> Tuple[bool, str]:
@@ -313,6 +327,395 @@ class ReviewerAgent:
                      f"`@{router_var_name}.get/post/put/delete` 装饰器。"
                      f"所有函数都未注册为 HTTP 端点，将导致 405 Method Not Allowed。"
                      f"修复方法：在每个处理 HTTP 请求的函数上添加 @{router_var_name}.post('/api/xxx') 等装饰器。")
+            logger.warning(f"❌ {error}")
+            global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+            return False, error
+
+        return True, ""
+
+    # ============================================================
+    # L0.6: 跨文件字段一致性检查（确定性，0 LLM 消耗）
+    # ============================================================
+
+    def _l0_cross_file_check(self, target_file: str, code_content: str,
+                              sandbox_dir: str) -> Tuple[bool, str]:
+        """
+        L0.6: 跨文件字段一致性检查。
+        检查 1: HTML Jinja 模板变量 vs models.py to_dict() 返回字段
+        检查 2: routes.py request.form keys vs HTML name 属性
+        """
+        basename = os.path.basename(target_file).lower()
+
+        # HTML 文件 → 检查 Jinja 字段一致性 + 反向表单字段检查
+        if target_file.endswith('.html'):
+            # L0.6-A: Jinja 字段
+            jinja_pass, jinja_error = self._l0_jinja_field_check(
+                target_file, code_content, sandbox_dir)
+            if not jinja_pass:
+                return False, jinja_error
+
+            # L0.6-B 反向: 此时 routes.py 已存在，检查 form key 一致性
+            routes_path = self._find_file_in_sandbox(sandbox_dir, 'routes.py')
+            if not routes_path:
+                routes_path = self._find_file_in_sandbox(sandbox_dir, 'views.py')
+            if routes_path:
+                try:
+                    with open(routes_path, 'r', encoding='utf-8') as f:
+                        routes_content = f.read()
+                    form_pass, form_error = self._l0_form_field_check(
+                        os.path.basename(routes_path), routes_content, sandbox_dir)
+                    if not form_pass:
+                        return False, form_error
+                except Exception:
+                    pass
+
+            # L0.8: form action 路径 vs 路由注册路径一致性检查
+            action_pass, action_error = self._l0_form_action_check(
+                target_file, code_content, sandbox_dir)
+            if not action_pass:
+                return False, action_error
+
+            return True, ""
+
+        # routes.py / views.py → 检查 form field 一致性
+        if basename in ('routes.py', 'views.py'):
+            return self._l0_form_field_check(target_file, code_content, sandbox_dir)
+
+        return True, ""
+
+    def _l0_jinja_field_check(self, target_file: str, html_content: str,
+                               sandbox_dir: str) -> Tuple[bool, str]:
+        """
+        L0.6-A: 检查 Jinja 模板变量是否匹配 models.py to_dict() 返回字段。
+        拦截典型 bug: {{ expense.category.name }} 而 to_dict() 返回 category_name
+        """
+        # 1. 找 models.py
+        models_path = self._find_file_in_sandbox(sandbox_dir, 'models.py')
+        if not models_path:
+            return True, ""  # 没有 models.py，跳过
+
+        try:
+            with open(models_path, 'r', encoding='utf-8') as f:
+                models_content = f.read()
+        except Exception:
+            return True, ""
+
+        # 2. 检查是否是 Flask SSR（需要有 render_template）
+        routes_path = self._find_file_in_sandbox(sandbox_dir, 'routes.py')
+        if routes_path:
+            try:
+                with open(routes_path, 'r', encoding='utf-8') as f:
+                    routes_content = f.read()
+                if 'render_template' not in routes_content:
+                    return True, ""  # 不是 SSR，跳过
+            except Exception:
+                pass
+
+        # 3. 提取 to_dict() 返回的 key（按模型类分组）
+        class_keys = self._extract_to_dict_keys(models_content)
+        if not class_keys:
+            return True, ""  # 没有 to_dict / SQL 列，跳过
+
+        # 合并所有 key 作为 fallback（无法匹配具体类时使用）
+        all_keys = set()
+        for ks in class_keys.values():
+            all_keys |= ks
+
+        # 4. 提取 Jinja {{ }} 块中的字段访问
+        jinja_blocks = re.findall(r'\{\{(.*?)\}\}', html_content, re.DOTALL)
+
+        # 跳过的变量名（Jinja 内置 / 非数据变量）
+        skip_vars = {'loop', 'range', 'request', 'config', 'session',
+                     'g', 'url_for', 'get_flashed_messages', 'true', 'false',
+                     'none', 'self', 'caller', 'joiner'}
+
+        mismatches = []
+        for block in jinja_blocks:
+            # 先剥离字符串字面量（防止 'style.css' 等文件名误报）
+            cleaned_block = re.sub(r'["\'][^"\']*["\']', '', block)
+
+            # 提取所有 xxx.yyy 或 xxx.yyy.zzz 模式
+            for m in re.finditer(r'(\w+)\.(\w+(?:\.\w+)*)', cleaned_block):
+                var_name = m.group(1)
+                field_path = m.group(2)  # 可能是 "amount" 或 "category.name"
+
+                # 跳过 Jinja 内置变量和过滤器
+                if var_name.lower() in skip_vars:
+                    continue
+
+                # 按变量名匹配模型类（expense→Expense, category→Category）
+                matched_keys = None
+                for cls_name, ks in class_keys.items():
+                    if cls_name.lower() == var_name.lower():
+                        matched_keys = ks
+                        break
+                # fallback: 使用合并 key
+                if matched_keys is None:
+                    matched_keys = all_keys
+
+                if '.' in field_path:
+                    # 嵌套访问：expense.category.name
+                    first_level = field_path.split('.')[0]
+                    if first_level not in matched_keys:
+                        # 看看是否有展平后的字段名（category.name → category_name）
+                        flat_name = field_path.replace('.', '_')
+                        suggestion = f"'{flat_name}'" if flat_name in matched_keys else ""
+                        hint = f"。应使用 {suggestion}" if suggestion else ""
+                        mismatches.append(
+                            f"`{{{{ {var_name}.{field_path} }}}}` — "
+                            f"'{first_level}' 不是 to_dict() 的返回字段{hint}。"
+                            f"可用字段: {sorted(matched_keys)}"
+                        )
+                else:
+                    # 单层访问：expense.amount
+                    if field_path not in matched_keys:
+                        mismatches.append(
+                            f"`{{{{ {var_name}.{field_path} }}}}` — "
+                            f"'{field_path}' 不在 to_dict() 返回字段中。"
+                            f"可用字段: {sorted(matched_keys)}"
+                        )
+
+        if mismatches:
+            error = (
+                f"[L0.6 Jinja 字段不匹配] {target_file}: "
+                f"模板引用了 models.py to_dict() 中不存在的字段：\n"
+                + "\n".join(f"  - {m}" for m in mismatches[:5])
+                + "\n修复方法：将模板变量改为 to_dict() 实际返回的字段名。"
+            )
+            logger.warning(f"❌ {error}")
+            global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+            return False, error
+
+        logger.info(f"✅ [L0.6-A] Jinja 字段校验通过: {target_file}")
+        return True, ""
+
+    def _l0_form_field_check(self, target_file: str, routes_content: str,
+                              sandbox_dir: str) -> Tuple[bool, str]:
+        """
+        L0.6-B: 检查 routes.py 的 request.form keys 是否与 HTML name 属性一致。
+        拦截典型 bug: request.form['category_id'] 但 HTML 中 name="category"
+        """
+        # 1. 提取 request.form keys
+        form_keys = set()
+        # request.form['xxx'] / request.form["xxx"]
+        for m in re.finditer(r"request\.form\[(['\"])(\w+)\1\]", routes_content):
+            form_keys.add(m.group(2))
+        # request.form.get('xxx') / request.form.get("xxx")
+        for m in re.finditer(r"request\.form\.get\((['\"])(\w+)\1", routes_content):
+            form_keys.add(m.group(2))
+
+        if not form_keys:
+            return True, ""  # 没有 request.form，跳过（可能是 REST API）
+
+        # 2. 从沙盒中所有 HTML 文件提取 name 属性
+        html_names = set()
+        for root, dirs, files in os.walk(sandbox_dir):
+            dirs[:] = [d for d in dirs if d not in
+                       ('__pycache__', 'venv', '.venv', 'node_modules', '.sandbox')]
+            for f in files:
+                if f.endswith('.html'):
+                    try:
+                        with open(os.path.join(root, f), 'r', encoding='utf-8') as fh:
+                            content = fh.read()
+                        for m in re.finditer(r'<(?:input|select|textarea|button)\b[^>]*\bname\s*=\s*["\']([\w-]+)["\']', content, re.IGNORECASE):
+                            html_names.add(m.group(1))
+                    except Exception:
+                        pass
+
+        if not html_names:
+            return True, ""  # 没找到 HTML name，跳过
+
+        # 3. 检查 routes.py 的 form keys 是否在 HTML name 中
+        missing_in_html = form_keys - html_names
+        if missing_in_html:
+            error = (
+                f"[L0.6 表单字段不匹配] {target_file}: "
+                f"request.form 引用了 HTML 中不存在的字段名: {sorted(missing_in_html)}。"
+                f"HTML 中实际的 name 属性: {sorted(html_names)}。"
+                f"修复方法：确保 request.form['xxx'] 的 key 与 HTML <input name='xxx'> 完全一致。"
+            )
+            logger.warning(f"❌ {error}")
+            global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+            return False, error
+
+        logger.info(f"✅ [L0.6-B] 表单字段校验通过: {target_file}")
+        return True, ""
+
+    @staticmethod
+    def _extract_to_dict_keys(models_content: str) -> dict:
+        """
+        从 models.py 提取 to_dict() 返回的字典 key，按模型类分组。
+        返回: {"ClassName": {key1, key2, ...}, ...}
+        支持两种模式：
+        1. ORM to_dict() 方法中的 return {"key": ...}
+        2. 原生 SQL SELECT 列名（含 AS 别名）→ 归入 "_sql" 虚拟类
+        """
+        class_keys = {}  # {class_name: set()}
+
+        # 模式 1: 按 class 分组提取 to_dict() keys
+        # 先找所有 class 定义及其范围
+        class_blocks = re.finditer(
+            r'class\s+(\w+).*?(?=\nclass\s|\Z)',
+            models_content, re.DOTALL
+        )
+        for cls_match in class_blocks:
+            cls_name = cls_match.group(1)
+            cls_body = cls_match.group(0)
+
+            # 在这个 class 内找 to_dict
+            to_dict_match = re.search(
+                r'def\s+to_dict\s*\(self\).*?(?=\n    def\s|\nclass\s|\Z)',
+                cls_body, re.DOTALL
+            )
+            if to_dict_match:
+                keys = set()
+                for m in re.finditer(r'["\']([\w]+)["\']\s*:', to_dict_match.group(0)):
+                    keys.add(m.group(1))
+                if keys:
+                    class_keys[cls_name] = keys
+
+        # 模式 2: 原生 SQL SELECT 列名（仅当 to_dict 没提取到时）
+        if not class_keys:
+            sql_keys = set()
+            select_blocks = re.findall(
+                r'SELECT\s+(.*?)\s+FROM',
+                models_content, re.DOTALL | re.IGNORECASE
+            )
+            for block in select_blocks:
+                columns = block.split(',')
+                for col in columns:
+                    col = col.strip()
+                    # AS 别名优先
+                    as_match = re.search(r'(?:as|AS)\s+(\w+)', col)
+                    if as_match:
+                        sql_keys.add(as_match.group(1))
+                    else:
+                        # 取最后一个标识符（如 e.amount → amount）
+                        parts = re.findall(r'(\w+)', col)
+                        if parts:
+                            sql_keys.add(parts[-1])
+            if sql_keys:
+                class_keys['_sql'] = sql_keys
+
+        return class_keys
+
+    @staticmethod
+    def _find_file_in_sandbox(sandbox_dir: str, filename: str):
+        """在沙盒目录中递归查找指定文件名，返回完整路径或 None"""
+        for root, dirs, files in os.walk(sandbox_dir):
+            dirs[:] = [d for d in dirs if d not in
+                       ('__pycache__', 'venv', '.venv', 'node_modules', '.sandbox')]
+            if filename in files:
+                return os.path.join(root, filename)
+        return None
+
+    def _l0_form_action_check(self, target_file: str, html_content: str,
+                               sandbox_dir: str) -> Tuple[bool, str]:
+        """
+        L0.8: 检查 HTML <form action="/xxx"> 的路径是否与 routes.py 注册的路径一致。
+        拦截典型 bug: action="/add_expense" 但路由注册的是 "/add"
+        """
+        import re as _re
+
+        # 1. 提取 HTML 中所有 form action 路径（排除 url_for 和 #）
+        form_actions = _re.findall(
+            r'<form[^>]+action\s*=\s*["\']([^"\'#]+)["\']',
+            html_content, _re.IGNORECASE
+        )
+        # 过滤掉 Jinja url_for 表达式（如 {{ url_for('xxx') }}）和空路径
+        static_actions = []
+        for action in form_actions:
+            action = action.strip()
+            if not action or '{{' in action or '{%' in action:
+                continue  # Jinja 动态路径，跳过（这是正确做法）
+            if action.startswith('/'):
+                static_actions.append(action)
+
+        if not static_actions:
+            return True, ""  # 没有硬编码的 form action（或全用 url_for），跳过
+
+        # 2. 从 routes.py / app.py 收集所有注册路径
+        registered_routes = set()
+        for fname in ('routes.py', 'views.py', 'app.py'):
+            fpath = self._find_file_in_sandbox(sandbox_dir, fname)
+            if not fpath:
+                continue
+            try:
+                with open(fpath, 'r', encoding='utf-8') as f:
+                    py_content = f.read()
+            except Exception:
+                continue
+
+            # @app.route('/path', ...) 或 @bp.route('/path', ...)
+            for m in _re.finditer(r'@\w+\.(?:route|post|get|put|delete)\s*\(\s*["\']([^"\']+)["\']', py_content):
+                registered_routes.add(m.group(1))
+
+            # app.add_url_rule('/path', ...)
+            for m in _re.finditer(r'add_url_rule\s*\(\s*["\']([^"\']+)["\']', py_content):
+                registered_routes.add(m.group(1))
+
+        if not registered_routes:
+            return True, ""  # 没有路由信息，跳过
+
+        # 3. 比对
+        mismatched = []
+        for action in static_actions:
+            if action not in registered_routes:
+                mismatched.append(action)
+
+        if mismatched:
+            error = (
+                f"[L0.8 form action 路径不匹配] {target_file}: "
+                f"HTML 中 <form action> 的路径 {mismatched} "
+                f"不在已注册的路由中。已注册路由: {sorted(registered_routes)}。"
+                f"修复方法：将 action 改为已注册的路径，"
+                f"或使用 action=\"{{{{ url_for('endpoint_name') }}}}\" 动态生成。"
+            )
+            logger.warning(f"❌ {error}")
+            global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+            return False, error
+
+        return True, ""
+
+    def _l0_template_folder_check(self, target_file: str, code_content: str,
+                                   sandbox_dir: str) -> Tuple[bool, str]:
+        """
+        L0.7: 检查 Flask(__name__) 是否缺少 template_folder 参数。
+        当 py 文件在 src/ 而 templates/ 在项目根目录时，必须配置 template_folder。
+        """
+        # 只检查包含 Flask(__name__) 的文件
+        if 'Flask(__name__)' not in code_content:
+            return True, ""
+
+        # 检查是否已经配置了 template_folder
+        if 'template_folder' in code_content:
+            return True, ""
+
+        # 检查项目结构：py 文件在子目录，templates/ 在其他位置
+        py_dir = os.path.dirname(os.path.join(sandbox_dir, target_file))
+        templates_in_py_dir = os.path.isdir(os.path.join(py_dir, 'templates'))
+
+        if templates_in_py_dir:
+            return True, ""  # templates/ 是 py 文件的兄弟目录，默认配置能找到
+
+        # 检查项目中是否存在 templates/ 目录
+        has_templates = False
+        for root, dirs, files in os.walk(sandbox_dir):
+            dirs[:] = [d for d in dirs if d not in
+                       ('__pycache__', 'venv', '.venv', 'node_modules', '.sandbox')]
+            if 'templates' in dirs:
+                has_templates = True
+                break
+
+        if has_templates:
+            error = (
+                f"[L0.7 template_folder 缺失] {target_file}: "
+                f"Flask(__name__) 缺少 template_folder 参数。"
+                f"当前文件在 {os.path.dirname(target_file) or '.'}/，"
+                f"但 templates/ 目录不在同级。"
+                f"必须改为 Flask(__name__, template_folder='../templates')，"
+                f"否则会 TemplateNotFound 错误！"
+            )
             logger.warning(f"❌ {error}")
             global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
             return False, error

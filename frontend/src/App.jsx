@@ -7,7 +7,7 @@ import './index.css';
 import ProjectSelector from './components/ProjectSelector';
 import CoderPanel from './components/CoderPanel';
 import ReviewerPanel from './components/ReviewerPanel';
-import ArtifactExplorer from './components/ArtifactExplorer';
+import LabWorkspace from './components/LabWorkspace';
 import PromptInput from './components/PromptInput';
 
 // --- 基础设施 ---
@@ -262,8 +262,8 @@ function App() {
 
         </div>
 
-        {/* --- Right Workspace: Mini VSCode (Artifacts & Output) --- */}
-        <ArtifactExplorer projectFiles={projectFiles} currentProjectId={currentProjectId} />
+        {/* --- Right Workspace: Lab (Tabs) --- */}
+        <LabWorkspace projectFiles={projectFiles} currentProjectId={currentProjectId} />
       </div>
     </div>
   );

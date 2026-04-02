@@ -302,8 +302,8 @@ class Prompts:
    - 如果有 → HTML 禁止内联 JS，只用 <script src="./app.js"></script> 引用
    - 如果没有 → HTML **必须**把所有 JS 逻辑写在内联 <script> 标签中
    - **铁律：禁止引用任务列表中不存在的文件！引用不存在的文件会导致 404 崩溃！**
-   - **Jinja 模板同理：禁止 `{%` extends "base.html" `%}` 或 `{%` include "header.html" `%}`，除非该文件在任务列表中！**
-   - **没有 base.html → index.html 必须包含完整 `<!DOCTYPE html>` 结构，不要用模板继承！**
+   - **Jinja 模板同理：禁止使用 extends / include 引用任务列表中不存在的模板文件！**
+   - **没有 base.html → index.html 必须包含完整 <!DOCTYPE html> 结构，不要用模板继承！**
 
 4. 【API 请求地址】前端 API 请求必须统一使用相对路径（如 `/api/memos`），禁止硬编码 `localhost`。
    API 路径必须与项目规划书 api_contracts 中定义的路径完全一致！

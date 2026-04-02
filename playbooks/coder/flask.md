@@ -126,6 +126,16 @@ return render_template('index.html', expenses=expenses, categories=categories)
 return redirect(url_for('index'))
 ```
 
+**⚠️ 表单 action 铁律**：HTML 模板中 `<form action>` **必须**使用 `url_for()` 生成 URL，**禁止**硬编码路径！
+
+```html
+<!-- ✅ 正确：用 url_for 自动解析路由 URL -->
+<form action="{{ url_for('add_expense') }}" method="post">
+
+<!-- ❌ 致命错误：硬编码路径可能与路由注册不一致 → 404 -->
+<form action="/add_expense" method="post">
+```
+
 #### 模式 B（API）：
 ```python
 # 接收 JSON
