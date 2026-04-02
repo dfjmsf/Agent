@@ -420,8 +420,142 @@ async def graduate_project(req: GraduateReq):
     count = graduate_project_experience(req.project_id)
     return {"status": "ok", "graduated_count": count, "project_id": req.project_id}
 
+
+# --- Git 版本管理 API ---
+
+@app.get("/api/project/git/status")
+async def git_status_api(project_id: str):
+    """获取项目 git 仓库状态"""
+    from tools.git_ops import git_status
+    base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects", project_id)
+    if not os.path.isdir(base_dir):
+        return {"error": f"项目不存在: {project_id}"}
+    return git_status(base_dir)
+
+
+@app.get("/api/project/git/log")
+async def git_log_api(project_id: str, max_count: int = 30):
+    """获取项目 commit 历史列表"""
+    from tools.git_ops import git_log
+    base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects", project_id)
+    if not os.path.isdir(base_dir):
+        return {"error": f"项目不存在: {project_id}"}
+    return {"commits": git_log(base_dir, max_count)}
+
+
+@app.get("/api/project/git/diff")
+async def git_diff_api(project_id: str, commit: str):
+    """获取指定 commit 的 diff"""
+    from tools.git_ops import git_diff
+    # 安全校验：commit hash 只允许十六进制字符
+    if not all(c in '0123456789abcdefABCDEF' for c in commit):
+        return {"error": "非法 commit hash"}
+    base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects", project_id)
+    if not os.path.isdir(base_dir):
+        return {"error": f"项目不存在: {project_id}"}
+    return {"diff": git_diff(base_dir, commit)}
+
+
+@app.post("/api/project/git/init")
+async def git_init_api(req: GraduateReq):
+    """手动初始化项目的 git 仓库并做首次 commit"""
+    from tools.git_ops import git_init, git_commit
+    base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects", req.project_id)
+    if not os.path.isdir(base_dir):
+        return {"error": f"项目不存在: {req.project_id}"}
+    ok = git_init(base_dir)
+    if ok:
+        git_commit(base_dir, f"初始化: {req.project_id}")
+    return {"status": "ok" if ok else "failed", "project_id": req.project_id}
+
+
+# --- 模型配置 API ---
+
+_AGENT_ROLES = ["MODEL_PLANNER", "MODEL_CODER", "MODEL_REVIEWER", "MODEL_SYNTHESIZER", "MODEL_AUDITOR"]
+_ROLE_LABELS = {
+    "MODEL_PLANNER": "规划师 (Manager)",
+    "MODEL_CODER": "编码器 (Coder)",
+    "MODEL_REVIEWER": "审查员 (Reviewer)",
+    "MODEL_SYNTHESIZER": "综合器 (Synthesizer)",
+    "MODEL_AUDITOR": "审计员 (Auditor)",
+}
+
+
+@app.get("/api/config/models")
+async def get_model_config():
+    """获取当前模型配置和可用 Provider 列表"""
+    from core.llm_client import default_llm
+
+    # 当前各 Agent 的模型配置
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    current = {}
+    for role in _AGENT_ROLES:
+        current[role] = os.getenv(role, "未设置")
+
+    # 收集所有 Provider 和它们的模型
+    providers = []
+    for p in default_llm.providers:
+        providers.append({
+            "name": p.name,
+            "models": p.models,
+        })
+
+    return {
+        "agents": {role: {"label": _ROLE_LABELS[role], "model": current[role]} for role in _AGENT_ROLES},
+        "providers": providers,
+    }
+
+
+class ModelConfigUpdate(BaseModel):
+    """模型配置更新请求"""
+    config: Dict[str, str]  # e.g. {"MODEL_PLANNER": "qwen3-max", "MODEL_CODER": "deepseek-chat"}
+
+
+@app.put("/api/config/models")
+async def update_model_config(req: ModelConfigUpdate):
+    """更新 .env 中的模型配置并热重载"""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+    # 读取现有 .env
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return {"error": ".env 文件不存在"}
+
+    # 逐行更新
+    updated_keys = set()
+    new_lines = []
+    for line in lines:
+        stripped = line.strip()
+        matched = False
+        for key, value in req.config.items():
+            if key in _AGENT_ROLES and stripped.startswith(f"{key}="):
+                new_lines.append(f"{key}={value}\n")
+                updated_keys.add(key)
+                matched = True
+                break
+        if not matched:
+            new_lines.append(line)
+
+    # 写回
+    try:
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+    except Exception as e:
+        return {"error": f"写入失败: {str(e)}"}
+
+    # 热重载环境变量到当前进程
+    for key, value in req.config.items():
+        if key in _AGENT_ROLES:
+            os.environ[key] = value
+
+    logger.info(f"✅ 模型配置已更新: {req.config}")
+    return {"status": "ok", "updated": dict(req.config),
+            "note": "配置已写入.env并热载，新的项目生成将使用更新后的模型。"}
+
+
 if __name__ == "__main__":
     import uvicorn
-    # 为了防止 Windows 上部分多进程阻塞，这里禁用了 reload 并以纯净模式跑
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
 

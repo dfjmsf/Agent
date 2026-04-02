@@ -80,6 +80,54 @@ export async function graduateProject(projectId) {
   return res.json();
 }
 
+// --- Git 版本管理 API ---
+
+export async function fetchGitStatus(projectId) {
+  const res = await fetch(`${API_BASE}/api/project/git/status?project_id=${encodeURIComponent(projectId)}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function fetchGitLog(projectId, maxCount = 30) {
+  const res = await fetch(`${API_BASE}/api/project/git/log?project_id=${encodeURIComponent(projectId)}&max_count=${maxCount}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function fetchGitDiff(projectId, commitHash) {
+  const res = await fetch(`${API_BASE}/api/project/git/diff?project_id=${encodeURIComponent(projectId)}&commit=${encodeURIComponent(commitHash)}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function initGitRepo(projectId) {
+  const res = await fetch(`${API_BASE}/api/project/git/init`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_id: projectId })
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+// --- 模型配置 API ---
+
+export async function fetchModelConfig() {
+  const res = await fetch(`${API_BASE}/api/config/models`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function updateModelConfig(config) {
+  const res = await fetch(`${API_BASE}/api/config/models`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ config })
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
 /**
  * 根据文件名推断 Monaco Editor 的语言标识
  */

@@ -2,6 +2,8 @@ import React, { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { FolderTree, GitBranch, Settings, MessageSquare } from 'lucide-react';
 import FileExplorer from './FileExplorer';
+import GitPanel from './GitPanel';
+import ModelSettings from './ModelSettings';
 
 /**
  * LabWorkspace - 右侧实验室面板（Tab 式）
@@ -23,23 +25,9 @@ export default function LabWorkspace({ projectFiles, currentProjectId }) {
       case 'files':
         return <FileExplorer projectFiles={projectFiles} currentProjectId={currentProjectId} />;
       case 'git':
-        return (
-          <div className="lab-placeholder">
-            <GitBranch size={48} color="#3bc7c7" strokeWidth={1} />
-            <h3>Git 版本管理</h3>
-            <p>即将上线：查看 commit 历史、浏览 diff、版本回滚。</p>
-            <div className="lab-placeholder-tag">Phase B</div>
-          </div>
-        );
+        return <GitPanel currentProjectId={currentProjectId} />;
       case 'settings':
-        return (
-          <div className="lab-placeholder">
-            <Settings size={48} color="#f0db4f" strokeWidth={1} />
-            <h3>模型设置</h3>
-            <p>即将上线：Provider 管理、Agent 模型映射、API Key 配置。</p>
-            <div className="lab-placeholder-tag">Phase C</div>
-          </div>
-        );
+        return <ModelSettings />;
       case 'pm':
         return (
           <div className="lab-placeholder">

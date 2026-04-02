@@ -207,6 +207,13 @@ class AstreaEngine:
                 logger.info(f"✨ 项目交付完成: {final_dir}")
                 global_broadcaster.emit_sync("System", "success",
                     f"✨ 项目完美生成！{final_dir}", {"final_path": final_dir})
+
+                # Git auto-commit（不阻塞交付）
+                try:
+                    from tools.git_ops import git_commit
+                    git_commit(final_dir, f"ASTrea: 项目生成完成 ({self.project_id})")
+                except Exception as e:
+                    logger.warning(f"⚠️ Git auto-commit 失败（不影响交付）: {e}")
             else:
                 self.blackboard.set_project_status(ProjectStatus.FAILED)
                 update_project_status(self.project_id, "failed")
@@ -327,6 +334,13 @@ class AstreaEngine:
             logger.info(f"✨ [Patch Mode] 修改完成: {final_dir}")
             global_broadcaster.emit_sync("System", "success",
                 f"✨ Patch Mode 修改完成！{final_dir}", {"final_path": final_dir})
+
+            # Git auto-commit（不阻塞交付）
+            try:
+                from tools.git_ops import git_commit
+                git_commit(final_dir, f"ASTrea Patch: {user_requirement[:60]}")
+            except Exception as e:
+                logger.warning(f"⚠️ Git auto-commit 失败（不影响交付）: {e}")
         else:
             self.blackboard.set_project_status(ProjectStatus.FAILED)
             update_project_status(self.project_id, "failed")
