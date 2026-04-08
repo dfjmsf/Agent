@@ -354,26 +354,29 @@ class ReviewerAgent:
             if not jinja_pass:
                 return False, jinja_error
 
-            # L0.6-B 反向: 此时 routes.py 已存在，检查 form key 一致性
-            routes_path = self._find_file_in_sandbox(sandbox_dir, 'routes.py')
-            if not routes_path:
-                routes_path = self._find_file_in_sandbox(sandbox_dir, 'views.py')
-            if routes_path:
-                try:
-                    with open(routes_path, 'r', encoding='utf-8') as f:
-                        routes_content = f.read()
-                    form_pass, form_error = self._l0_form_field_check(
-                        os.path.basename(routes_path), routes_content, sandbox_dir)
-                    if not form_pass:
-                        return False, form_error
-                except Exception:
-                    pass
+            # L0.6-B 反向检查已禁用：
+            # 审查 HTML 时反向检查 routes.py 的 form keys 会产生误报，
+            # 因为 routes.py 中其他路由的 form keys（如 add_category 的 'name'）
+            # 可能对应尚未创建的 HTML 文件（如 categories.html）。
+            # L0.6-B 正向检查（直接审查 routes.py 时）已经足够覆盖这一场景。
+
+            # L0.7: 路由 URL 一致性检查（动态：无路由文件时自动跳过）
+            route_pass, route_error = self._l0_route_url_check(
+                target_file, code_content, sandbox_dir)
+            if not route_pass:
+                return False, route_error
 
             # L0.8: form action 路径 vs 路由注册路径一致性检查
             action_pass, action_error = self._l0_form_action_check(
                 target_file, code_content, sandbox_dir)
             if not action_pass:
                 return False, action_error
+
+            # L0.9: 模板继承一致性检查
+            inherit_pass, inherit_error = self._l0_template_inherit_check(
+                target_file, code_content, sandbox_dir)
+            if not inherit_pass:
+                return False, inherit_error
 
             return True, ""
 
@@ -476,8 +479,17 @@ class ReviewerAgent:
                         )
 
         if mismatches:
+            # 确定冲突源文件（Jinja 字段不匹配时，有罪方可能是 models.py 的 to_dict）
+            cross_file_tag = ""
+            for root, dirs, files in os.walk(sandbox_dir):
+                dirs[:] = [d for d in dirs if d not in ('__pycache__', 'venv', '.venv', 'node_modules', '.sandbox')]
+                for f in files:
+                    if f == 'models.py':
+                        cross_file_tag = f"[CROSS_FILE:{os.path.relpath(os.path.join(root, f), sandbox_dir)}] "
+                        break
+
             error = (
-                f"[L0.6 Jinja 字段不匹配] {target_file}: "
+                f"{cross_file_tag}[L0.6 Jinja 字段不匹配] {target_file}: "
                 f"模板引用了 models.py to_dict() 中不存在的字段：\n"
                 + "\n".join(f"  - {m}" for m in mismatches[:5])
                 + "\n修复方法：将模板变量改为 to_dict() 实际返回的字段名。"
@@ -528,8 +540,12 @@ class ReviewerAgent:
         # 3. 检查 routes.py 的 form keys 是否在 HTML name 中
         missing_in_html = form_keys - html_names
         if missing_in_html:
+            # 冲突源文件标记：错误在 routes.py（form key 与 HTML 不匹配）
+            # target_file 就是 routes.py 自身路径（可能是直接审查，也可能是反向检查）
+            cross_file_tag = f"[CROSS_FILE:{target_file}] "
+
             error = (
-                f"[L0.6 表单字段不匹配] {target_file}: "
+                f"{cross_file_tag}[L0.6 表单字段不匹配] {target_file}: "
                 f"request.form 引用了 HTML 中不存在的字段名: {sorted(missing_in_html)}。"
                 f"HTML 中实际的 name 属性: {sorted(html_names)}。"
                 f"修复方法：确保 request.form['xxx'] 的 key 与 HTML <input name='xxx'> 完全一致。"
@@ -574,30 +590,8 @@ class ReviewerAgent:
                 if keys:
                     class_keys[cls_name] = keys
 
-        # 模式 2: 原生 SQL SELECT 列名（仅当 to_dict 没提取到时）
-        if not class_keys:
-            sql_keys = set()
-            select_blocks = re.findall(
-                r'SELECT\s+(.*?)\s+FROM',
-                models_content, re.DOTALL | re.IGNORECASE
-            )
-            for block in select_blocks:
-                columns = block.split(',')
-                for col in columns:
-                    col = col.strip()
-                    # AS 别名优先
-                    as_match = re.search(r'(?:as|AS)\s+(\w+)', col)
-                    if as_match:
-                        sql_keys.add(as_match.group(1))
-                    else:
-                        # 取最后一个标识符（如 e.amount → amount）
-                        parts = re.findall(r'(\w+)', col)
-                        if parts:
-                            sql_keys.add(parts[-1])
-            if sql_keys:
-                class_keys['_sql'] = sql_keys
-
         return class_keys
+
 
     @staticmethod
     def _find_file_in_sandbox(sandbox_dir: str, filename: str):
@@ -608,6 +602,132 @@ class ReviewerAgent:
             if filename in files:
                 return os.path.join(root, filename)
         return None
+
+    def _l0_template_inherit_check(self, target_file: str, html_content: str,
+                                    sandbox_dir: str) -> Tuple[bool, str]:
+        """
+        L0.9: 模板继承一致性检查。
+        如果沙盒中存在 base.html（且定义了 {% block %}），
+        其他 HTML 文件必须使用 {% extends "base.html" %}。
+        """
+        import re as _re
+
+        # 跳过 base.html 自身
+        basename = os.path.basename(target_file).lower()
+        if basename in ('base.html', 'layout.html', 'base_layout.html'):
+            return True, ""
+
+        # 在沙盒中查找 base 模板
+        base_path = self._find_file_in_sandbox(sandbox_dir, 'base.html')
+        if not base_path:
+            base_path = self._find_file_in_sandbox(sandbox_dir, 'layout.html')
+        if not base_path:
+            return True, ""  # 没 base 模板 → 不约束
+
+        # 验证 base 模板确实定义了 {% block %}
+        try:
+            with open(base_path, 'r', encoding='utf-8') as f:
+                base_content = f.read()
+            if '{% block ' not in base_content and '{%block ' not in base_content:
+                return True, ""  # base.html 没有 block 定义 → 不是布局模板
+        except Exception:
+            return True, ""
+
+        # 检查当前文件是否有 {% extends %}
+        if _re.search(r'\{%[-\s]*extends\s', html_content):
+            return True, ""  # 有继承 → 通过
+
+        # 没有继承 → 报错
+        base_rel = os.path.relpath(base_path, sandbox_dir).replace('\\', '/')
+        error = (
+            f"[L0.9 模板继承缺失] {target_file}: "
+            f"沙盒中存在布局模板 {base_rel}（含 {{% block %}} 定义），"
+            f"但当前文件未使用 {{% extends \"{os.path.basename(base_path)}\" %}}。"
+            f"修复方法：在文件开头添加 {{% extends \"{os.path.basename(base_path)}\" %}}，"
+            f"将页面内容放入 {{% block content %}} 中。"
+        )
+        return False, error
+
+    def _l0_route_url_check(self, target_file: str, html_content: str,
+                             sandbox_dir: str) -> Tuple[bool, str]:
+        """
+        L0.7: 检查 HTML 中的 href/action/fetch URL 是否与后端路由匹配。
+        动态扫描沙盒中所有 .py 文件提取路由。
+        纯前端项目（无路由定义）→ 自动跳过，不产生约束。
+        """
+        import re as _re
+
+        # 1. 动态发现沙盒中所有已注册路由
+        registered_routes = set()
+        route_source_file = None
+        try:
+            from tools.observer import Observer
+            obs = Observer(sandbox_dir)
+            for root, dirs, files in os.walk(sandbox_dir):
+                dirs[:] = [d for d in dirs if d not in
+                           {'.git', '__pycache__', 'node_modules', '.sandbox', 'venv', '.venv'}]
+                for f in files:
+                    if f.endswith('.py'):
+                        rel = os.path.relpath(os.path.join(root, f), sandbox_dir).replace('\\', '/')
+                        routes = obs.extract_routes(rel)
+                        for r in routes:
+                            registered_routes.add(r['path'])
+                            if not route_source_file:
+                                route_source_file = rel
+        except Exception:
+            return True, ""  # Observer 异常时不阻塞
+
+        # 纯前端项目：没发现任何路由 → 跳过检查
+        if not registered_routes:
+            return True, ""
+
+        registered_routes.add('/')  # 根路由总是合法
+
+        # 2. 提取 HTML 中所有引用的内部 URL
+        html_urls = set()
+        # href="/xxx" 和 action="/xxx"（排除锚点、外链、static）
+        for m in _re.finditer(r'(?:href|action)\s*=\s*["\'](/[^"\'#]*)["\']', html_content):
+            url = m.group(1).split('?')[0]
+            if not url.startswith('/static'):
+                html_urls.add(url)
+        # fetch("/xxx")
+        for m in _re.finditer(r'fetch\s*\(\s*[`"\'](/[^`"\']*)[`"\']', html_content):
+            html_urls.add(m.group(1).split('?')[0])
+
+        if not html_urls:
+            return True, ""
+
+        # 3. 对比：移除 Jinja 模板参数后匹配
+        def normalize(url):
+            """移除 Jinja 变量如 /edit-entry/{{ entry.id }} → /edit-entry"""
+            cleaned = _re.sub(r'/\{\{[^}]*\}\}', '', url)
+            cleaned = _re.sub(r'/\{%[^%]*%\}', '', cleaned)
+            return cleaned.rstrip('/') or '/'
+
+        phantom_urls = set()
+        for url in html_urls:
+            norm_url = normalize(url)
+            matched = False
+            for route in registered_routes:
+                # Flask <int:id> / FastAPI {id} → 通配
+                route_pattern = _re.sub(r'<[^>]+>', '[^/]+', route)
+                route_pattern = _re.sub(r'\{[^}]+\}', '[^/]+', route_pattern)
+                if _re.fullmatch(route_pattern, norm_url):
+                    matched = True
+                    break
+            if not matched:
+                phantom_urls.add(url)
+
+        if phantom_urls:
+            error = (
+                f"[CROSS_FILE:{route_source_file}] [L0.7 幻影路由] {target_file}: "
+                f"HTML 引用了后端不存在的路由 URL: {sorted(phantom_urls)}。"
+                f"已注册的路由: {sorted(registered_routes)}。"
+                f"修复方法：删除引用不存在路由的链接/按钮，只使用已注册路由的 URL。"
+            )
+            return False, error
+
+        return True, ""
 
     def _l0_form_action_check(self, target_file: str, html_content: str,
                                sandbox_dir: str) -> Tuple[bool, str]:
@@ -945,14 +1065,225 @@ except Exception as e:
         return memory_hint
 
     # ============================================================
+    # L0-Contract: 契约校验（确定性，0 LLM 消耗）
+    # ============================================================
+
+    def _l0_contract_check(self, target_file: str, code_content: str,
+                           sandbox_dir: str, project_spec: dict) -> Tuple[bool, str]:
+        """L0-Contract: 基于 page_routes / template_contracts 的契约校验。
+        当契约存在时，以契约为权威基准校验 Coder 的代码。"""
+        if not project_spec:
+            return True, ""
+
+        page_routes = project_spec.get("page_routes", [])
+        template_contracts = project_spec.get("template_contracts", {})
+
+        if not page_routes and not template_contracts:
+            return True, ""  # 无契约 → 跳过
+
+        # C1: 后端路由函数 vs 契约路径一致性（Python 路由文件）
+        if target_file.endswith('.py') and page_routes:
+            c1_pass, c1_error = self._l0_contract_c1_route_check(
+                target_file, code_content, page_routes)
+            if not c1_pass:
+                return False, c1_error
+
+        # C2: HTML form action / href vs 契约路径一致性（HTML 文件）
+        if target_file.endswith('.html') and page_routes:
+            c2_pass, c2_error = self._l0_contract_c2_html_url_check(
+                target_file, code_content, page_routes)
+            if not c2_pass:
+                return False, c2_error
+
+        # C3: template_folder 路径 vs 实际目录结构一致性（Flask app 文件）
+        if target_file.endswith('.py') and sandbox_dir:
+            c3_pass, c3_error = self._l0_contract_c3_template_folder_check(
+                target_file, code_content, sandbox_dir)
+            if not c3_pass:
+                return False, c3_error
+
+        return True, ""
+
+    def _l0_contract_c1_route_check(self, target_file: str, code_content: str,
+                                    page_routes: list) -> Tuple[bool, str]:
+        """L0.C1: 检查 Python 路由文件中注册的路径是否与 page_routes 契约一致。
+        仅对包含路由注册的文件生效（routes.py / app.py 等）。"""
+        import re as _re
+
+        # 只检查包含路由注册的文件
+        has_route_registration = (
+            'add_url_rule' in code_content or
+            '@app.' in code_content or
+            '@router.' in code_content or
+            '@bp.' in code_content or
+            'route(' in code_content
+        )
+        if not has_route_registration:
+            return True, ""
+
+        # 从代码中提取所有注册路径
+        code_routes = set()
+        # @app.route('/path') / @bp.route('/path') / @router.get('/path')
+        for m in _re.finditer(r'@\w+\.(?:route|get|post|put|delete|patch)\s*\(\s*["\'](/[^"\']*)["\']', code_content):
+            code_routes.add(m.group(1))
+        # add_url_rule('/path', ...)
+        for m in _re.finditer(r'add_url_rule\s*\(\s*["\'](/[^"\']*)["\']', code_content):
+            code_routes.add(m.group(1))
+
+        if not code_routes:
+            return True, ""  # 没提取到路由路径，跳过
+
+        # 从契约提取所有路径
+        contract_routes = set()
+        for r in page_routes:
+            contract_routes.add(r.get('path', ''))
+
+        # 契约中有但代码中没有的路径（Coder 遗漏注册）
+        missing_in_code = contract_routes - code_routes
+        if missing_in_code:
+            error = (
+                f"[L0.C1 路由契约违规] {target_file}: "
+                f"page_routes 契约要求注册以下路径，但代码中未找到: {sorted(missing_in_code)}。"
+                f"代码中已注册的路径: {sorted(code_routes)}。"
+                f"修复方法：按照契约补全缺失的路由注册。"
+            )
+            logger.warning(f"❌ {error}")
+            global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+            return False, error
+
+        logger.info(f"✅ [L0.C1] 路由契约校验通过: {target_file}")
+        return True, ""
+
+    def _l0_contract_c2_html_url_check(self, target_file: str, html_content: str,
+                                       page_routes: list) -> Tuple[bool, str]:
+        """L0.C2: 检查 HTML 中 form action / href 是否全部存在于 page_routes 契约。
+        当 page_routes 契约存在时，以契约为权威基准（替代动态扫描）。"""
+        import re as _re
+
+        # 从契约提取所有合法路径
+        contract_paths = set()
+        for r in page_routes:
+            path = r.get('path', '')
+            if path:
+                contract_paths.add(path)
+        contract_paths.add('/')  # 根路由总是合法
+
+        # 从 HTML 中提取所有内部 URL
+        html_urls = set()
+        # action="/xxx" 和 href="/xxx"（排除锚点、外链、static、Jinja 动态路径）
+        for m in _re.finditer(r'(?:href|action)\s*=\s*["\'](/[^"\'#]*)["\']', html_content):
+            url = m.group(1).split('?')[0].rstrip('/')
+            if not url:
+                url = '/'
+            # 跳过静态资源和 Jinja 动态路径
+            if url.startswith('/static') or '{{' in m.group(0) or '{%' in m.group(0):
+                continue
+            html_urls.add(url)
+        # fetch("/xxx")
+        for m in _re.finditer(r'fetch\s*\(\s*[`"\'](/[^`"\']*)[`"\']', html_content):
+            url = m.group(1).split('?')[0].rstrip('/')
+            if not url:
+                url = '/'
+            html_urls.add(url)
+
+        if not html_urls:
+            return True, ""  # 没引用到任何内部 URL
+
+        # 对比：HTML 中引用了契约中不存在的路径
+        phantom_urls = set()
+        for url in html_urls:
+            # 支持路径参数匹配（如 /entries/123 匹配 /entries/<int:id>）
+            matched = False
+            for contract_path in contract_paths:
+                # 精确匹配
+                if url == contract_path:
+                    matched = True
+                    break
+                # 路径参数通配（Flask <xxx> / FastAPI {xxx}）
+                pattern = _re.sub(r'<[^>]+>', '[^/]+', contract_path)
+                pattern = _re.sub(r'\{[^}]+\}', '[^/]+', pattern)
+                if _re.fullmatch(pattern, url):
+                    matched = True
+                    break
+            if not matched:
+                phantom_urls.add(url)
+
+        if phantom_urls:
+            error = (
+                f"[L0.C2 URL 契约违规] {target_file}: "
+                f"HTML 引用的 URL {sorted(phantom_urls)} 不在 page_routes 契约中。"
+                f"契约定义的合法路径: {sorted(contract_paths)}。"
+                f"修复方法：将 URL 改为契约中定义的路径。"
+            )
+            logger.warning(f"❌ {error}")
+            global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+            return False, error
+
+        logger.info(f"✅ [L0.C2] HTML URL 契约校验通过: {target_file}")
+        return True, ""
+
+    def _l0_contract_c3_template_folder_check(self, target_file: str, code_content: str,
+                                               sandbox_dir: str) -> Tuple[bool, str]:
+        """L0.C3: 检查 Flask template_folder 参数指向的路径是否实际存在。
+        比 L0.7 更精确：L0.7 只检查有没有 template_folder，C3 验证路径是否正确。"""
+        import re as _re
+
+        # 只检查包含 Flask( 的文件
+        if 'Flask(' not in code_content:
+            return True, ""
+
+        # 提取 template_folder 参数值
+        m = _re.search(r'template_folder\s*=\s*["\'](.*?)["\']', code_content)
+        if not m:
+            return True, ""  # 没指定 template_folder（使用默认），跳过
+
+        tf_value = m.group(1)  # 如 '../templates'
+
+        # 计算绝对路径：target_file 所在目录 + template_folder 的相对路径
+        py_dir = os.path.dirname(os.path.join(sandbox_dir, target_file))
+        resolved = os.path.normpath(os.path.join(py_dir, tf_value))
+
+        # 检查该路径是否存在
+        if os.path.isdir(resolved):
+            logger.info(f"✅ [L0.C3] template_folder 路径验证通过: {tf_value} → {resolved}")
+            return True, ""
+
+        # 路径不存在 → 尝试推断正确路径
+        correct_tf = None
+        # 检查 templates/ 是不是在沙盒根目录
+        root_templates = os.path.join(sandbox_dir, 'templates')
+        if os.path.isdir(root_templates):
+            correct_rel = os.path.relpath(root_templates, py_dir).replace('\\', '/')
+            correct_tf = correct_rel
+
+        suggestion = ""
+        if correct_tf:
+            if correct_tf == 'templates':
+                suggestion = f"正确值应为 template_folder='templates'，或直接删除此参数（Flask 默认就是 templates/）。"
+            else:
+                suggestion = f"正确值应为 template_folder='{correct_tf}'。"
+        else:
+            suggestion = "请确认 templates/ 目录的位置，或删除 template_folder 参数使用默认值。"
+
+        error = (
+            f"[L0.C3 模板路径错误] {target_file}: "
+            f"template_folder='{tf_value}' 解析后指向 {resolved}，但该目录不存在。"
+            f"{suggestion}"
+        )
+        logger.warning(f"❌ {error}")
+        global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+        return False, error
+
+    # ============================================================
     # 主入口
     # ============================================================
 
     def evaluate_draft(self, target_file: str, description: str,
                        code_content: str = None, sandbox_dir: str = None,
-                       module_interfaces: dict = None) -> Tuple[bool, str]:
+                       module_interfaces: dict = None,
+                       project_spec: dict = None) -> Tuple[bool, str]:
         """
-        评估文件草稿（v3 L0+L1 管线）
+        评估文件草稿（v3 L0+L0C+L1 管线）
 
         Args:
             target_file: 目标文件路径
@@ -960,6 +1291,7 @@ except Exception as e:
             code_content: Engine 传入的已缝合代码
             sandbox_dir: 沙盒工作目录
             module_interfaces: 跨文件接口契约（来自 Manager 规划书）
+            project_spec: 完整项目规划书（含 page_routes / template_contracts）
 
         返回:
             is_pass (bool): 是否审查通过
@@ -985,13 +1317,22 @@ except Exception as e:
 
         global_broadcaster.emit_sync("Reviewer", "l0_pass", "✅ L0 静态检查通过")
 
+        # === Step 1.5: L0-Contract 契约校验 (0 LLM) ===
+        lc_pass, lc_error = self._l0_contract_check(
+            target_file, code_content, sandbox_dir, project_spec)
+        if not lc_pass:
+            logger.warning(f"❌ Reviewer L0-Contract 驳回: {lc_error[:200]}")
+            global_broadcaster.emit_sync("Reviewer", "review_fail",
+                f"L0-Contract 契约校验未通过", {"feedback": lc_error})
+            return False, lc_error
+
         # === Step 2: L1 合约审计 (~800 tokens) ===
         # 非 Python 文件跳过 L1（HTML/CSS/JS 的合约审计意义不大）
         if not target_file.endswith('.py'):
             logger.info(f"✅ [L1] 非 Python 文件，跳过合约审计: {target_file}")
             global_broadcaster.emit_sync("Reviewer", "review_pass",
-                "✓ 审核通过！合并入主分支。", {"feedback": "L0 通过，非 Python 跳过 L1"})
-            return True, "L0 通过（非 Python 文件，跳过 L1）"
+                "✓ 审核通过！合并入主分支。", {"feedback": "L0+Contract 通过，非 Python 跳过 L1"})
+            return True, "L0+Contract 通过（非 Python 文件，跳过 L1）"
 
         memory_hint = self._build_review_context(target_file, module_interfaces)
         l1_pass, l1_feedback = self._l1_contract_audit(

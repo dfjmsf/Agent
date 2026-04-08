@@ -185,6 +185,8 @@ class CoderAgent:
 
         # Playbook: 技术栈编码规范（由 Engine 按文件类型动态加载）
         playbook = task_meta.get("playbook", "") if task_meta else ""
+        # P0.5: 用户项目潜规则（空字符串 = 零噪音）
+        user_rules_block = task_meta.get("user_rules_block", "") if task_meta else ""
 
         # Phase 0: Fill 模式 — 使用骨架填充 prompt
         if task_meta and task_meta.get("is_fill_mode") and task_meta.get("skeleton_code"):
@@ -194,6 +196,7 @@ class CoderAgent:
                 project_spec=project_spec,
                 vfs_context=vfs_str,
                 coder_playbook=playbook,
+                user_rules_block=user_rules_block,
             )
             user_prompt = "请将骨架中的所有 `...` 占位替换为完整的业务实现。输出完整文件代码。"
         else:
@@ -203,7 +206,8 @@ class CoderAgent:
                 memory_hint=memory_hint,
                 project_spec=project_spec,
                 vfs_context=vfs_str,
-                playbook=playbook
+                playbook=playbook,
+                user_rules_block=user_rules_block,
             )
             user_prompt = "请开始编写该文件的代码。只输出这一个文件的代码内容。"
 
@@ -360,6 +364,7 @@ class CoderAgent:
         project_spec = task_meta.get("project_spec", "无规划书") if task_meta else "无规划书"
         vfs_str = observer_context if observer_context else "当前无依赖文件。"
         playbook = task_meta.get("playbook", "") if task_meta else ""
+        user_rules_block = task_meta.get("user_rules_block", "") if task_meta else ""
 
         system_content = self._get_coder_prompt(target_file).format(
             target_file=target_file,
@@ -367,7 +372,8 @@ class CoderAgent:
             memory_hint=memory_hint,
             project_spec=project_spec,
             vfs_context=vfs_str,
-            playbook=playbook
+            playbook=playbook,
+            user_rules_block=user_rules_block,
         )
 
         if existing_code:
@@ -447,6 +453,10 @@ class CoderAgent:
         if feedback:
             mode = "Reviewer退回修复"
             edit_instruction = feedback
+        elif (task_meta or {}).get("is_fill_mode"):
+            # 骨架填充模式：骨架已在真理区，但要走 Fill prompt 而非 Editor
+            mode = "首次生成"
+            edit_instruction = None
         elif existing_code:
             mode = "跨任务修改已有文件"
             edit_instruction = f"【任务要求】\n{description}"
@@ -471,12 +481,24 @@ class CoderAgent:
                 )
             else:
                 # 后端文件：精简记忆 + Editor 差量编辑
+                retry_count = (task_meta or {}).get("retry_count", 0)
                 fix_hint = self._build_fix_hint(target_file, description, observer_context)
-                result = self._fix_with_editor(
-                    target_file, description, edit_instruction,
-                    existing_code=existing_code,
-                    memory_hint=fix_hint, task_meta=task_meta
-                )
+                if retry_count >= 3:
+                    # 重试 3+ 次时，Editor 差量编辑容易"修一个破一个"
+                    # 直接走全量重写，给 Coder 一个干净的全局视角
+                    logger.info(f"🔄 [重试{retry_count}] 跳过 Editor，直接全量重写: {target_file}")
+                    result = self._fallback_full_rewrite(
+                        target_file, description, edit_instruction,
+                        existing_code=existing_code,
+                        observer_context=observer_context,
+                        memory_hint=fix_hint, task_meta=task_meta
+                    )
+                else:
+                    result = self._fix_with_editor(
+                        target_file, description, edit_instruction,
+                        existing_code=existing_code,
+                        memory_hint=fix_hint, task_meta=task_meta
+                    )
         else:
             # 首次生成
             is_fill = (task_meta or {}).get("is_fill_mode", False)

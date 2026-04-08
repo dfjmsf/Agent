@@ -7,6 +7,7 @@ v1.3 核心基建：
 - 状态机驱动: 严格的 status 字段控制 Agent 唤醒顺序
 - 契约前置: Manager 的规划书/API 契约钉在黑板上，作为所有 Agent 的标准
 """
+import os
 import logging
 from enum import Enum
 from datetime import datetime, timezone
@@ -82,6 +83,10 @@ class TaskItem(BaseModel):
     # --- 记忆追踪 ---
     recalled_memory_ids: List[int] = Field(default_factory=list)
 
+    # --- TechLead 仲裁状态 (Phase 2.1) ---
+    tech_lead_invoked: bool = False               # 是否已唤醒过 TechLead（每个 task 最多 1 次）
+    tech_lead_feedback: Optional[str] = None      # TechLead 的修复指令
+
     def log_action(self, message: str):
         """追加一条轨迹记录"""
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
@@ -91,6 +96,15 @@ class TaskItem(BaseModel):
         """追加一条错误日志"""
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         self.error_logs.append(f"[{ts}] {error}")
+
+
+class CompletedTaskRecord(BaseModel):
+    """任务账本条目 — 一次子任务完成的不可变记录 (Phase 2.1)"""
+    task_id: str
+    target_file: str
+    description: str                        # 任务意图（用户可读的语义标签）
+    git_hash: Optional[str] = None          # 对应的 Git commit hash
+    completed_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class BlackboardState(BaseModel):
@@ -117,8 +131,52 @@ class BlackboardState(BaseModel):
     global_routes: Dict[str, Any] = Field(default_factory=dict)
     # 格式: {"routes.py": [{"method":"GET","path":"/api/users","function":"get_users"}]}
 
+    # --- Phase 2.1: Task Ledger (任务账本) ---
+    completed_tasks: List[CompletedTaskRecord] = Field(default_factory=list)
+
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    # --- Phase 2.1: 文件持久化 ---
+
+    def save_to_disk(self, project_dir: str) -> bool:
+        """
+        序列化到 .astrea/blackboard_state.json。
+        触发时机：每轮 task commit 后。
+        """
+        import os
+        astrea_dir = os.path.join(project_dir, ".astrea")
+        os.makedirs(astrea_dir, exist_ok=True)
+        save_path = os.path.join(astrea_dir, "blackboard_state.json")
+        try:
+            json_str = self.model_dump_json(indent=2)
+            with open(save_path, "w", encoding="utf-8") as f:
+                f.write(json_str)
+            logger.info(f"💾 BlackboardState 已持久化 → {save_path} ({len(json_str)} bytes)")
+            return True
+        except Exception as e:
+            logger.error(f"❌ BlackboardState 持久化失败: {e}")
+            return False
+
+    @classmethod
+    def load_from_disk(cls, project_dir: str) -> 'BlackboardState | None':
+        """
+        从 .astrea/blackboard_state.json 反序列化恢复。
+        恢复时机：PM 收到该项目消息时自动加载。
+        """
+        import os
+        save_path = os.path.join(project_dir, ".astrea", "blackboard_state.json")
+        if not os.path.isfile(save_path):
+            return None
+        try:
+            with open(save_path, "r", encoding="utf-8") as f:
+                json_str = f.read()
+            state = cls.model_validate_json(json_str)
+            logger.info(f"📂 BlackboardState 已从磁盘恢复: {save_path}")
+            return state
+        except Exception as e:
+            logger.error(f"❌ BlackboardState 反序列化失败: {e}")
+            return None
 
 
 # ============================================================
@@ -156,6 +214,17 @@ class Blackboard:
         self._touch()
         logger.info(f"📌 项目状态扭转: {old.value} → {status.value}")
         self.checkpoint()
+
+    def find_task_by_file(self, target_file: str) -> Optional[TaskItem]:
+        """按 target_file 查找已存在的 task（用于 TechLead 跨文件打回）"""
+        def _norm(p: str) -> str:
+            return os.path.normpath(p).replace('\\', '/')
+        
+        target = _norm(target_file)
+        for t in self._state.tasks:
+            if _norm(t.target_file) == target:
+                return t
+        return None
 
     def set_project_spec(self, spec: dict, spec_text: str, project_name: str = None):
         """Manager 贴上规划书和 API 契约"""
@@ -313,6 +382,22 @@ class Blackboard:
     def has_fused_tasks(self) -> bool:
         """检查是否有熔断的任务"""
         return any(t.status == TaskStatus.FUSED for t in self._state.tasks)
+
+    # --- Phase 2.1: Task Ledger ---
+
+    def record_completed_task(self, task_id: str, target_file: str,
+                              description: str, git_hash: str = None):
+        """向账本追加一条完成记录"""
+        record = CompletedTaskRecord(
+            task_id=task_id,
+            target_file=target_file,
+            description=description,
+            git_hash=git_hash,
+        )
+        self._state.completed_tasks.append(record)
+        self._touch()
+        logger.info(f"📒 Ledger 记录: [{task_id}] {target_file} → {git_hash or 'no-hash'}")
+        self.checkpoint()
 
     # --- Checkpoint 持久化 ---
 

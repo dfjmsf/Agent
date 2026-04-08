@@ -227,6 +227,75 @@ async def start_generation(req: GenerateReq, bg_tasks: BackgroundTasks):
     return {"status": "started", "message": "AstreaEngine Activated in Background Thread"}
 
 
+# ============================================================
+# PM Agent 对话端点 (Phase 2.1)
+# ============================================================
+
+from agents.pm import PMAgent, PMResponse
+from dataclasses import asdict
+
+_pm_instances: Dict[str, PMAgent] = {}
+
+def _get_pm_instance(project_id: str) -> PMAgent:
+    """获取或创建 PM Agent 实例（进程内缓存，按 project_id 隔离）"""
+    if project_id not in _pm_instances:
+        _pm_instances[project_id] = PMAgent(project_id)
+    return _pm_instances[project_id]
+
+class ChatReq(BaseModel):
+    message: str
+    project_id: str = "default_project"
+
+class ActionReq(BaseModel):
+    action: str  # "confirm" | "reject"
+    project_id: str = "default_project"
+
+@app.post("/api/chat")
+async def chat_with_pm(req: ChatReq):
+    """PM Agent 对话入口"""
+    pm = _get_pm_instance(req.project_id)
+    response = pm.chat(req.message)
+    return asdict(response)
+
+@app.post("/api/chat/action")
+async def chat_action(req: ActionReq):
+    """确定性按钮动作（confirm/reject，零 LLM 分类）"""
+    pm = _get_pm_instance(req.project_id)
+    response = pm.handle_action(req.action)
+
+    if response.is_executing:
+        # 从 PM 获取已确认的需求文本，启动 Engine
+        user_req = getattr(pm, 'confirmed_requirement', None) or "用户确认执行"
+        t = threading.Thread(
+            target=run_project_thread,
+            args=(user_req, None, req.project_id)
+        )
+        t.start()
+
+    return asdict(response)
+
+@app.get("/api/chat/history")
+async def chat_history(project_id: str, limit: int = 50):
+    """获取指定项目的 PM 对话历史（从 FTS5 加载）"""
+    pm = _get_pm_instance(project_id)
+    store = pm._get_store()
+    if not store:
+        return {"messages": []}
+    try:
+        records = store.get_recent(limit=limit)
+        messages = []
+        for r in records:
+            messages.append({
+                "role": "pm" if r["role"] == "pm" else "user",
+                "content": r["content"],
+                "round_id": r["round_id"],
+            })
+        return {"messages": messages}
+    except Exception as e:
+        logger.warning(f"⚠️ 加载对话历史失败: {e}")
+        return {"messages": []}
+
+
 class ResumeReq(BaseModel):
     project_id: str
 
@@ -469,15 +538,63 @@ async def git_init_api(req: GraduateReq):
     return {"status": "ok" if ok else "failed", "project_id": req.project_id}
 
 
+# --- 逆向扫描 API (Phase 1.3) ---
+
+class ScanReq(BaseModel):
+    project_id: str  # MVP: projects/ 下的项目 ID
+
+
+@app.post("/api/project/scan")
+async def scan_project_api(req: ScanReq):
+    """逆向扫描已有项目，生成 project_spec"""
+    from tools.project_scanner import ProjectScanner
+    from agents.manager import ManagerAgent
+
+    base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects", req.project_id)
+    if not os.path.isdir(base_dir):
+        return {"error": f"项目不存在: {req.project_id}"}
+
+    try:
+        # Step 1: 确定性扫描（零 LLM）
+        scanner = ProjectScanner(base_dir)
+        scan_result = scanner.scan()
+
+        # Step 2: LLM 合成（1 次调用）
+        manager = ManagerAgent(req.project_id)
+        spec = manager._generate_spec_from_scan(scan_result)
+
+        return {
+            "status": "ok",
+            "project_id": req.project_id,
+            "scan_summary": {
+                "tech_stack": scan_result.get("tech_stack", []),
+                "file_count": len(scan_result.get("files", [])),
+                "route_count": len(scan_result.get("routes", [])),
+                "model_count": len(scan_result.get("models", [])),
+                "entry": scan_result.get("entry", {}),
+                "config_files": scan_result.get("config_files", []),
+            },
+            "project_spec": spec,
+        }
+    except FileNotFoundError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        logger.error(f"逆向扫描异常: {e}")
+        return {"error": f"扫描失败: {str(e)}"}
+
+
 # --- 模型配置 API ---
 
-_AGENT_ROLES = ["MODEL_PLANNER", "MODEL_CODER", "MODEL_REVIEWER", "MODEL_SYNTHESIZER", "MODEL_AUDITOR"]
+_AGENT_ROLES = ["MODEL_PLANNER", "MODEL_CODER", "MODEL_REVIEWER", "MODEL_SYNTHESIZER", "MODEL_AUDITOR", "MODEL_PM", "MODEL_PLANNER_LITE", "MODEL_TECH_LEAD"]
 _ROLE_LABELS = {
     "MODEL_PLANNER": "规划师 (Manager)",
     "MODEL_CODER": "编码器 (Coder)",
     "MODEL_REVIEWER": "审查员 (Reviewer)",
     "MODEL_SYNTHESIZER": "综合器 (Synthesizer)",
     "MODEL_AUDITOR": "审计员 (Auditor)",
+    "MODEL_PM": "项目经理 (PM)",
+    "MODEL_PLANNER_LITE": "规划组 (PlannerLite)",
+    "MODEL_TECH_LEAD": "技术骨干 (TechLead)",
 }
 
 

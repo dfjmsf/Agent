@@ -199,7 +199,7 @@ class Observer:
             return []
 
         routes = []
-        # 遍历所有函数定义，检查装饰器
+        # 方式 1: 遍历所有函数定义，检查装饰器（@app.route / @router.get）
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -208,6 +208,30 @@ class Observer:
                 if route_info:
                     route_info["function"] = node.name
                     routes.append(route_info)
+
+        # 方式 2: 扫描 add_url_rule('/', 'name', func, methods=[...]) 调用
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Attribute) and func.attr == 'add_url_rule'):
+                continue
+            if not node.args or not isinstance(node.args[0], ast.Constant):
+                continue
+            path = node.args[0].value
+            method = "GET"
+            func_name = "?"
+            # 提取 methods 关键字参数
+            for kw in node.keywords:
+                if kw.arg == 'methods' and isinstance(kw.value, ast.List):
+                    methods = [e.value for e in kw.value.elts
+                               if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+                    if methods:
+                        method = methods[0].upper()
+            # 提取函数名（第 3 个位置参数）
+            if len(node.args) >= 3 and isinstance(node.args[2], ast.Name):
+                func_name = node.args[2].id
+            routes.append({"method": method, "path": path, "function": func_name})
 
         if routes:
             logger.info(f"🛤️ extract_routes({file_path}) → {len(routes)} 个路由")

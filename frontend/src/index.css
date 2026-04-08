@@ -1481,3 +1481,219 @@ body {
   color: var(--text-dim);
   flex-shrink: 0;
 }
+
+/* ============================================================
+   PM Chat — 对话组件样式
+   ============================================================ */
+
+.pm-chat {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  font-family: 'Inter', sans-serif;
+}
+
+.pm-chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.pm-msg {
+  display: flex;
+  gap: 10px;
+  max-width: 90%;
+  animation: pmFadeIn 0.3s ease;
+}
+
+@keyframes pmFadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.pm-msg-user {
+  align-self: flex-end;
+  flex-direction: row-reverse;
+}
+
+.pm-msg-pm {
+  align-self: flex-start;
+}
+
+.pm-msg-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  flex-shrink: 0;
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.pm-msg-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pm-msg-content {
+  padding: 10px 14px;
+  border-radius: 12px;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.pm-msg-pm .pm-msg-content {
+  background: rgba(57, 255, 20, 0.08);
+  border: 1px solid rgba(57, 255, 20, 0.15);
+  color: var(--text-primary);
+}
+
+.pm-msg-user .pm-msg-content {
+  background: rgba(100, 130, 255, 0.12);
+  border: 1px solid rgba(100, 130, 255, 0.2);
+  color: var(--text-primary);
+}
+
+/* plan.md 卡片 */
+.pm-plan-card {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(57, 255, 20, 0.12);
+  border-radius: 10px;
+  padding: 14px;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.pm-plan-md {
+  font-family: 'Inter', 'Noto Sans SC', monospace;
+  font-size: 12px;
+  line-height: 1.7;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  margin: 0;
+}
+
+/* 确定性按钮 */
+.pm-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.pm-action-btn {
+  padding: 8px 18px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  border: none;
+  font-family: 'Inter', sans-serif;
+}
+
+.pm-btn-primary {
+  background: linear-gradient(135deg, #39ff14 0%, #00e676 100%);
+  color: #0a0a0a;
+}
+
+.pm-btn-primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(57, 255, 20, 0.3);
+}
+
+.pm-btn-secondary {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-secondary);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.pm-btn-secondary:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.2);
+}
+
+/* 加载动画 */
+.pm-msg-loading {
+  display: flex;
+  gap: 5px;
+  padding: 12px 16px;
+}
+
+.pm-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(57, 255, 20, 0.5);
+  animation: pmBounce 1.2s infinite ease-in-out;
+}
+
+.pm-dot:nth-child(2) { animation-delay: 0.2s; }
+.pm-dot:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes pmBounce {
+  0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+  40% { transform: scale(1); opacity: 1; }
+}
+
+/* 输入区域 */
+.pm-chat-input-area {
+  display: flex;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  flex-shrink: 0;
+}
+
+.pm-chat-input {
+  flex: 1;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  padding: 10px 14px;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: 'Inter', sans-serif;
+  resize: none;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.pm-chat-input:focus {
+  border-color: rgba(57, 255, 20, 0.3);
+}
+
+.pm-chat-input::placeholder {
+  color: var(--text-dim);
+}
+
+.pm-send-btn {
+  padding: 10px 20px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, #39ff14 0%, #00e676 100%);
+  color: #0a0a0a;
+  font-weight: 600;
+  font-size: 13px;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-family: 'Inter', sans-serif;
+  align-self: flex-end;
+}
+
+.pm-send-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(57, 255, 20, 0.3);
+}
+
+.pm-send-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}

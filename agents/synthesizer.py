@@ -75,6 +75,11 @@ class SynthesizerAgent:
         if not content or content == "一次通过，无踩坑经验":
             logger.info(f"📝 Synthesizer: 一次通过无经验可提炼，跳过写入")
             return
+
+        # L2 反投毒硬阀门：超过 250 字的经验直接丢弃，宁丢勿毒
+        if len(content) > 250:
+            logger.warning(f"⚠️ Synthesizer L2 阀门: 经验过长 ({len(content)} 字)，丢弃防投毒")
+            return
         
         if scope not in ("global", "project"):
             logger.warning(f"⚠️ Synthesizer scope 非法: '{scope}'，降级为 'project'")

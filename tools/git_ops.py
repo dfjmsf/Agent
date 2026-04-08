@@ -110,6 +110,14 @@ def git_commit(project_dir: str, message: str) -> bool:
     return False
 
 
+def get_head_hash(project_dir: str) -> Optional[str]:
+    """获取当前 HEAD 的完整 commit hash（Phase 2.1 Task Ledger 用）"""
+    result = _run_git(project_dir, ["rev-parse", "HEAD"])
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip()
+    return None
+
+
 def git_log(project_dir: str, max_count: int = 30) -> List[Dict]:
     """获取 commit 历史"""
     if not is_git_repo(project_dir):

@@ -128,6 +128,34 @@ export async function updateModelConfig(config) {
   return res.json();
 }
 
+// --- PM Agent 对话 API ---
+
+export async function chatWithPM(message, projectId) {
+  const res = await fetch(`${API_BASE}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message, project_id: projectId })
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function chatAction(action, projectId) {
+  const res = await fetch(`${API_BASE}/api/chat/action`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action, project_id: projectId })
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function fetchChatHistory(projectId, limit = 50) {
+  const res = await fetch(`${API_BASE}/api/chat/history?project_id=${encodeURIComponent(projectId)}&limit=${limit}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
 /**
  * 根据文件名推断 Monaco Editor 的语言标识
  */

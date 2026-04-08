@@ -4,6 +4,7 @@ import { FolderTree, GitBranch, Settings, MessageSquare } from 'lucide-react';
 import FileExplorer from './FileExplorer';
 import GitPanel from './GitPanel';
 import ModelSettings from './ModelSettings';
+import PMChat from './PMChat';
 
 /**
  * LabWorkspace - 右侧实验室面板（Tab 式）
@@ -29,14 +30,7 @@ export default function LabWorkspace({ projectFiles, currentProjectId }) {
       case 'settings':
         return <ModelSettings />;
       case 'pm':
-        return (
-          <div className="lab-placeholder">
-            <MessageSquare size={48} color="#39ff14" strokeWidth={1} />
-            <h3>PM Agent Chat</h3>
-            <p>即将上线：自然语言对话、需求澄清、规划审批。</p>
-            <div className="lab-placeholder-tag">Phase D</div>
-          </div>
-        );
+        return <PMChat currentProjectId={currentProjectId} />;
       default:
         return null;
     }

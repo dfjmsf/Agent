@@ -211,9 +211,16 @@ class AstreaEngine:
                 # Git auto-commit（不阻塞交付）
                 try:
                     from tools.git_ops import git_commit
-                    git_commit(final_dir, f"ASTrea: 项目生成完成 ({self.project_id})")
+                    ledger_count = len(self.blackboard.state.completed_tasks)
+                    git_commit(final_dir, f"ASTrea: 项目交付完成 ({self.project_id}) [Ledger: {ledger_count} tasks]")
                 except Exception as e:
                     logger.warning(f"⚠️ Git auto-commit 失败（不影响交付）: {e}")
+
+                # Blackboard 持久化（Phase 2.1）
+                try:
+                    self.blackboard.state.save_to_disk(final_dir)
+                except Exception as e:
+                    logger.warning(f"⚠️ Blackboard 持久化失败: {e}")
             else:
                 self.blackboard.set_project_status(ProjectStatus.FAILED)
                 update_project_status(self.project_id, "failed")
@@ -341,6 +348,12 @@ class AstreaEngine:
                 git_commit(final_dir, f"ASTrea Patch: {user_requirement[:60]}")
             except Exception as e:
                 logger.warning(f"⚠️ Git auto-commit 失败（不影响交付）: {e}")
+
+            # Blackboard 持久化（Phase 2.1）
+            try:
+                self.blackboard.state.save_to_disk(final_dir)
+            except Exception as e:
+                logger.warning(f"⚠️ Blackboard 持久化失败: {e}")
         else:
             self.blackboard.set_project_status(ProjectStatus.FAILED)
             update_project_status(self.project_id, "failed")
@@ -808,7 +821,11 @@ class AstreaEngine:
                     task.log_error("骨架生成失败，降级为普通模式")
                     task.sub_tasks = []  # 清空 sub_tasks，走普通流程
 
-        feedback = None
+        # 如果 TechLead 注入了修复指令（跨文件打回），作为初始 feedback
+        feedback = task.tech_lead_feedback
+        if feedback:
+            logger.info(f"⚖️ [{task.task_id}] 使用 TechLead 修复指令: {feedback[:80]}...")
+            task.tech_lead_feedback = None  # 消费后清除，避免重复注入
 
         while True:
             # 优雅退出检查
@@ -927,6 +944,24 @@ class AstreaEngine:
                 self.blackboard.clear_draft(task.task_id)
                 self.blackboard.update_task_status(task.task_id, TaskStatus.DONE)
 
+                # Phase 2.1: 逐任务 Git commit + Ledger 记录
+                git_hash = None
+                if self.vfs:
+                    try:
+                        from tools.git_ops import git_commit, get_head_hash
+                        commit_msg = f"[{task.task_id}] {task.target_file}: {task.description[:60]}"
+                        git_commit(self.vfs.truth_dir, commit_msg)
+                        git_hash = get_head_hash(self.vfs.truth_dir)
+                    except Exception as e:
+                        logger.warning(f"⚠️ 逐任务 Git commit 失败: {e}")
+
+                self.blackboard.record_completed_task(
+                    task_id=task.task_id,
+                    target_file=task.target_file,
+                    description=task.description,
+                    git_hash=git_hash,
+                )
+
                 logger.info(f"🎉 [{task.task_id}] 审查通过，已 commit 到真理区")
                 return
             else:
@@ -945,6 +980,29 @@ class AstreaEngine:
                 task.log_error(f"Reviewer 驳回: {reviewer_feedback[:200]}")
                 self.blackboard.increment_retry(task.task_id)
                 feedback = reviewer_feedback
+
+                # === TechLead 跨文件冲突仲裁 ===
+                if task.retry_count >= 3 and not task.tech_lead_invoked:
+                    cross_file = self._detect_cross_file_conflict(reviewer_feedback)
+                    if cross_file:
+                        logger.info(f"⚖️ 检测到跨文件冲突: {task.target_file} ↔ {cross_file}，唤醒 TechLead")
+                        global_broadcaster.emit_sync("Engine", "tech_lead",
+                            f"⚖️ 唤醒技术骨干仲裁: {task.target_file} ↔ {cross_file}")
+                        verdict = self._invoke_tech_lead(task, cross_file, reviewer_feedback)
+                        task.tech_lead_invoked = True  # 无论成败，标记已唤醒
+
+                        if verdict:
+                            guilty = verdict["guilty_file"]
+                            if guilty != task.target_file:
+                                # 有罪文件不是当前 task → 打回有罪文件
+                                reopened = self._reopen_guilty_task(task, verdict)
+                                if reopened:
+                                    return  # 退出当前 task 循环，让 _phase_execution 重新调度
+                            else:
+                                # 有罪文件就是当前 task → 强化 feedback
+                                feedback = (verdict["fix_instruction"]
+                                            + "\n\n原始审查: " + reviewer_feedback)
+
                 logger.warning(f"🔨 [{task.task_id}] 审查未通过 "
                                f"(retry {task.retry_count}/{MAX_RETRIES})")
 
@@ -975,8 +1033,8 @@ class AstreaEngine:
 
             # 精准依赖分析（传递闭包 + AST import + 兜底）
             dep_files = self._resolve_smart_deps(task, existing_code)
+            context_parts = []
             if dep_files:
-                context_parts = []
                 for dep_path in dep_files:
                     skeleton = obs.get_skeleton(dep_path)
                     if skeleton and "Error" not in skeleton:
@@ -986,8 +1044,20 @@ class AstreaEngine:
                         if content and "Error" not in content:
                             preview = content[:800] + "\n...[省略]" if len(content) > 800 else content
                             context_parts.append(f"--- [依赖文件: {dep_path}] ---\n{preview}\n")
-                observer_context = "".join(context_parts)
                 logger.info(f"📐 精准依赖注入: {dep_files}")
+
+            # (2.5) 前端文件：动态注入路由上下文
+            FRONTEND_EXTS = {'.html', '.htm', '.vue', '.svelte', '.jsx', '.tsx'}
+            target_ext = os.path.splitext(task.target_file)[1].lower()
+            if target_ext in FRONTEND_EXTS:
+                routes_file = self._find_routes_file_in_tasks(obs)
+                if routes_file and routes_file not in (dep_files or []):
+                    skeleton = obs.get_skeleton(routes_file)
+                    if skeleton and "Error" not in skeleton:
+                        context_parts.append(f"--- [路由文件骨架: {routes_file}] ---\n{skeleton}\n")
+                        logger.info(f"🛤️ 前端路由注入: {routes_file}")
+
+            observer_context = "".join(context_parts)
         except Exception as e:
             logger.warning(f"⚠️ Observer 预取异常: {e}")
 
@@ -996,6 +1066,30 @@ class AstreaEngine:
         _pb_loader = PlaybookLoader()
         _tech_stack = (self.blackboard.state.project_spec or {}).get("tech_stack", [])
         playbook_content = _pb_loader.load_for_coder(_tech_stack, task.target_file)
+
+        # (3.5) P0.5: 嗅探用户项目潜规则文件（零噪音：无文件则为空字符串）
+        user_rules_block = ""
+        if self.vfs:
+            for rule_name in (".astrea.md", ".cursorrules", "CLAUDE.md"):
+                rule_path = os.path.join(self.vfs.truth_dir, rule_name)
+                if os.path.isfile(rule_path):
+                    try:
+                        with open(rule_path, "r", encoding="utf-8") as f:
+                            rules_content = f.read().strip()
+                        if rules_content:
+                            user_rules_block = (
+                                "\n═══════════════════════════════════════════\n"
+                                "【P0.5 — 用户的项目专属潜规则（User Project Rules）】\n"
+                                "═══════════════════════════════════════════\n\n"
+                                "[重要指令]: 以下是主人为本项目订制的特例规则，"
+                                "优先级凌驾于所有 Playbook 最佳实践之上！\n"
+                                "如果在技术实现时遇到冲突，请完全服从本规则。\n\n"
+                                f"{rules_content}\n\n"
+                            )
+                            logger.info(f"📜 P0.5 潜规则加载: {rule_name} ({len(rules_content)} chars)")
+                            break  # 只取第一个命中的
+                    except Exception as e:
+                        logger.warning(f"⚠️ P0.5 潜规则读取失败: {e}")
 
         # (4) 构建 task_meta
         tasks_dict = [
@@ -1012,17 +1106,44 @@ class AstreaEngine:
             "playbook": playbook_content,
             # Phase 0.3: 全局快照
             "global_snapshot": self.blackboard.get_global_snapshot_text(),
+            # 重试次数（Coder 根据此决定是否跳过 Editor 模式）
+            "retry_count": task.retry_count,
+            # P0.5: 用户项目潜规则（空字符串 = 无规则，零噪音）
+            "user_rules_block": user_rules_block,
         }
 
+        # (4.1) 前端文件：构建路由清单并注入 observer_context
+        FRONTEND_EXTS = {'.html', '.htm', '.vue', '.svelte', '.jsx', '.tsx'}
+        target_ext = os.path.splitext(task.target_file)[1].lower()
+        if target_ext in FRONTEND_EXTS:
+            try:
+                from tools.observer import Observer
+                obs = Observer(self.vfs.truth_dir if self.vfs else ".")
+                route_manifest = self._build_route_manifest(obs)
+                if route_manifest:
+                    task_meta["observer_context"] += (
+                        "\n\n--- [⚠️ 可用路由清单（禁止使用清单外的 URL）] ---\n"
+                        + route_manifest + "\n"
+                    )
+                    logger.info(f"🛤️ 路由清单注入: {len(route_manifest.splitlines())} 条路由")
+            except Exception as e:
+                logger.warning(f"⚠️ 路由清单构建异常: {e}")
+
         # (4.5) 如果是 fill 阶段，注入骨架代码
+        #   但如果已经重试 >= 2 次，说明骨架本身可能不完整（如缺少路由），
+        #   此时关闭 fill 约束，让 Coder 自由发挥
         if task.sub_tasks and task.current_sub_task_index >= 1:
-            skeleton_code = ""
-            if self.vfs:
-                skeleton_code = self.vfs.read_truth(task.target_file) or ""
-            if skeleton_code:
-                task_meta["skeleton_code"] = skeleton_code
-                task_meta["is_fill_mode"] = True
-                logger.info(f"🔧 [{task.task_id}] Fill 模式: 注入骨架 {len(skeleton_code)} chars")
+            if task.retry_count >= 2:
+                logger.info(f"🔓 [{task.task_id}] 重试 {task.retry_count} 次，解除骨架约束（退出 Fill 模式）")
+                task.sub_tasks = []  # 清空 sub_tasks → 后续不再走 fill 模式
+            else:
+                skeleton_code = ""
+                if self.vfs:
+                    skeleton_code = self.vfs.read_truth(task.target_file) or ""
+                if skeleton_code:
+                    task_meta["skeleton_code"] = skeleton_code
+                    task_meta["is_fill_mode"] = True
+                    logger.info(f"🔧 [{task.task_id}] Fill 模式: 注入骨架 {len(skeleton_code)} chars")
 
         # (5) 调用 Coder
         try:
@@ -1122,6 +1243,54 @@ class AstreaEngine:
             logger.error(f"❌ 骨架生成异常: {e}")
             return ""
 
+    def _find_routes_file_in_tasks(self, obs) -> Optional[str]:
+        """动态发现路由文件：从当前任务列表中找含路由定义的 .py 文件"""
+        # 先检查常见文件名
+        ROUTE_BASENAMES = {'routes.py', 'views.py', 'urls.py', 'main.py', 'app.py'}
+        for task in self.blackboard.state.tasks:
+            basename = os.path.basename(task.target_file).lower()
+            if basename in ROUTE_BASENAMES:
+                routes = obs.extract_routes(task.target_file)
+                if routes:
+                    return task.target_file
+        return None
+
+    def _build_route_manifest(self, obs) -> str:
+        """构建可用路由清单文本（供 Coder prompt 消费）。
+        优先级：page_routes 契约 > global_routes > 真理区扫描。
+        纯前端项目 → 返回空字符串 → 不产生约束。"""
+        all_routes = []
+        # 来源 0: page_routes 契约（最权威，来自项目规划书）
+        try:
+            spec = json.loads(self.blackboard.state.spec_text or "{}")
+            for r in spec.get("page_routes", []):
+                entry = f"{r.get('method','?')} {r.get('path','?')} → {r.get('function','?')}"
+                if r.get("renders"):
+                    entry += f" → renders {r['renders']}"
+                all_routes.append(entry)
+        except Exception:
+            pass
+        if all_routes:
+            return "\n".join(all_routes)
+        # 来源 1: global_routes（已提交到真理区的路由）
+        for file_path, routes in self.blackboard.state.global_routes.items():
+            for r in routes:
+                entry = f"{r['method']} {r['path']} → {r.get('function', '?')}"
+                if entry not in all_routes:
+                    all_routes.append(entry)
+        # 来源 2: 真理区扫描（补充 global_routes 未覆盖的）
+        if self.vfs and not all_routes:
+            for f in self.vfs.list_truth_files():
+                if f.endswith('.py'):
+                    routes = obs.extract_routes(f)
+                    for r in routes:
+                        entry = f"{r['method']} {r['path']} → {r.get('function', '?')}"
+                        if entry not in all_routes:
+                            all_routes.append(entry)
+        if not all_routes:
+            return ""
+        return "\n".join(all_routes)
+
     def _resolve_smart_deps(self, task: TaskItem, existing_code: str = "") -> list:
         """
         三级精准依赖解析（零 LLM 成本）：
@@ -1216,16 +1385,18 @@ class AstreaEngine:
         reviewer = self._get_reviewer()
         sandbox_dir = self.vfs.sandbox_dir if self.vfs else None
         
-        # 从规划书中提取 module_interfaces 契约
+        # 从规划书中提取 module_interfaces 契约 + 完整 spec
         module_interfaces = None
+        project_spec = None
         try:
             spec = self.blackboard.state.project_spec
             if isinstance(spec, dict):
                 module_interfaces = spec.get("module_interfaces")
+                project_spec = spec
             elif isinstance(spec, str):
-                import json
                 spec_dict = json.loads(spec)
                 module_interfaces = spec_dict.get("module_interfaces")
+                project_spec = spec_dict
         except Exception:
             pass
         
@@ -1233,7 +1404,8 @@ class AstreaEngine:
             return reviewer.evaluate_draft(task.target_file, task.description,
                                            code_content=merged_code,
                                            sandbox_dir=sandbox_dir,
-                                           module_interfaces=module_interfaces)
+                                           module_interfaces=module_interfaces,
+                                           project_spec=project_spec)
         except Exception as e:
             err_msg = str(e)
             if 'interpreter shutdown' in err_msg or 'Event loop is closed' in err_msg:
@@ -1243,6 +1415,116 @@ class AstreaEngine:
             logger.error(f"❌ Reviewer 调用异常: {e}")
             task.log_error(f"Reviewer 异常: {e}")
             return False, f"Reviewer 执行异常: {e}"
+
+    # ============================================================
+    # TechLead 跨文件仲裁
+    # ============================================================
+
+    @staticmethod
+    def _detect_cross_file_conflict(feedback: str) -> Optional[str]:
+        """从 Reviewer L0.6 反馈中提取 [CROSS_FILE:xxx] 标签"""
+        import re
+        m = re.search(r'\[CROSS_FILE:(.*?)\]', feedback)
+        return m.group(1) if m else None
+
+    def _invoke_tech_lead(self, task: TaskItem, conflict_file: str,
+                          l06_error: str) -> Optional[dict]:
+        """
+        唤醒 TechLead 进行跨文件冲突仲裁。
+
+        可控性约束：
+        - 只读取冲突双方文件，不写任何文件
+        - 代码截断 3000 字符，防 token 爆炸
+        - 失败返回 None，不影响正常流程
+        """
+        try:
+            from agents.tech_lead import TechLeadAgent
+            tech_lead = TechLeadAgent()
+
+            # 读取冲突的对方文件
+            conflict_code = ""
+            if self.vfs:
+                conflict_code = self.vfs.read_truth(conflict_file) or ""
+            if not conflict_code:
+                # 尝试从沙盒读取
+                sandbox_path = os.path.join(self.vfs.sandbox_dir, conflict_file) if self.vfs else ""
+                if sandbox_path and os.path.exists(sandbox_path):
+                    with open(sandbox_path, 'r', encoding='utf-8') as f:
+                        conflict_code = f.read()
+
+            if not conflict_code:
+                logger.warning(f"⚠️ TechLead: 无法读取冲突文件 {conflict_file}，跳过仲裁")
+                return None
+
+            # 当前任务文件的最新代码
+            current_code = task.code_draft or ""
+            if self.vfs:
+                current_code = self.vfs.read_truth(task.target_file) or current_code
+
+            # 获取用户需求
+            user_req = self.blackboard.state.user_requirement or ""
+
+            verdict = tech_lead.arbitrate(
+                current_file=task.target_file,
+                current_code=current_code,
+                conflict_file=conflict_file,
+                conflict_code=conflict_code,
+                l06_error=l06_error,
+                user_requirement=user_req,
+            )
+            return verdict
+
+        except Exception as e:
+            logger.error(f"❌ TechLead 仲裁失败: {e}")
+            return None
+
+    def _reopen_guilty_task(self, blocked_task: TaskItem, verdict: dict) -> bool:
+        """
+        将有罪文件的 task 状态回滚为 REJECTED，注入 TechLead 修复指令。
+
+        可控性约束：
+        - 两个 task 的 retry_count 都重置为 0（给全新机会）
+        - 被阻塞的 task 恢复为 TODO（等有罪 task 修完后重新调度）
+        """
+        guilty_file = verdict["guilty_file"]
+        guilty_task = self.blackboard.find_task_by_file(guilty_file)
+
+        if not guilty_task:
+            logger.warning(f"⚠️ TechLead 判定 {guilty_file} 有罪，但找不到对应 task")
+            return False
+
+        if guilty_task.status != TaskStatus.DONE:
+            logger.warning(f"⚠️ TechLead 判定 {guilty_file} 有罪，但该 task 状态为 {guilty_task.status}（非 DONE）")
+            return False
+
+        logger.info(
+            f"⚖️ TechLead 仲裁: 打回 {guilty_file} (原因: {verdict.get('reasoning', '无')[:60]})"
+        )
+        global_broadcaster.emit_sync("Engine", "tech_lead_reopen",
+            f"⚖️ 打回有罪文件: {guilty_file}", {"guilty": guilty_file, "blocked": blocked_task.target_file})
+
+        # 1. 有罪 task → TODO + 注入 fix_instruction + 重置计数
+        #    必须是 TODO 才能被 get_next_runnable_task() 拾取
+        self.blackboard.update_task_status(guilty_task.task_id, TaskStatus.TODO)
+        guilty_task.retry_count = 0
+        guilty_task.tech_lead_feedback = verdict["fix_instruction"]
+        guilty_task.tech_lead_invoked = True  # 有罪 task 也标记，防止二次仲裁
+
+        # 2. 被阻塞 task → TODO + 重置计数
+        self.blackboard.update_task_status(blocked_task.task_id, TaskStatus.TODO)
+        blocked_task.retry_count = 0
+
+        # 3. 调整任务顺序：将有罪 task 移到被阻塞 task 之前
+        #    保证 get_next_runnable_task() 先拾取有罪 task
+        tasks = self.blackboard.state.tasks
+        guilty_idx = next((i for i, t in enumerate(tasks) if t.task_id == guilty_task.task_id), None)
+        blocked_idx = next((i for i, t in enumerate(tasks) if t.task_id == blocked_task.task_id), None)
+        if guilty_idx is not None and blocked_idx is not None and guilty_idx > blocked_idx:
+            tasks.insert(blocked_idx, tasks.pop(guilty_idx))
+            logger.info(f"⚖️ 任务顺序调整: {guilty_task.task_id} 移到 {blocked_task.task_id} 之前")
+
+        logger.info(f"⚖️ {guilty_task.task_id} → TODO (retry=0), {blocked_task.task_id} → TODO (retry=0)")
+        return True
 
     # ============================================================
     # Phase 3: 结算

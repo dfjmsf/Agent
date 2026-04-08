@@ -108,6 +108,100 @@ class ManagerAgent:
             logger.error(f"规划书生成异常: {e}")
             return {}
 
+    def _generate_spec_from_scan(self, scan_result: dict) -> dict:
+        """
+        Phase 1.3: 从 ProjectScanner 的确定性扫描结果生成 project_spec。
+        LLM 只负责填空 10%：module_graph, naming_conventions, key_decisions。
+        """
+        logger.info("📋 Manager 正在从扫描结果合成项目规划书...")
+        global_broadcaster.emit_sync("Manager", "spec_from_scan_start",
+            "🔍 正在从扫描结果合成项目规划书...")
+
+        # 构造扫描摘要（控制 Token，不注入全部骨架）
+        scan_summary_parts = []
+        scan_summary_parts.append(f"技术栈: {', '.join(scan_result.get('tech_stack', []))}")
+        scan_summary_parts.append(f"文件列表: {', '.join(scan_result.get('files', []))}")
+
+        entry = scan_result.get("entry", {})
+        if entry.get("file"):
+            scan_summary_parts.append(
+                f"入口文件: {entry['file']} (端口: {entry.get('port', '未知')}, "
+                f"框架: {entry.get('framework', '未知')})"
+            )
+
+        # 路由
+        routes = scan_result.get("routes", [])
+        if routes:
+            routes_text = "\n".join(
+                f"  {r['method']} {r['path']} → {r.get('function', '?')} ({r.get('file', '?')})"
+                for r in routes
+            )
+            scan_summary_parts.append(f"路由:\n{routes_text}")
+        else:
+            scan_summary_parts.append("路由: 未通过装饰器检测到（可能使用 add_url_rule 或其他模式，请从骨架推断）")
+
+        # 模型
+        models = scan_result.get("models", [])
+        if models:
+            models_text = "\n".join(
+                f"  {m['name']} ({m.get('file', '?')}): {', '.join(m.get('fields', []))}"
+                + (f" [表: {m['table']}]" if m.get('table') else "")
+                for m in models
+            )
+            scan_summary_parts.append(f"数据模型:\n{models_text}")
+
+        # 骨架（只注入关键骨架，控制 Token）
+        skeletons = scan_result.get("skeletons", {})
+        if skeletons:
+            skeleton_text = "\n\n".join(
+                f"--- {path} ---\n{skel[:800]}" + ("..." if len(skel) > 800 else "")
+                for path, skel in list(skeletons.items())[:10]  # 最多 10 个文件
+            )
+            scan_summary_parts.append(f"代码骨架:\n{skeleton_text}")
+
+        scan_summary = "\n\n".join(scan_summary_parts)
+
+        # 关键文件全文
+        key_files = scan_result.get("key_files_code", {})
+        key_files_text = "\n\n".join(
+            f"=== {path} ===\n{code}"
+            for path, code in key_files.items()
+        ) if key_files else "无关键文件全文"
+
+        system_prompt = Prompts.MANAGER_SPEC_FROM_SCAN_SYSTEM.format(
+            scan_summary=scan_summary,
+            key_files_code=key_files_text,
+        )
+        user_prompt = "请根据扫描结果生成项目规划书 JSON。"
+
+        try:
+            raw_response = self.llm_client.chat_completion(
+                enable_thinking=False,
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ]
+            )
+            json_str = raw_response.content
+            if "```json" in json_str:
+                json_str = json_str.split("```json")[1].split("```")[0].strip()
+            elif "```" in json_str:
+                json_str = json_str.split("```")[1].split("```")[0].strip()
+
+            spec = json.loads(json_str)
+            logger.info(f"✅ 逆向规划书合成完毕: {spec.get('project_name', '?')}")
+            global_broadcaster.emit_sync("Manager", "spec_from_scan_done",
+                f"✅ 逆向规划书合成完毕: {spec.get('project_name', '?')}", {"spec": spec})
+            return spec
+
+        except json.JSONDecodeError as e:
+            logger.error(f"逆向规划书 JSON 解析失败: {e}")
+            return {}
+        except Exception as e:
+            logger.error(f"逆向规划书合成异常: {e}")
+            return {}
+
     def plan_tasks(self, user_requirement: str, project_spec: dict = None,
                    manager_playbook: str = "", complex_files_hint: str = "") -> dict:
         """
