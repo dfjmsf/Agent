@@ -26,6 +26,7 @@ class CoderAgent:
         self.model = os.getenv("MODEL_CODER", "qwen3-coder-plus")
         self.project_id = project_id
         self._last_recalled_ids: List[int] = []  # 最近一次 recall 的记忆 IDs
+        self._last_coder_mode: str = "unknown"  # "create" | "editor" | "fallback_rewrite"
 
     # --- 前端文件后缀集合 ---
     FRONTEND_EXTENSIONS = {'.html', '.htm', '.css', '.js', '.jsx', '.ts', '.tsx', '.vue', '.svelte'}
@@ -284,6 +285,7 @@ class CoderAgent:
                             patched_code = self._apply_edits_in_memory(existing_code, edits)
                             if patched_code is not None:
                                 logger.info(f"🔧 [Editor] 差量编辑成功")
+                                self._last_coder_mode = "editor"
                                 global_broadcaster.emit_sync("Coder", "edit_done", f"差量修复完成", {"code": patched_code})
                                 return patched_code
                             else:
@@ -293,6 +295,7 @@ class CoderAgent:
 
         # Fallback: 基于现有代码的保守覆写
         logger.warning(f"⚠️ [Editor] Fallback 保守覆写模式")
+        self._last_coder_mode = "fallback_rewrite"
         return self._fallback_full_rewrite(
             target_file, description, feedback,
             existing_code=existing_code,
@@ -463,42 +466,47 @@ class CoderAgent:
         else:
             mode = "首次生成"
             edit_instruction = None
+            self._last_coder_mode = "create"
         
         logger.info(f"💻 Coder 正在编码... 目标文件: {target_file}, 模式: {mode}")
         global_broadcaster.emit_sync("Coder", "coding_start", f"[{mode}] 正在为 {target_file} 编写代码", {"target": target_file})
         
         if edit_instruction:
             ext = os.path.splitext(target_file)[1].lower()
-            if ext in self.FRONTEND_EXTENSIONS:
-                # 前端文件直接全量覆写（Editor search/replace 对 CSS/JS 匹配率极低）
-                logger.info(f"🎨 [前端] 跳过 Editor 模式，直接全量覆写: {target_file}")
-                fix_hint = self._build_fix_hint(target_file, description, observer_context)
+            retry_count = (task_meta or {}).get("retry_count", 0)
+            fix_hint = self._build_fix_hint(target_file, description, observer_context)
+
+            # 重试 3+ 次时，Editor 差量编辑容易"修一个破一个"
+            # 直接走全量重写，给 Coder 一个干净的全局视角
+            if retry_count >= 3:
+                logger.info(f"🔄 [重试{retry_count}] 跳过 Editor，直接全量重写: {target_file}")
+                self._last_coder_mode = "fallback_rewrite"
                 result = self._fallback_full_rewrite(
                     target_file, description, edit_instruction,
                     existing_code=existing_code,
                     observer_context=observer_context,
                     memory_hint=fix_hint, task_meta=task_meta
                 )
+            elif ext in self.FRONTEND_EXTENSIONS and task_meta and task_meta.get("ast_slice"):
+                # 前端 + AST 切片就位 → Editor 靶向修复（最优路径）
+                ast_slice = task_meta["ast_slice"]
+                logger.info(
+                    f"🔬 [前端+AST] 启用 Editor 靶向修复: {target_file} "
+                    f"→ {ast_slice['name']} L{ast_slice['start_line']}-{ast_slice['end_line']}"
+                )
+                result = self._fix_with_editor(
+                    target_file, description, edit_instruction,
+                    existing_code=existing_code,
+                    memory_hint=fix_hint, task_meta=task_meta
+                )
             else:
-                # 后端文件：精简记忆 + Editor 差量编辑
-                retry_count = (task_meta or {}).get("retry_count", 0)
-                fix_hint = self._build_fix_hint(target_file, description, observer_context)
-                if retry_count >= 3:
-                    # 重试 3+ 次时，Editor 差量编辑容易"修一个破一个"
-                    # 直接走全量重写，给 Coder 一个干净的全局视角
-                    logger.info(f"🔄 [重试{retry_count}] 跳过 Editor，直接全量重写: {target_file}")
-                    result = self._fallback_full_rewrite(
-                        target_file, description, edit_instruction,
-                        existing_code=existing_code,
-                        observer_context=observer_context,
-                        memory_hint=fix_hint, task_meta=task_meta
-                    )
-                else:
-                    result = self._fix_with_editor(
-                        target_file, description, edit_instruction,
-                        existing_code=existing_code,
-                        memory_hint=fix_hint, task_meta=task_meta
-                    )
+                # 通用路径：前端无 AST 切片 / 后端文件 → 默认走 Editor 差量编辑
+                logger.info(f"✏️ [Editor] 差量编辑: {target_file}")
+                result = self._fix_with_editor(
+                    target_file, description, edit_instruction,
+                    existing_code=existing_code,
+                    memory_hint=fix_hint, task_meta=task_meta
+                )
         else:
             # 首次生成
             is_fill = (task_meta or {}).get("is_fill_mode", False)

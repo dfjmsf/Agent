@@ -142,98 +142,76 @@ class AstreaEngine:
             self._reviewer = ReviewerAgent(self.project_id)
         return self._reviewer
 
+    def _next_round_number(self) -> int:
+        """从 Git 历史中扫描已有的最大 Round 编号，返回 N+1。无历史则返回 1。"""
+        import subprocess
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "projects", self.project_id))
+        git_dir = os.path.join(base_dir, ".git")
+        if not os.path.isdir(git_dir):
+            return 1
+        try:
+            result = subprocess.run(
+                ["git", "log", "--max-count=50", "--format=%s"],
+                cwd=base_dir, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+            )
+            if result.returncode != 0 or not result.stdout:
+                return 1
+            max_round = 0
+            for line in result.stdout.strip().split('\n'):
+                m = re.search(r"\[Round (\d+)\]", line)
+                if m:
+                    max_round = max(max_round, int(m.group(1)))
+            return max_round + 1
+        except Exception:
+            return 1
+
     # ============================================================
     # 主入口
     # ============================================================
 
-    def run(self, user_requirement: str, out_dir: str = None) -> Tuple[bool, str]:
+    def run(self, user_requirement: str, out_dir: str = None, mode: str = "auto") -> Tuple[bool, str]:
         """
         主入口：用户需求 → 完整项目
 
         Args:
             user_requirement: 用户需求文本
             out_dir: 可选指定输出目录
+            mode: "auto" | "create" | "patch" | "rollback"
 
         Returns:
             (success, final_dir)
         """
-        logger.info(f"🚀 AstreaEngine 启动: {self.project_id}")
+        # 生成本次执行的全局批次/轮次标记 (递增数字 Round ID)
+        self.session_id = str(self._next_round_number())
+        logger.info(f"🚀 AstreaEngine 启动: {self.project_id} (mode={mode}, Round={self.session_id})")
 
         # 记录用户需求
         self.blackboard.state.user_requirement = user_requirement
         append_event("user", "prompt", user_requirement, project_id=self.project_id)
         create_project_meta(self.project_id)
-        global_broadcaster.emit_sync("System", "start_project", "AstreaEngine 启动...")
+        global_broadcaster.emit_sync("System", "start_project", f"AstreaEngine 启动 (mode={mode}, Round={self.session_id})...")
+
+        # mode 决策
+        if mode == "auto":
+            if self._is_existing_project():
+                mode = "patch"
+                logger.info("🔄 auto → patch（检测到已有项目）")
+            else:
+                mode = "create"
+                logger.info("🆕 auto → create（新项目）")
 
         try:
-            if self._is_existing_project():
+            if mode == "create":
+                return self._run_create_mode(user_requirement, out_dir)
+            elif mode == "patch":
                 return self._run_patch_mode(user_requirement)
-
-            # Phase 1: 规划（含重命名 + sandbox 预热，与 plan_tasks 并行）
-            self._phase_planning(user_requirement, out_dir=out_dir)
-
-            # 输出目录已在 _phase_planning 中设置
-            final_dir = self.blackboard.state.out_dir
-
-            # 防御：规划阶段未产出任何任务 → 直接失败（通常是网络异常）
-            if not self.blackboard.state.tasks:
-                logger.error("💥 规划阶段未生成任何任务，项目失败")
-                self.blackboard.set_project_status(ProjectStatus.FAILED)
-                update_project_status(self.project_id, "failed")
-                global_broadcaster.emit_sync("System", "error", "💥 规划失败：未生成任何任务（可能是网络异常）")
-                return False, out_dir or ""
-
-            # Phase 2: 执行
-            self.blackboard.set_project_status(ProjectStatus.EXECUTING)
-            success = self._phase_execution()
-
-            # Phase 2.5: 集成测试
-            if success and self._needs_integration_test():
-                integration_ok = self._phase_integration_test()
-                if not integration_ok:
-                    # 回 Manager 做 mini re-plan 后精确重试
-                    success = self._retry_from_integration()
-                    if success:
-                        integration_ok = self._phase_integration_test()
-                    if not integration_ok:
-                        logger.warning("⚠️ 确定性集成测试 2 次未通过，降级为警告交付")
-                        global_broadcaster.emit_sync("System", "integration_warning", "⚠️ 集成测试未完全通过，降级为警告交付")
-                        success = True
-
-            # Phase 3: 结算
-            if success:
-                self.blackboard.set_project_status(ProjectStatus.COMPLETED)
-                update_project_status(self.project_id, "success")
-                logger.info(f"✨ 项目交付完成: {final_dir}")
-                global_broadcaster.emit_sync("System", "success",
-                    f"✨ 项目完美生成！{final_dir}", {"final_path": final_dir})
-
-                # Git auto-commit（不阻塞交付）
-                try:
-                    from tools.git_ops import git_commit
-                    ledger_count = len(self.blackboard.state.completed_tasks)
-                    git_commit(final_dir, f"ASTrea: 项目交付完成 ({self.project_id}) [Ledger: {ledger_count} tasks]")
-                except Exception as e:
-                    logger.warning(f"⚠️ Git auto-commit 失败（不影响交付）: {e}")
-
-                # Blackboard 持久化（Phase 2.1）
-                try:
-                    self.blackboard.state.save_to_disk(final_dir)
-                except Exception as e:
-                    logger.warning(f"⚠️ Blackboard 持久化失败: {e}")
+            elif mode == "rollback":
+                return self._run_rollback_mode(user_requirement)
             else:
-                self.blackboard.set_project_status(ProjectStatus.FAILED)
-                update_project_status(self.project_id, "failed")
-                global_broadcaster.emit_sync("System", "error", "💥 项目存在熔断任务")
-
-            # 后台异步结算
-            self._phase_settlement(user_requirement, success)
-
-            # 清理 checkpoint
-            self.blackboard.delete_checkpoint()
-            self.vfs.clean_sandbox()
-
-            return success, final_dir
+                logger.warning(f"⚠️ 未知 mode '{mode}'，降级为 auto")
+                if self._is_existing_project():
+                    return self._run_patch_mode(user_requirement)
+                return self._run_create_mode(user_requirement, out_dir)
 
         except Exception as e:
             logger.error(f"❌ AstreaEngine 异常: {e}")
@@ -242,6 +220,76 @@ class AstreaEngine:
             self.blackboard.set_project_status(ProjectStatus.FAILED)
             update_project_status(self.project_id, "failed")
             return False, out_dir or ""
+
+    def _run_create_mode(self, user_requirement: str, out_dir: str = None) -> Tuple[bool, str]:
+        """Create 模式：全量新建项目"""
+        logger.info("🆕 Create Mode 启动")
+
+        # Phase 1: 规划（含重命名 + sandbox 预热，与 plan_tasks 并行）
+        self._phase_planning(user_requirement, out_dir=out_dir)
+
+        # 输出目录已在 _phase_planning 中设置
+        final_dir = self.blackboard.state.out_dir
+
+        # 防御：规划阶段未产出任何任务 → 直接失败（通常是网络异常）
+        if not self.blackboard.state.tasks:
+            logger.error("💥 规划阶段未生成任何任务，项目失败")
+            self.blackboard.set_project_status(ProjectStatus.FAILED)
+            update_project_status(self.project_id, "failed")
+            global_broadcaster.emit_sync("System", "error", "💥 规划失败：未生成任何任务（可能是网络异常）")
+            return False, out_dir or ""
+
+        # Phase 2: 执行
+        self.blackboard.set_project_status(ProjectStatus.EXECUTING)
+        success = self._phase_execution()
+
+        # Phase 2.5: 集成测试
+        if success and self._needs_integration_test():
+            integration_ok = self._phase_integration_test()
+            if not integration_ok:
+                # 回 Manager 做 mini re-plan 后精确重试
+                success = self._retry_from_integration()
+                if success:
+                    integration_ok = self._phase_integration_test()
+                if not integration_ok:
+                    logger.warning("⚠️ 确定性集成测试 2 次未通过，降级为警告交付")
+                    global_broadcaster.emit_sync("System", "integration_warning", "⚠️ 集成测试未完全通过，降级为警告交付")
+                    success = True
+
+        # Phase 3: 结算
+        if success:
+            self.blackboard.set_project_status(ProjectStatus.COMPLETED)
+            update_project_status(self.project_id, "success")
+            logger.info(f"✨ 项目交付完成: {final_dir}")
+            global_broadcaster.emit_sync("System", "success",
+                f"✨ 项目完美生成！{final_dir}", {"final_path": final_dir})
+
+            # Git auto-commit（不阻塞交付）
+            try:
+                from tools.git_ops import git_commit
+                ledger_count = len(self.blackboard.state.completed_tasks)
+                git_commit(final_dir, f"ASTrea: 项目交付完成 ({self.project_id}) [Ledger: {ledger_count} tasks]")
+            except Exception as e:
+                logger.warning(f"⚠️ Git auto-commit 失败（不影响交付）: {e}")
+
+            # Blackboard 持久化（Phase 2.1）
+            try:
+                self.blackboard.state.save_to_disk(final_dir)
+            except Exception as e:
+                logger.warning(f"⚠️ Blackboard 持久化失败: {e}")
+        else:
+            self.blackboard.set_project_status(ProjectStatus.FAILED)
+            update_project_status(self.project_id, "failed")
+            global_broadcaster.emit_sync("System", "error", "💥 项目存在熔断任务")
+
+        # 后台异步结算
+        self._phase_settlement(user_requirement, success)
+
+        # 清理 checkpoint
+        self.blackboard.delete_checkpoint()
+        self.vfs.clean_sandbox()
+
+        return success, final_dir
 
     @classmethod
     def resume(cls, project_id: str) -> Optional['AstreaEngine']:
@@ -256,7 +304,8 @@ class AstreaEngine:
         engine._manager = None
         engine._coder = None
         engine._reviewer = None
-        logger.info(f"🔄 AstreaEngine 从 Checkpoint 恢复: {project_id}")
+        engine.session_id = str(engine._next_round_number())
+        logger.info(f"🔄 AstreaEngine 从 Checkpoint 恢复: {project_id} (Round={engine.session_id})")
         return engine
 
     # ============================================================
@@ -370,6 +419,177 @@ class AstreaEngine:
         return success, final_dir
 
     # ============================================================
+    # Rollback Mode: 版本回退
+    # ============================================================
+
+    def _run_rollback_mode(self, user_requirement: str) -> Tuple[bool, str]:
+        """
+        Rollback 模式：从 git log 中定位 commit，执行 git revert。
+        """
+        logger.info(f"⏪ Rollback Mode 启动: {self.project_id}")
+        global_broadcaster.emit_sync("System", "start_project", f"⏪ Rollback Mode: {self.project_id}")
+
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "projects", self.project_id))
+        git_dir = os.path.join(base_dir, ".git")
+
+        if not os.path.isdir(git_dir):
+            logger.error("💥 [Rollback] 项目没有 Git 仓库，无法回滚")
+            global_broadcaster.emit_sync("System", "error", "💥 项目没有 Git 仓库，无法回滚")
+            return False, base_dir
+
+        try:
+            import subprocess
+            # 从 user_requirement 中提取关键词，搜索 git log
+            result = subprocess.run(
+                ["git", "log", "--max-count=20", "--format=%H|%s|%ai"],
+                cwd=base_dir, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+            )
+            if result.returncode != 0 or not result.stdout:
+                logger.error(f"💥 [Rollback] git log 失败: {result.stderr}")
+                return False, base_dir
+
+            commits = []
+            for line in result.stdout.strip().split('\n'):
+                if not line.strip():
+                    continue
+                parts = line.split('|', 2)
+                if len(parts) == 3:
+                    commits.append({"hash": parts[0].strip(), "message": parts[1].strip(), "date": parts[2].strip()})
+
+            if not commits:
+                logger.warning("⚠️ [Rollback] 没有可回滚的 commit")
+                global_broadcaster.emit_sync("System", "error", "没有可回滚的 commit 记录")
+                return False, base_dir
+
+            # 解析指令：判断是否是批量批次回滚
+            req_lower = user_requirement.lower()
+            if req_lower.startswith("rollback round:"):
+                # 提取 round_id
+                round_id = user_requirement.split(":", 1)[1].strip()
+                logger.info(f"⏪ [Rollback] 收到批次回退请求: Round {round_id}")
+                
+                # 找出同属于该批次的所有 commit
+                round_commits = [c for c in commits if f"[Round {round_id}]" in c["message"]]
+                if not round_commits:
+                    logger.warning(f"⚠️ [Rollback] 找不到包含 [Round {round_id}] 的 commit")
+                    global_broadcaster.emit_sync("System", "error", f"找不到批次 {round_id} 的提交记录")
+                    return False, base_dir
+                
+                # git log 输出是最新的在前（时间倒序）。所以 round_commits 已经是从新到旧排序了。
+                # 级联回退：依次 git revert --no-commit
+                global_broadcaster.emit_sync("System", "info", f"⏪ 正在级联回退批次: Round {round_id} (共 {len(round_commits)} 条记录)...")
+                for c in round_commits:
+                    commit_hash = c["hash"]
+                    logger.info(f"⏪ [Rollback] revert {commit_hash[:8]}: {c['message']}")
+                    res = subprocess.run(
+                        ["git", "revert", "--no-commit", commit_hash],
+                        cwd=base_dir, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15
+                    )
+                    if res.returncode != 0:
+                        logger.error(f"❌ [Rollback] git revert 冲突: {res.stderr}")
+                        subprocess.run(["git", "revert", "--abort"], cwd=base_dir, capture_output=True, timeout=5)
+                        global_broadcaster.emit_sync("System", "error", f"❌ 级联回退时发生冲突，已中止。")
+                        return False, base_dir
+                
+                # 最终一笔提交
+                res = subprocess.run(
+                    ["git", "commit", "-m", f"⏪ Rollback [Round {round_id}]"],
+                    cwd=base_dir, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10
+                )
+                if res.returncode == 0:
+                    logger.info(f"✅ [Rollback] 批次回退成功: Round {round_id}")
+                    global_broadcaster.emit_sync("System", "success", f"✅ 已成功将批次 Round {round_id} 的全部修改连根拔除")
+                    update_project_status(self.project_id, "success")
+                    return True, base_dir
+                else:
+                    logger.error(f"❌ [Rollback] 提交回退记录失败: {res.stderr}")
+                    return False, base_dir
+
+            else:
+                # 兼容旧单笔回退或回退到指定 commit
+                target_commit = None
+                if req_lower.startswith("rollback commit:"):
+                    commit_hash = user_requirement.split(":", 1)[1].strip()
+                    for c in commits:
+                        if c["hash"].startswith(commit_hash):
+                            target_commit = c
+                            break
+                else:
+                    for c in commits:
+                        if any(kw in c["message"].lower() for kw in req_lower.split() if len(kw) > 1):
+                            target_commit = c
+                            break
+
+                if not target_commit:
+                    target_commit = commits[0]
+                    logger.info(f"⏪ [Rollback] 未匹配到关键词，回退最近的 commit: {target_commit['hash'][:8]}")
+
+                commit_hash = target_commit["hash"]
+                logger.info(f"⏪ [Rollback] 执行 git revert {commit_hash[:8]}: {target_commit['message']}")
+                global_broadcaster.emit_sync("System", "info", f"⏪ 正在回退: {target_commit['message']} ({target_commit['date'][:10]})")
+
+                revert_result = subprocess.run(
+                    ["git", "revert", "--no-edit", commit_hash],
+                    cwd=base_dir, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30,
+                )
+
+                if revert_result.returncode == 0:
+                    logger.info(f"✅ [Rollback] 回退成功: {commit_hash[:8]}")
+                    global_broadcaster.emit_sync("System", "success", f"✅ 已成功回退到 {target_commit['message']} 之前的状态")
+                    update_project_status(self.project_id, "success")
+                    return True, base_dir
+                else:
+                    logger.error(f"❌ [Rollback] git revert 冲突: {revert_result.stderr}")
+                    subprocess.run(["git", "revert", "--abort"], cwd=base_dir, capture_output=True, timeout=5)
+                    global_broadcaster.emit_sync("System", "error", f"❌ 回退时发生冲突，已自动中止。可能需要手动处理。")
+                    return False, base_dir
+
+        except Exception as e:
+            logger.error(f"❌ [Rollback] 异常: {e}")
+            global_broadcaster.emit_sync("System", "error", f"❌ 回退异常: {str(e)}")
+            return False, base_dir
+
+    # ============================================================
+    # 变动率监控 (Patch Mode 质量检查)
+    # ============================================================
+
+    @staticmethod
+    def _check_change_rate(target_file: str, old_code: str, new_code: str,
+                           coder_mode: str = "unknown") -> bool:
+        """
+        检查代码变动率，防止 patch 模式下 Coder 抽风重写。
+
+        返回 True 表示放行，False 表示需要重试。
+
+        规则：
+        - editor + diff < 80%: 放行
+        - fallback_rewrite: 合法降级，直接放行
+        - editor + diff > 80%: 告警，建议重试
+        """
+        if not old_code or not new_code:
+            return True  # 新文件无需检查
+
+        import difflib
+        old_lines = old_code.splitlines()
+        new_lines = new_code.splitlines()
+        ratio = difflib.SequenceMatcher(None, old_lines, new_lines).ratio()
+        change_rate = 1.0 - ratio
+
+        logger.info(f"📊 变动率检查: {target_file} | rate={change_rate:.1%} | coder_mode={coder_mode}")
+
+        if coder_mode == "fallback_rewrite":
+            # CodePatcher 降级为保守覆写 → 合法，放行
+            logger.info(f"✅ 合法降级覆写 (fallback_rewrite)，放行")
+            return True
+
+        if change_rate > 0.8:
+            # 疑似 Coder 抽风
+            logger.warning(f"⚠️ 变动率过高 ({change_rate:.1%})，疑似全量重写而非增量修改")
+            return False
+
+        return True
+
+    # ============================================================
     # Phase 2.5: 集成测试
     # ============================================================
 
@@ -405,19 +625,39 @@ class AstreaEngine:
 
         tester = IntegrationTester(self.project_id)
 
-        # 收集所有已完成代码
+        # 收集项目所有代码（从真理区，非仅 task 列表）
+        # Patch 模式下 tasks 只有被修改的文件，但入口文件（app.py）可能不在其中
         all_code = {}
-        for task in self.blackboard.state.tasks:
-            code = ""
-            if self.vfs:
-                try:
-                    truth_path = os.path.join(self.blackboard.state.out_dir, task.target_file)
-                    if os.path.isfile(truth_path):
-                        with open(truth_path, "r", encoding="utf-8") as f:
-                            code = f.read()
-                except Exception:
-                    pass
-            all_code[task.target_file] = code
+        if self.vfs:
+            truth_dir = self.blackboard.state.out_dir
+            if truth_dir and os.path.isdir(truth_dir):
+                for root, dirs, files in os.walk(truth_dir):
+                    dirs[:] = [d for d in dirs if d not in
+                               {'__pycache__', '.git', '.astrea', '.sandbox',
+                                'venv', '.venv', 'node_modules'}]
+                    for f in files:
+                        if f.startswith('.'):
+                            continue
+                        fpath = os.path.join(root, f)
+                        rel = os.path.relpath(fpath, truth_dir).replace('\\', '/')
+                        try:
+                            with open(fpath, "r", encoding="utf-8") as fh:
+                                all_code[rel] = fh.read()
+                        except Exception:
+                            pass
+        if not all_code:
+            # Fallback: 从 tasks 收集（兼容旧逻辑）
+            for task in self.blackboard.state.tasks:
+                code = ""
+                if self.vfs:
+                    try:
+                        truth_path = os.path.join(self.blackboard.state.out_dir, task.target_file)
+                        if os.path.isfile(truth_path):
+                            with open(truth_path, "r", encoding="utf-8") as f:
+                                code = f.read()
+                    except Exception:
+                        pass
+                all_code[task.target_file] = code
 
         sandbox_dir = self.vfs.sandbox_dir if self.vfs else ""
 
@@ -555,8 +795,13 @@ class AstreaEngine:
 
         manager = self._get_manager()
 
-        # Step 1: 生成规划书（含 project_name + tech_stack）
-        project_spec = manager._generate_project_spec(user_requirement)
+        # Step 0.5: 读取 plan.md（如果存在，由 PlannerLite 在 PM 确认阶段生成）
+        plan_md_content = self._read_plan_md()
+        if plan_md_content:
+            logger.info(f"plan.md 已读取 ({len(plan_md_content)} 字符)，将作为合同约束注入 Manager")
+
+        # Step 1: 生成规划书（含 project_name + tech_stack），注入 plan.md 合同
+        project_spec = manager._generate_project_spec(user_requirement, plan_md=plan_md_content)
 
         # Step 1.5: 从 spec 提取项目名 → 立即重命名 + 启动 sandbox 预热
         project_name = (project_spec.get("project_name", "") or "").replace(" ", "_") if project_spec else ""
@@ -600,7 +845,8 @@ class AstreaEngine:
             plan = manager.plan_tasks(
                 user_requirement, project_spec=project_spec,
                 manager_playbook=manager_playbook,
-                complex_files_hint=complex_hint
+                complex_files_hint=complex_hint,
+                plan_md=plan_md_content
             )
 
         plan["project_spec"] = project_spec
@@ -615,6 +861,21 @@ class AstreaEngine:
                       project_id=self.project_id)
 
         logger.info(f"📋 规划完成: {project_name}, {len(plan.get('tasks', []))} 个子任务")
+
+    def _read_plan_md(self) -> str:
+        """读取项目目录下的 plan.md（由 PlannerLite 在 PM 确认阶段生成）"""
+        project_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "projects", self.project_id
+        )
+        plan_path = os.path.join(project_dir, ".astrea", "plan.md")
+        if os.path.isfile(plan_path):
+            try:
+                with open(plan_path, "r", encoding="utf-8") as f:
+                    return f.read()
+            except Exception as e:
+                logger.warning(f"plan.md 读取失败: {e}")
+        return None
 
     def _estimate_file_count(self, project_spec: dict) -> int:
         """从 project_spec 预估项目文件数。"""
@@ -949,7 +1210,8 @@ class AstreaEngine:
                 if self.vfs:
                     try:
                         from tools.git_ops import git_commit, get_head_hash
-                        commit_msg = f"[{task.task_id}] {task.target_file}: {task.description[:60]}"
+                        session_prefix = getattr(self, "session_id", "local")
+                        commit_msg = f"[Round {session_prefix}] [{task.task_id}] {task.target_file}: {task.description[:60]}"
                         git_commit(self.vfs.truth_dir, commit_msg)
                         git_hash = get_head_hash(self.vfs.truth_dir)
                     except Exception as e:
@@ -1111,6 +1373,28 @@ class AstreaEngine:
             # P0.5: 用户项目潜规则（空字符串 = 无规则，零噪音）
             "user_rules_block": user_rules_block,
         }
+
+        # (4.0) Phase 2.4: AST 显微镜 — 大文件修改时注入精准切片
+        #   Phase 2.5.3 放宽：首次修改大文件（>50行）也触发，不再要求 feedback
+        if existing_code and len(existing_code.splitlines()) > 50:
+            try:
+                from tools.ast_microscope import ASTMicroscope, detect_lang
+                lang = detect_lang(task.target_file)
+                if lang != "unknown":
+                    scope = ASTMicroscope()
+                    ast_slice = scope.find_relevant_slice(
+                        existing_code, task.description, lang, context_lines=10
+                    )
+                    if ast_slice:
+                        task_meta["ast_slice"] = ast_slice
+                        task_meta["ast_full_code"] = existing_code
+                        logger.info(
+                            f"🔬 AST 显微镜切片: {ast_slice['name']} "
+                            f"L{ast_slice['start_line']}-{ast_slice['end_line']} "
+                            f"({len(ast_slice['code'])} chars)"
+                        )
+            except Exception as e:
+                logger.warning(f"⚠️ AST 显微镜切片失败: {e}")
 
         # (4.1) 前端文件：构建路由清单并注入 observer_context
         FRONTEND_EXTS = {'.html', '.htm', '.vue', '.svelte', '.jsx', '.tsx'}

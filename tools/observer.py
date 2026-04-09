@@ -320,15 +320,52 @@ class Observer:
         if ext == ".py":
             return self._skeleton_python(source, file_path)
         elif ext in ('.html', '.htm', '.vue', '.svelte'):
+            # Phase 2.4: 优先走 AST 显微镜，失败则降级到正则
+            ast_result = self._skeleton_via_microscope(source, file_path)
+            if ast_result:
+                return ast_result
             return self._skeleton_html(source, file_path)
         elif ext in ('.js', '.jsx', '.ts', '.tsx'):
+            ast_result = self._skeleton_via_microscope(source, file_path)
+            if ast_result:
+                return ast_result
             return self._skeleton_js(source, file_path)
         elif ext == '.css':
+            ast_result = self._skeleton_via_microscope(source, file_path)
+            if ast_result:
+                return ast_result
             return self._skeleton_css(source, file_path)
         else:
             # 未知类型：返回前 50 行
             lines = source.split('\n')[:50]
             return f"# {file_path} (未知类型，前50行)\n" + "\n".join(lines)
+
+    def _skeleton_via_microscope(self, source: str, file_path: str) -> str:
+        """
+        Phase 2.4: 使用 ASTMicroscope 生成前端骨架。
+        成功返回格式化骨架字符串，tree-sitter 不可用时返回空字符串（调用方降级到正则）。
+        """
+        try:
+            from tools.ast_microscope import ASTMicroscope, detect_lang
+            lang = detect_lang(file_path)
+            if lang == "unknown":
+                return ""
+            scope = ASTMicroscope()
+            symbols = scope.list_symbols(source, lang)
+            if not symbols:
+                return ""
+
+            lines = [f"# {file_path} (AST 显微镜骨架)"]
+            for sym in symbols:
+                prefix = "  " if "." in sym["name"] or "::" in sym["name"] else ""
+                lines.append(f"{prefix}{sym['type']} {sym['name']}  (L{sym['start_line']}-{sym['end_line']})")
+
+            result = "\n".join(lines)
+            logger.info(f"🔬 get_skeleton({file_path}) → {len(symbols)} 符号 (AST 显微镜)")
+            return result
+        except Exception as e:
+            logger.warning(f"⚠️ AST 显微镜骨架失败 ({file_path}): {e}，降级到正则")
+            return ""
 
     def _skeleton_python(self, source: str, file_path: str) -> str:
         """Python AST 骨架提取"""

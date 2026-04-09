@@ -37,11 +37,12 @@ class ManagerAgent:
         self.coder = CoderAgent(project_id)
         self.reviewer = ReviewerAgent(project_id)
 
-    def _generate_project_spec(self, user_requirement: str) -> dict:
+    def _generate_project_spec(self, user_requirement: str, plan_md: str = None) -> dict:
         """
         步骤 1: 生成或增量更新项目规划书 (Project Spec)。
         - 新项目: 全量生成
         - 已有规划书: 注入旧 spec，让 LLM 判断是否需要修改（允许原样输出）
+        - plan_md: 用户确认过的 plan.md，作为 P0.5 合同约束
         """
         logger.info("📋 Manager 正在生成/更新项目规划书...")
         
@@ -60,6 +61,20 @@ class ManagerAgent:
             # 新项目 → 全量生成
             system_prompt = Prompts.MANAGER_SPEC_SYSTEM
             logger.info("📋 新项目，全量生成规划书")
+        
+        # P0.5 合同注入：plan.md 约束高于一切
+        if plan_md:
+            contract_clause = (
+                "\n\n═══ P0.5 — 用户确认的项目方案（合同级约束，高于一切 P1/P2 规则）═══\n"
+                "以下是用户审核并确认过的项目方案（plan.md），你必须严格遵循：\n\n"
+                f"{plan_md}\n\n"
+                "【铁律】\n"
+                "1. 技术栈必须与 plan.md 完全一致，不得擅自替换\n"
+                "2. 核心功能必须与 plan.md 完全一致，不得擅自增减\n"
+                "3. 你可以在此基础上补充工程细节（如 module_interfaces、api_contracts），但不得违反上述约束\n"
+            )
+            system_prompt = contract_clause + "\n" + system_prompt
+            logger.info("📜 plan.md 合同已注入 Manager Spec Prompt")
         
         user_prompt = f"主人的开发需求：\n{user_requirement}\n请输出项目规划书 JSON。"
         
@@ -203,9 +218,11 @@ class ManagerAgent:
             return {}
 
     def plan_tasks(self, user_requirement: str, project_spec: dict = None,
-                   manager_playbook: str = "", complex_files_hint: str = "") -> dict:
+                   manager_playbook: str = "", complex_files_hint: str = "",
+                   plan_md: str = None) -> dict:
         """
         步骤 2: 基于规划书拆解任务列表。
+        plan_md: 用户确认过的 plan.md，作为 P0.5 合同约束
         """
         logger.info("🧠 Manager 正在基于规划书拆解任务...")
         
@@ -249,13 +266,24 @@ class ManagerAgent:
             spec_str = json.dumps(project_spec, ensure_ascii=False, indent=2)
             spec_context = f"\n\n═══ P1 — 项目契约（覆盖一切 P2 指南，冲突时以此为准）═══\n【项目规划书 — 你必须基于此架构拆解任务，禁止 Playbook 模板覆盖规划书的文件结构】\n{spec_str}"
 
-        # 5. 组装 system_prompt（按优先级排列：规则 > P1 规划书 > 环境 > P2 经验）
+        # 4.5 注入 plan.md 合同（P0.5，高于 P1）
+        plan_md_context = ""
+        if plan_md:
+            plan_md_context = (
+                "\n\n═══ P0.5 — 用户确认的项目方案（合同级约束，高于一切 P1/P2 规则）═══\n"
+                f"{plan_md}\n\n"
+                "【铁律】技术栈和核心功能必须与上述 plan.md 完全一致，不得擅自替换或增减。\n"
+            )
+            logger.info("📜 plan.md 合同已注入 Manager Plan Prompt")
+
+        # 5. 组装 system_prompt（按优先级排列：P0.5 plan.md > 规则 > P1 规划书 > 环境 > P2 经验）
         manager_system = Prompts.MANAGER_SYSTEM.format(
             manager_playbook=manager_playbook,
             complex_files_hint=complex_files_hint or ""
         )
         system_prompt = (
-            manager_system
+            plan_md_context  # P0.5: plan.md 合同最高优先
+            + manager_system
             + spec_context  # P1: 规划书紧跟规则之后
             + f"\n\n{env_context}"  # 环境信息
             + f"\n\n═══ P2 — 参考信息（仅供参考，与 P1 规划书冲突时必须服从 P1）═══"

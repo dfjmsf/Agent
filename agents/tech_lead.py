@@ -83,8 +83,20 @@ class TechLeadAgent:
             elif "```" in raw:
                 raw = raw.split("```")[1].split("```")[0].strip()
 
-            verdict = json.loads(raw)
+            # 清理 LLM 输出中的非法控制字符（\x00-\x1f 除 \n \r \t 外）
+            import re as _re
+            raw = _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', raw)
 
+            try:
+                verdict = json.loads(raw)
+            except json.JSONDecodeError:
+                # 二次尝试：strict=False 容忍更多非标准字符
+                try:
+                    verdict = json.loads(raw, strict=False)
+                    logger.warning("⚠️ TechLead JSON 使用 strict=False 解析成功")
+                except json.JSONDecodeError as e2:
+                    logger.error(f"❌ TechLead 返回非法 JSON: {e2}")
+                    return None
             # 校验必要字段
             if "guilty_file" not in verdict or "fix_instruction" not in verdict:
                 logger.error(f"❌ TechLead 返回缺少必要字段: {verdict}")

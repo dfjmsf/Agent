@@ -77,7 +77,12 @@ export default function PMChat({ currentProjectId }) {
   const handleAction = useCallback(async (actionId) => {
     setIsLoading(true);
     // 追加一个用户"点击"消息
-    const label = actionId === 'confirm' ? '✅ 确认执行' : '❌ 修改需求';
+    const labelMap = {
+      confirm: '✅ 确认执行', reject: '❌ 修改需求',
+      patch_confirm: '✅ 确认修改', patch_cancel: '取消修改',
+      rollback_confirm: '✅ 确认回滚', rollback_cancel: '取消回滚',
+    };
+    const label = labelMap[actionId] || actionId;
     setMessages(prev => [...prev, { role: 'user', content: label }]);
 
     try {

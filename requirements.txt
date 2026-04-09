@@ -15,3 +15,10 @@ SQLAlchemy
 # === Database (PostgreSQL + pgvector) ===
 psycopg2-binary
 pgvector
+
+# === AST 显微镜 (Phase 2.4 tree-sitter) ===
+tree-sitter
+tree-sitter-javascript
+tree-sitter-html
+tree-sitter-css
+tree-sitter-typescript

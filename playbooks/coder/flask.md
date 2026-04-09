@@ -147,6 +147,25 @@ return jsonify({"key": "value"}), 200
 return jsonify({"error": "Not Found"}), 404
 ```
 
+**🚫 模式 B 铁律：前端 fetch 的路由禁止 redirect()**
+- 前端用 `fetch('/api/xxx', {method: 'DELETE'})` 发非 GET 请求
+- 后端用 `redirect()` 响应 → 浏览器收到 302 → 自动跟随变成 GET → 405 Method Not Allowed
+- **所有被 fetch/axios 调用的路由，必须返回 `jsonify()` 响应，严禁 `redirect()`**
+
+```python
+# ✅ 正确：返回 JSON
+@bp.route('/api/items/<int:id>', methods=['DELETE'])
+def delete_item(id):
+    # ... 删除逻辑 ...
+    return jsonify({"success": True}), 200
+
+# ❌ 致命错误：fetch DELETE 收到 302 会变 GET → 405
+@bp.route('/api/items/<int:id>', methods=['DELETE'])
+def delete_item(id):
+    # ... 删除逻辑 ...
+    return redirect(url_for('index'))  # 永远不要这样做！
+```
+
 ### 5. 表单字段名一致性铁律
 HTML `<input name="xxx">` 或 `<select name="xxx">` 的 name 属性
 **必须**与 routes.py 中 `request.form['xxx']` 的 key **完全一致**！
@@ -168,7 +187,20 @@ category_id = request.form['category']    # ❌ 不匹配！
 ```python
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
 ```
-- `init_db()` 必须包含种子数据（默认分类等），否则前端下拉框为空！
+
+**🚫 种子数据铁律（违反 = 前端空白，严重 bug）**
+
+1. 凡涉及"分类/类型/标签"功能，**必须创建独立的 categories 表**，不能只在主表用 TEXT 字段：
+```python
+# ❌ 致命错误：category 是 TEXT → 新数据库时分类列表为空！
+cursor.execute('CREATE TABLE IF NOT EXISTS expenses (category TEXT)')
+
+# ✅ 正确：独立 categories 表 + 外键关联
+cursor.execute('CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY, name TEXT UNIQUE)')
+cursor.execute('CREATE TABLE IF NOT EXISTS expenses (category_id INTEGER REFERENCES categories(id))')
+```
+
+2. `init_db()` **必须**包含种子数据，否则前端下拉框为空：
 ```python
 def init_db():
     conn = get_db_connection()
@@ -177,6 +209,8 @@ def init_db():
     # 必须有种子数据！
     cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES ('餐饮')")
     cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES ('交通')")
+    cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES ('购物')")
+    cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES ('娱乐')")
     conn.commit()
     conn.close()
 ```

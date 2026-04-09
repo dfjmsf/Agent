@@ -1,19 +1,18 @@
 """
-PM Agent — 用户与 ASTrea 系统的唯一对话入口
+PM Agent — ASTrea 化身，用户的唯一对话窗口
 
-Phase 2.1 核心组件：
-- 二层意图路由（硬路由正则 + 软路由 LLM）
-- 需求标准化（自然语言 → structured_req JSON）
-- 规划组协调（调用 PlannerLite 生成 plan.md）
-- 确认/拒绝流（确定性按钮，零 LLM 分类成本）
-- 对话滑动窗口（5 轮 = 10 条消息）
-- FTS5 对话档案持久化
+Phase 2.5.1 双层架构：
+  Layer 1: 路由嗅探器（保守正则 + LLM 主力分类）
+  Layer 2: 人格化身（高情商回复 + 上下文按需注入）
+
+路由类型：create / patch / rollback / chat / scan / clarify
+状态机：idle / wait_confirm / wait_patch_confirm / wait_rollback_confirm / wait_clarify
 """
 import os
 import re
 import json
 import logging
-import threading
+import subprocess
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Any
 
@@ -30,34 +29,47 @@ _SLIDING_WINDOW_SIZE = 10
 @dataclass
 class PMResponse:
     """PM 返回给前端的结构化响应"""
-    intent: str              # "chat" | "plan" | "code" | "scan" | "action"
+    intent: str              # "create" | "patch" | "rollback" | "chat" | "scan" | "clarify" | "action"
     reply: str               # PM 的自然语言回复
-    plan_md: Optional[str] = None     # plan.md（plan 意图时返回）
+    plan_md: Optional[str] = None     # plan.md（create 意图时返回）
     actions: Optional[list] = None    # 确定性按钮 [{"id": "confirm", ...}]
     is_executing: bool = False        # 是否已触发 Engine 执行
 
 
 class PMAgent:
     """
-    项目经理 Agent — 用户的唯一对话窗口。
+    ASTrea 化身 — 用户的唯一对话窗口。
 
-    职责：意图路由 + 需求标准化 + 规划组协调 + 闲聊
-    不做：写代码、审查代码、直接操控 Engine
+    Phase 2.5.1 双层架构：
+    - Layer 1: 路由嗅探器 — 保守正则(仅命令前缀) + LLM 主力分类
+    - Layer 2: 人格化身 — 高情商回复 + 上下文按需注入
     """
 
     def __init__(self, project_id: str):
         self.project_id = project_id
         self.model = os.getenv("MODEL_PM", "deepseek-chat")
 
-        # 对话滑动窗口（内存态，MVP 不持久化窗口本身）
+        # 对话滑动窗口（内存态）
         self.conversation: List[dict] = []
 
         # 待确认的规划（等待用户 confirm/reject）
         self.pending_req: Optional[dict] = None
         self.pending_plan_md: Optional[str] = None
 
+        # patch / rollback 暂存
+        self.pending_patch: Optional[str] = None          # 用户的修改意图描述
+        self.pending_rollback_commit: Optional[str] = None # 待回滚的 commit hash
+
         # 状态机
-        self.state: str = "idle"  # "idle" | "wait_confirm"
+        self.state: str = "idle"
+        # 有效状态: "idle" | "wait_confirm" | "wait_patch_confirm"
+        #           | "wait_rollback_confirm" | "wait_clarify"
+
+        # Engine 执行时的 mode（create/patch/rollback）
+        self.confirmed_mode: str = "auto"
+
+        # 上一轮路由结果（供 Layer 2 使用）
+        self._last_route: Optional[dict] = None
 
         # 轮次计数（用于 FTS5 round_id）
         self.round_id: int = 0
@@ -78,7 +90,7 @@ class PMAgent:
                 if os.path.isdir(project_dir):
                     self._store = ConversationStore(project_dir)
             except Exception as e:
-                logger.warning(f"⚠️ ConversationStore 初始化失败: {e}")
+                logger.warning(f"ConversationStore 初始化失败: {e}")
         return self._store
 
     # ============================================================
@@ -89,33 +101,34 @@ class PMAgent:
         """
         主入口：接收用户消息，返回结构化响应。
 
-        流程：追加历史 → 意图分类 → 分发处理 → 截断窗口 → 持久化 → 返回
+        流程：追加历史 → 状态机分发/意图分类 → 处理 → 截断窗口 → 持久化 → 返回
         """
         self.round_id += 1
-        logger.info(f"💬 PM 收到消息 (round={self.round_id}): {user_message[:80]}...")
+        logger.info(f"PM 收到消息 (round={self.round_id}): {user_message[:80]}...")
 
         # 追加用户消息到窗口
         self.conversation.append({"role": "user", "content": user_message})
 
-        # 如果在等待确认状态，用户的自由文本视为修改需求
+        # ---- 状态机优先分发 ----
         if self.state == "wait_confirm":
             response = self._handle_plan_revision(user_message)
+        elif self.state == "wait_patch_confirm":
+            # 用户在修改确认阶段的回复，暂时走 chat 处理
+            response = self._handle_chat(user_message)
+        elif self.state == "wait_rollback_confirm":
+            response = self._handle_chat(user_message)
+        elif self.state == "wait_clarify":
+            # 用户澄清后重新路由
+            self.state = "idle"
+            route_result = self._classify_intent(user_message)
+            self._last_route = route_result
+            response = self._dispatch_route(route_result, user_message)
         else:
-            # 意图分类
-            intent = self._classify_intent(user_message)
-            logger.info(f"🔍 意图分类结果: {intent}")
-
-            # 分发处理
-            if intent == "chat":
-                response = self._handle_chat(user_message)
-            elif intent == "plan":
-                response = self._handle_plan(user_message)
-            elif intent == "code":
-                response = self._handle_code(user_message)
-            elif intent == "scan":
-                response = self._handle_scan(user_message)
-            else:
-                response = self._handle_chat(user_message)
+            # idle 状态 → Layer 1 路由
+            route_result = self._classify_intent(user_message)
+            self._last_route = route_result
+            logger.info(f"路由结果: {route_result}")
+            response = self._dispatch_route(route_result, user_message)
 
         # 追加 PM 回复到窗口
         self.conversation.append({"role": "assistant", "content": response.reply})
@@ -131,83 +144,146 @@ class PMAgent:
                 store.append("user", user_message, self.round_id)
                 store.append("pm", response.reply, self.round_id)
             except Exception as e:
-                logger.warning(f"⚠️ FTS5 写入失败: {e}")
+                logger.warning(f"FTS5 写入失败: {e}")
 
         return response
+
+    def _dispatch_route(self, route_result: dict, message: str) -> PMResponse:
+        """根据路由结果分发到对应处理器"""
+        route = route_result.get("route", "chat")
+
+        if route == "create":
+            return self._handle_create(message)
+        elif route == "patch":
+            return self._handle_patch(message)
+        elif route == "rollback":
+            return self._handle_rollback(message)
+        elif route == "scan":
+            return self._handle_scan(message)
+        elif route == "clarify":
+            return self._handle_clarify(message)
+        else:
+            return self._handle_chat(message)
 
     def handle_action(self, action: str) -> PMResponse:
         """
         处理确定性按钮动作（零 LLM 分类成本）。
 
         Args:
-            action: "confirm" | "reject"
+            action: "confirm" | "reject" | "rollback_confirm" | "rollback_cancel"
         """
-        logger.info(f"🔘 PM 收到按钮动作: {action}")
+        logger.info(f"PM 收到按钮动作: {action}")
 
         if action == "confirm":
             return self._handle_confirm()
         elif action == "reject":
             return self._handle_reject()
+        elif action == "patch_confirm":
+            return self._handle_patch_execute()
+        elif action == "patch_cancel":
+            self.state = "idle"
+            self.pending_patch = None
+            return PMResponse(intent="action", reply="好的，取消修改。")
+        elif action == "rollback_confirm":
+            return self._handle_rollback_execute()
+        elif action == "rollback_cancel":
+            self.state = "idle"
+            self.pending_rollback_commit = None
+            return PMResponse(intent="action", reply="好的，取消回滚操作。")
         else:
-            return PMResponse(
-                intent="action",
-                reply=f"未知操作: {action}"
-            )
+            return PMResponse(intent="action", reply=f"未知操作: {action}")
 
     # ============================================================
-    # 意图分类（二层路由）
+    # Layer 1: 路由嗅探器（保守正则 + LLM 主力）
     # ============================================================
 
-    def _classify_intent(self, message: str) -> str:
+    def _classify_intent(self, message: str) -> dict:
         """
-        二层路由：硬路由（正则匹配，零 LLM）→ 软路由（LLM 分类，~100 tokens）
+        双层路由：
+        - 层 1: 保守正则 — 仅匹配显式命令前缀（100% 确定性）
+        - 层 2: LLM 分类 — 所有自然语言一律交给 LLM（~200 tokens）
+        - 安全网: 置信度 < 0.7 → clarify
         """
-        msg = message.strip().lower()
+        msg = message.strip()
 
-        # --- 层 1: 硬路由（正则匹配）---
-        chat_patterns = [r'^/chat\b', r'^你好', r'^hi\b', r'^hello\b', r'^聊聊']
-        plan_patterns = [r'^/plan\b', r'帮我做', r'帮我设计', r'帮我规划',
-                         r'帮我开发', r'做一个', r'开发一个', r'创建一个', r'写一个']
-        code_patterns = [r'^/code\b', r'^开始写', r'^执行', r'^开始编码']
-        scan_patterns = [r'^/scan\b', r'扫描', r'分析项目', r'逆向', r'接手']
+        # === 层 1: 显式命令前缀（100% 确定性，零 LLM）===
+        if msg.startswith('/plan') or msg.startswith('/create'):
+            return {"route": "create", "confidence": 1.0, "context_needs": []}
+        if msg.startswith('/scan'):
+            return {"route": "scan", "confidence": 1.0, "context_needs": []}
+        if msg.startswith('/rollback'):
+            return {"route": "rollback", "confidence": 1.0, "context_needs": ["file_list"]}
+        if msg.startswith('/patch'):
+            return {"route": "patch", "confidence": 1.0, "context_needs": ["file_list"]}
 
-        # 检查历史上下文中是否有追问（如"之前"、"上次"）
-        archive_patterns = [r'之前', r'上次', r'历史', r'说过什么']
+        # === 层 2: LLM 分类（所有自然语言）===
+        result = self._llm_classify(message)
 
-        for p in chat_patterns:
-            if re.search(p, msg):
-                return "chat"
-        for p in plan_patterns:
-            if re.search(p, msg):
-                return "plan"
-        for p in code_patterns:
-            if re.search(p, msg):
-                return "code"
-        for p in scan_patterns:
-            if re.search(p, msg):
-                return "scan"
+        # === 安全网：置信度不够就追问 ===
+        if result.get("confidence", 0) < 0.7:
+            logger.info(f"路由置信度过低 ({result.get('confidence', 0)})，触发 clarify")
+            return {"route": "clarify", "confidence": result.get("confidence", 0), "context_needs": []}
 
-        # 检查是否是档案检索请求
-        for p in archive_patterns:
-            if re.search(p, msg):
-                return "chat"  # 通过 chat 处理，内部会触发档案搜索
+        return result
 
-        # --- 层 2: 软路由（LLM 分类）---
+    def _llm_classify(self, message: str) -> dict:
+        """调用 LLM 做五分类意图识别，输出结构化 dict"""
+        project_exists = self._project_exists()
+        project_status = f"项目 {self.project_id} — {'已存在，包含源代码文件' if project_exists else '不存在或为空项目'}"
+
         try:
-            prompt = Prompts.PM_INTENT_CLASSIFIER.format(message=message)
+            prompt = Prompts.PM_INTENT_CLASSIFIER_V2.format(
+                project_status=project_status,
+                message=message,
+            )
             response = default_llm.chat_completion(
                 model=self.model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
             )
-            result = response.content.strip().lower()
-            if result in ("chat", "plan", "code", "scan"):
-                return result
-            logger.warning(f"⚠️ LLM 意图分类返回非法值: {result}，降级为 chat")
-            return "chat"
-        except Exception as e:
-            logger.warning(f"⚠️ LLM 意图分类失败: {e}，降级为 chat")
-            return "chat"
+            raw = response.content.strip()
+
+            # 清理 Markdown 代码块包裹
+            if "```json" in raw:
+                raw = raw.split("```json")[1].split("```")[0].strip()
+            elif "```" in raw:
+                raw = raw.split("```")[1].split("```")[0].strip()
+
+            result = json.loads(raw)
+
+            # 验证必要字段
+            route = result.get("route", "chat")
+            valid_routes = ("create", "patch", "rollback", "chat", "scan")
+            if route not in valid_routes:
+                logger.warning(f"LLM 返回非法路由 '{route}'，降级为 chat")
+                route = "chat"
+
+            return {
+                "route": route,
+                "confidence": float(result.get("confidence", 0.8)),
+                "context_needs": result.get("context_needs", []),
+            }
+        except (json.JSONDecodeError, Exception) as e:
+            logger.warning(f"LLM 意图分类失败: {e}，降级为 chat")
+            return {"route": "chat", "confidence": 0.5, "context_needs": []}
+
+    def _project_exists(self) -> bool:
+        """检查当前项目是否已有真实文件"""
+        projects_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "projects"
+        )
+        project_dir = os.path.join(projects_dir, self.project_id)
+        if not os.path.isdir(project_dir):
+            return False
+        # 排除隐藏目录和配置文件，检查是否有实际源代码
+        for root, dirs, files in os.walk(project_dir):
+            dirs[:] = [d for d in dirs if d not in
+                       ('__pycache__', 'venv', '.venv', 'node_modules', '.sandbox', '.astrea', '.git')]
+            real_files = [f for f in files if not f.startswith('.') and f != 'plan.md']
+            if real_files:
+                return True
+        return False
 
     # ============================================================
     # 需求标准化
@@ -246,14 +322,13 @@ class PMAgent:
                 json_str = json_str.split("```")[1].split("```")[0].strip()
 
             req = json.loads(json_str)
-            logger.info(f"✅ 需求标准化完成: {req.get('summary', '未知')}")
+            logger.info(f"需求标准化完成: {req.get('summary', '未知')}")
             return req
 
         except (json.JSONDecodeError, Exception) as e:
-            logger.error(f"❌ 需求标准化失败: {e}")
+            logger.error(f"需求标准化失败: {e}")
             # 降级：从原始消息提取关键信息
             first_line = user_message.split('\n')[0].strip()[:100]
-            # 尝试从编号列表中提取功能点
             features = []
             for line in user_message.split('\n'):
                 line = line.strip()
@@ -262,21 +337,14 @@ class PMAgent:
             if not features:
                 features = [first_line]
 
-            # 检测用户消息中是否提及技术栈
             tech = {"database": "sqlite", "frontend": "jinja2_ssr", "backend": "flask"}
             defaults = []
             msg_lower = user_message.lower()
-            if "sqlalchemy" in msg_lower or "sqlite" in msg_lower:
-                tech["database"] = "sqlite"
-            else:
+            if "sqlalchemy" not in msg_lower and "sqlite" not in msg_lower:
                 defaults.append({"field": "数据库", "value": "SQLite", "reason": "用户未指定"})
-            if "flask" in msg_lower:
-                tech["backend"] = "flask"
-            else:
+            if "flask" not in msg_lower:
                 defaults.append({"field": "后端", "value": "Flask", "reason": "用户未指定"})
-            if "jinja" in msg_lower:
-                tech["frontend"] = "jinja2_ssr"
-            else:
+            if "jinja" not in msg_lower:
                 defaults.append({"field": "前端", "value": "Jinja2 SSR", "reason": "用户未指定"})
 
             return {
@@ -292,7 +360,7 @@ class PMAgent:
     # ============================================================
 
     def _handle_chat(self, message: str) -> PMResponse:
-        """闲聊处理 — PM 直接回复（注入项目上下文）"""
+        """闲聊处理 — 高情商 PM 直接回复"""
         # 检查是否是档案检索请求
         archive_keywords = ["之前", "上次", "历史", "说过什么", "说过"]
         if any(kw in message for kw in archive_keywords):
@@ -300,12 +368,16 @@ class PMAgent:
             if archive_result:
                 return PMResponse(intent="chat", reply=archive_result)
 
-        project_context = self._build_project_context()
-        system_prompt = Prompts.PM_SYSTEM.format(project_context=project_context)
+        context_needs = self._last_route.get("context_needs", []) if self._last_route else []
+        project_context = self._build_project_context(context_needs)
+        route_hint = ""  # chat 模式无特殊 hint
+        system_prompt = Prompts.PM_SYSTEM.format(
+            project_context=project_context,
+            route_hint=route_hint,
+        )
 
         try:
             messages = [{"role": "system", "content": system_prompt}]
-            # 注入滑动窗口历史
             messages.extend(self.conversation[-6:])
 
             response = default_llm.chat_completion(
@@ -315,91 +387,232 @@ class PMAgent:
             )
             return PMResponse(intent="chat", reply=response.content.strip())
         except Exception as e:
-            logger.error(f"❌ PM 闲聊失败: {e}")
+            logger.error(f"PM 闲聊失败: {e}")
             return PMResponse(intent="chat", reply="抱歉，我暂时无法回复，请稍后再试。")
 
-    def _handle_plan(self, message: str) -> PMResponse:
-        """规划处理 — 标准化需求 → 规划组生成 plan.md → 返回给用户确认"""
-        global_broadcaster.emit_sync("PM", "info", "📋 正在分析您的需求...")
+    def _handle_create(self, message: str) -> PMResponse:
+        """创建处理 — 标准化需求 → 规划组生成 plan.md → 返回给用户确认"""
+        global_broadcaster.emit_sync("PM", "info", "正在分析您的需求...")
 
         # 1. 标准化需求
         structured_req = self._standardize_requirement(message)
 
-        # 2. 调用规划组生成 plan.md
+        # 2. 调用规划组生成 plan.md（自动保存到 .astrea/plan.md）
         from agents.planner_lite import PlannerLiteAgent
         planner = PlannerLiteAgent()
-        plan_md = planner.generate_plan(structured_req)
+        projects_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "projects"
+        )
+        project_dir = os.path.join(projects_dir, self.project_id)
+        plan_md = planner.generate_plan(structured_req, project_dir=project_dir)
 
         # 3. 保存待确认状态
         self.pending_req = structured_req
         self.pending_plan_md = plan_md
         self.state = "wait_confirm"
 
-        # 4. 构建回复（包含默认值告知）
+        # 4. PM 口语化归纳
+        summary = structured_req.get("summary", "您的项目")
         defaults = structured_req.get("defaults_applied", [])
-        defaults_notice = ""
+        features = structured_req.get("core_features", [])
+
+        reply_parts = [f"我帮您梳理了一下「{summary}」的方案"]
+        if features:
+            feature_str = "、".join(f[:20] for f in features[:3])
+            reply_parts.append(f"，核心功能包括{feature_str}")
+        reply_parts.append("。详细的技术方案在右侧方案面板里，您看看有没有要调整的。")
+
         if defaults:
-            notices = [f"- {d['field']}：{d['value']}（{d['reason']}）" for d in defaults]
-            defaults_notice = "\n\n⚠️ 以下选项使用了默认值，如需调整请告诉我：\n" + "\n".join(notices)
+            notices = [f"{d['field']}用的是{d['value']}" for d in defaults]
+            reply_parts.append(f"\n\n另外，{', '.join(notices)}，这些是默认选择，需要换的话随时告诉我。")
 
-        reply = f"我为您设计了以下技术方案，请确认是否开始开发：{defaults_notice}"
+        reply = "".join(reply_parts)
 
-        global_broadcaster.emit_sync("PM", "plan_preview", "📋 技术方案预览已就绪")
+        global_broadcaster.emit_sync("PM", "plan_preview", "技术方案预览已就绪")
 
         return PMResponse(
-            intent="plan",
+            intent="create",
             reply=reply,
             plan_md=plan_md,
             actions=[
-                {"id": "confirm", "label": "✅ 确认执行", "style": "primary"},
-                {"id": "reject", "label": "❌ 修改需求", "style": "secondary"},
+                {"id": "confirm", "label": "确认执行", "style": "primary"},
+                {"id": "reject", "label": "我要调整", "style": "secondary"},
             ]
         )
 
+    def _handle_patch(self, message: str) -> PMResponse:
+        """
+        修改处理（二步确认）：
+        Step 1: PM 确认理解了修改意图，展示确认按钮
+        Step 2: 用户点击确认 → _handle_patch_execute() 启动 Engine patch mode
+        """
+        self.pending_patch = message
+        self.state = "wait_patch_confirm"
+
+        if self._project_exists():
+            # 项目存在，PM 确认修改意图
+            context_needs = self._last_route.get("context_needs", []) if self._last_route else []
+            project_context = self._build_project_context(context_needs)
+
+            # 用 LLM 生成一个有温度的确认回复
+            route_hint = "【当前场景：用户想修改已有项目，请简洁确认理解了修改需求，告知用户点击确认按钮即可启动修改】"
+            system_prompt = Prompts.PM_SYSTEM.format(
+                project_context=project_context,
+                route_hint=route_hint,
+            )
+            try:
+                messages = [{"role": "system", "content": system_prompt}]
+                messages.extend(self.conversation[-6:])
+                resp = default_llm.chat_completion(
+                    model=self.model,
+                    messages=messages,
+                    temperature=0.5,
+                )
+                reply = resp.content.strip()
+            except Exception:
+                reply = "明白，我来帮您处理这个修改。"
+
+            return PMResponse(
+                intent="patch",
+                reply=reply,
+                actions=[
+                    {"id": "patch_confirm", "label": "✅ 确认修改", "style": "primary"},
+                    {"id": "patch_cancel", "label": "取消", "style": "default"},
+                ],
+            )
+        else:
+            # 项目不存在，引导用户走 create
+            self.state = "idle"
+            self.pending_patch = None
+            return PMResponse(
+                intent="patch",
+                reply="目前这个项目还没有文件呢，是不是想先创建一个新项目？直接告诉我您想做什么就行。",
+            )
+
+    def _handle_patch_execute(self) -> PMResponse:
+        """
+        用户确认修改 → 启动 Engine patch mode。
+        """
+        if not self.pending_patch:
+            return PMResponse(intent="action", reply="没有待执行的修改。")
+
+        # 保存修改需求作为 Engine prompt
+        self.confirmed_requirement = self.pending_patch
+        self.confirmed_mode = "patch"
+
+        patch_desc = self.pending_patch[:60]
+        self.pending_patch = None
+        self.state = "idle"
+
+        global_broadcaster.emit_sync("PM", "info", f"用户已确认修改，正在启动 Patch 模式...")
+
+        return PMResponse(
+            intent="action",
+            reply=f"收到！正在以 Patch 模式修改「{patch_desc}」，请在左侧面板关注进度。",
+            is_executing=True,
+        )
+
+    def _handle_rollback(self, message: str) -> PMResponse:
+        """
+        回滚处理 — 查询 git log 定位 commit，请用户确认。
+        本阶段降级实现：从 git log 中搜索关键词。
+        """
+        if not self._project_exists():
+            return PMResponse(
+                intent="rollback",
+                reply="这个项目还没有文件，没有可以回滚的记录。",
+            )
+
+        # 查询 git log
+        commits = self._query_git_log(message)
+        if commits:
+            # 找到匹配的 commit
+            commit = commits[0]
+            self.state = "wait_rollback_confirm"
+            
+            # 判断是否带有 Round 标识
+            import re
+            m = re.search(r"\[Round (\d+)\]", commit["message"])
+            if m:
+                round_id = m.group(1)
+                self.pending_rollback_target = f"Round: {round_id}"
+                reply = f"找到了该次修改所在的批次 (Round {round_id})。我们将撤销该批次所有的修改。\n\n最早的一笔任务是：\n> {commit['message']} ({commit['date']})\n\n要彻底恢复到这批次修改之前的状态吗？"
+            else:
+                self.pending_rollback_target = f"Commit: {commit['hash']}"
+                reply = f"找到了一条相关的修改记录：\n\n> {commit['message']} ({commit['date']})\n\n要恢复到这次修改之前的状态吗？"
+
+            return PMResponse(
+                intent="rollback",
+                reply=reply,
+                actions=[
+                    {"id": "rollback_confirm", "label": "确认回滚", "style": "danger"},
+                    {"id": "rollback_cancel", "label": "取消", "style": "secondary"},
+                ],
+            )
+        else:
+            self.state = "idle"
+            return PMResponse(
+                intent="rollback",
+                reply="没有找到相关的修改记录。您能告诉我更多细节吗？比如大概是什么时候改的、改了什么。",
+            )
+
+    def _handle_rollback_execute(self) -> PMResponse:
+        """执行回滚"""
+        self.state = "idle"
+        target = getattr(self, "pending_rollback_target", None)
+        self.pending_rollback_target = None
+        self.pending_rollback_commit = None # 保留旧字段清空兼容
+
+        if not target:
+            return PMResponse(intent="action", reply="没有待回滚的记录。")
+
+        self.confirmed_requirement = f"Rollback {target}"
+        self.confirmed_mode = "rollback"
+
+        # 执行实际 git revert
+        global_broadcaster.emit_sync("PM", "info", f"用户已确认回滚，正在启动 Rollback 模式...")
+        
+        return PMResponse(
+            intent="action",
+            reply=f"收到！正在为您执行回滚操作，将撤销最近的修改批次，请留意左侧面板进度。",
+            is_executing=True,
+        )
+
+    def _handle_clarify(self, message: str) -> PMResponse:
+        """意图不明确时追问用户"""
+        self.state = "wait_clarify"
+
+        # 根据上下文生成有温度的追问
+        if self._project_exists():
+            reply = "我不太确定您的意思——您是想对现有项目做一些修改，还是想创建一个全新的项目？"
+        else:
+            reply = "我想先确认一下，您是想创建一个新项目吗？如果是的话，可以跟我说说您想做什么。"
+
+        return PMResponse(intent="clarify", reply=reply)
+
     def _handle_plan_revision(self, message: str) -> PMResponse:
         """用户在 wait_confirm 状态下发送了修改意见 → 重新标准化 + 重新生成 plan"""
-        global_broadcaster.emit_sync("PM", "info", "📝 正在根据您的反馈调整方案...")
+        global_broadcaster.emit_sync("PM", "info", "正在根据您的反馈调整方案...")
 
-        # 基于上一轮的 structured_req 做增量修改
         structured_req = self._standardize_requirement(message)
 
-        # 重新调用规划组
         from agents.planner_lite import PlannerLiteAgent
         planner = PlannerLiteAgent()
         plan_md = planner.generate_plan(structured_req)
 
-        # 更新待确认状态
         self.pending_req = structured_req
         self.pending_plan_md = plan_md
 
-        defaults = structured_req.get("defaults_applied", [])
-        defaults_notice = ""
-        if defaults:
-            notices = [f"- {d['field']}：{d['value']}（{d['reason']}）" for d in defaults]
-            defaults_notice = "\n\n⚠️ 默认值：\n" + "\n".join(notices)
-
-        reply = f"已根据您的反馈更新了方案，请再次确认：{defaults_notice}"
+        reply = "已经根据您的反馈更新了方案，请在方案面板查看最新版本。"
 
         return PMResponse(
-            intent="plan",
+            intent="create",
             reply=reply,
             plan_md=plan_md,
             actions=[
-                {"id": "confirm", "label": "✅ 确认执行", "style": "primary"},
-                {"id": "reject", "label": "❌ 继续修改", "style": "secondary"},
+                {"id": "confirm", "label": "确认执行", "style": "primary"},
+                {"id": "reject", "label": "继续调整", "style": "secondary"},
             ]
-        )
-
-    def _handle_code(self, message: str) -> PMResponse:
-        """编码处理 — 检查有无已确认 plan，有则触发 Engine"""
-        if self.pending_req and self.state == "wait_confirm":
-            # 用户直接说"执行"/"开始写" → 等同于 confirm
-            return self._handle_confirm()
-
-        # 没有 pending plan → 提示先走 plan
-        return PMResponse(
-            intent="code",
-            reply="还没有待执行的方案哦。请先告诉我您想做什么项目，我来帮您规划。"
         )
 
     def _handle_scan(self, message: str) -> PMResponse:
@@ -418,25 +631,21 @@ class PMAgent:
             if not scan_result.get("files_found"):
                 return PMResponse(
                     intent="scan",
-                    reply="该项目目录下没有找到可分析的源代码文件。"
+                    reply="这个项目目录下没有找到可分析的源代码文件。",
                 )
 
-            # 格式化扫描结果摘要
-            summary_parts = [
-                f"📂 扫描完成：发现 {scan_result.get('files_found', 0)} 个文件",
-                f"🔧 技术栈：{', '.join(scan_result.get('tech_stack', ['未识别']))}",
-            ]
+            files_found = scan_result.get('files_found', 0)
+            tech_stack = ', '.join(scan_result.get('tech_stack', ['未识别']))
+            reply = f"扫描完成：发现 {files_found} 个文件，技术栈是 {tech_stack}。"
+
             if scan_result.get("entry_point"):
                 ep = scan_result["entry_point"]
-                summary_parts.append(f"🚀 入口：{ep.get('file', '未知')} (端口 {ep.get('port', '未知')})")
+                reply += f"\n入口文件是 {ep.get('file', '未知')}，端口 {ep.get('port', '未知')}。"
 
-            return PMResponse(
-                intent="scan",
-                reply="\n".join(summary_parts),
-            )
+            return PMResponse(intent="scan", reply=reply)
         except Exception as e:
-            logger.error(f"❌ 扫描失败: {e}")
-            return PMResponse(intent="scan", reply=f"扫描过程中发生错误：{str(e)}")
+            logger.error(f"扫描失败: {e}")
+            return PMResponse(intent="scan", reply=f"扫描过程中出了点问题：{str(e)}")
 
     # ============================================================
     # 确认/拒绝处理
@@ -449,15 +658,14 @@ class PMAgent:
 
         summary = self.pending_req.get("summary", "用户项目")
 
-        # 保存需求文本（server.py 会读取这个值启动 Engine）
         self.confirmed_requirement = self._structured_req_to_prompt(self.pending_req)
+        self.confirmed_mode = "create"
 
-        # 清空待确认状态
         self.pending_req = None
         self.pending_plan_md = None
         self.state = "idle"
 
-        global_broadcaster.emit_sync("PM", "info", f"✅ 用户已确认方案，正在启动开发团队...")
+        global_broadcaster.emit_sync("PM", "info", f"用户已确认方案，正在启动开发团队...")
 
         return PMResponse(
             intent="action",
@@ -467,38 +675,77 @@ class PMAgent:
 
     def _handle_reject(self) -> PMResponse:
         """用户拒绝 → PM 追问，保持 wait_confirm 状态"""
-        # 状态不变，仍在 wait_confirm，等待用户发修改意见
         return PMResponse(
             intent="action",
-            reply="了解，您希望怎么调整？比如换技术栈、增减功能、改文件结构？"
+            reply="好的，您想怎么调整？比如换个技术栈、加减功能什么的，直接说就行。"
         )
 
     # ============================================================
-    # 辅助方法
+    # Layer 2: 上下文按需注入
     # ============================================================
 
-    def _build_project_context(self) -> str:
-        """构建当前项目的上下文信息"""
+    def _build_project_context(self, context_needs: list = None) -> str:
+        """根据 context_needs 按需构建项目上下文，避免全量灌入"""
+        if context_needs is None:
+            context_needs = []
+
         projects_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "projects"
         )
         project_dir = os.path.join(projects_dir, self.project_id)
 
-        parts = [f"项目 ID: {self.project_id}"]
+        parts = [f"项目: {self.project_id}"]
 
-        if os.path.isdir(project_dir):
-            # 简单统计文件数
-            file_count = 0
-            for root, dirs, files in os.walk(project_dir):
-                dirs[:] = [d for d in dirs if d not in
-                           ('__pycache__', 'venv', '.venv', 'node_modules', '.sandbox', '.astrea', '.git')]
-                file_count += len([f for f in files if not f.startswith('.')])
-            parts.append(f"文件数: {file_count}")
-        else:
+        project_exists = os.path.isdir(project_dir)
+
+        if not project_exists:
             parts.append("状态: 新项目（尚无文件）")
+            return " | ".join(parts)
 
-        return " | ".join(parts)
+        # 基础信息：总是包含文件数
+        file_count = 0
+        file_names = []
+        for root, dirs, files in os.walk(project_dir):
+            dirs[:] = [d for d in dirs if d not in
+                       ('__pycache__', 'venv', '.venv', 'node_modules', '.sandbox', '.astrea', '.git')]
+            for f in files:
+                if not f.startswith('.'):
+                    file_count += 1
+                    file_names.append(os.path.relpath(os.path.join(root, f), project_dir))
+        parts.append(f"文件数: {file_count}")
+
+        # 按需注入详细上下文
+        if "file_list" in context_needs and file_names:
+            parts.append(f"\n项目文件: {', '.join(file_names[:20])}")
+
+        if "tech_stack" in context_needs:
+            # 尝试从 plan.md 提取技术栈
+            plan_path = os.path.join(project_dir, ".astrea", "plan.md")
+            if os.path.isfile(plan_path):
+                try:
+                    with open(plan_path, "r", encoding="utf-8") as f:
+                        plan_content = f.read(500)
+                    parts.append(f"\n技术方案摘要: {plan_content[:200]}")
+                except Exception:
+                    pass
+
+        if "frontend_skeleton" in context_needs:
+            # 列出前端相关文件
+            frontend_files = [f for f in file_names if any(
+                f.endswith(ext) for ext in ('.html', '.js', '.jsx', '.vue', '.css', '.ts', '.tsx')
+            )]
+            if frontend_files:
+                parts.append(f"\n前端文件: {', '.join(frontend_files[:10])}")
+
+        if "project_progress" in context_needs:
+            parts.append(f"\n进度: 项目包含 {file_count} 个文件")
+
+        return " | ".join(parts[:2]) + "".join(parts[2:])
+
+    # ============================================================
+    # 辅助方法
+    # ============================================================
 
     @staticmethod
     def _structured_req_to_prompt(req: dict) -> str:
@@ -532,27 +779,101 @@ class PMAgent:
         if not store:
             return None
 
-        # 提取搜索关键词（去掉"之前"、"上次"等前缀词）
         clean_query = query
         for prefix in ["之前说过", "之前", "上次", "历史", "说过什么", "说过"]:
             clean_query = clean_query.replace(prefix, "").strip()
 
         if not clean_query:
-            clean_query = query  # fallback 用原文
+            clean_query = query
 
         try:
             results = store.search(clean_query, limit=5)
             if not results:
                 return "没有找到相关的历史对话记录。"
 
-            lines = ["📜 找到以下相关历史记录：", ""]
+            lines = ["找到以下相关历史记录：", ""]
             for r in results:
-                role_label = "👤 用户" if r["role"] == "user" else "🤖 PM"
+                role_label = "用户" if r["role"] == "user" else "PM"
                 lines.append(f"**{role_label}** (轮次 {r['round_id']}):")
                 lines.append(f"> {r['content'][:200]}")
                 lines.append("")
 
             return "\n".join(lines)
         except Exception as e:
-            logger.warning(f"⚠️ 档案检索失败: {e}")
+            logger.warning(f"档案检索失败: {e}")
             return None
+
+    def _query_git_log(self, message: str, max_count: int = 10) -> list:
+        """从 git log 中搜索与用户消息相关的 commit（降级版 Ledger 查询）"""
+        projects_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "projects"
+        )
+        project_dir = os.path.join(projects_dir, self.project_id)
+        git_dir = os.path.join(project_dir, ".git")
+
+        if not os.path.isdir(git_dir):
+            return []
+
+        try:
+            result = subprocess.run(
+                ["git", "log", f"--max-count={max_count}", "--format=%H|%s|%ai"],
+                cwd=project_dir,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+            )
+            if result.returncode != 0 or not result.stdout:
+                return []
+
+            commits = []
+            for line in result.stdout.strip().split('\n'):
+                if not line.strip():
+                    continue
+                parts = line.split('|', 2)
+                if len(parts) == 3:
+                    commits.append({
+                        "hash": parts[0].strip(),
+                        "message": parts[1].strip(),
+                        "date": parts[2].strip()[:10],
+                    })
+
+            # 优先级 1: 用户直接指定了 Round 编号（如 "撤销 Round 2" / "回滚第2轮"）
+            import re
+            round_direct = re.search(r"(?:round|轮)\s*(\d+)", message, re.IGNORECASE)
+            if round_direct:
+                target_round = round_direct.group(1)
+                round_commits = [c for c in commits if f"[Round {target_round}]" in c["message"]]
+                if round_commits:
+                    return [round_commits[-1]]  # 返回该轮最早的 commit
+
+            # 优先级 2: 关键词匹配
+            msg_lower = message.lower()
+            matched = [c for c in commits if any(
+                kw in c["message"].lower() for kw in msg_lower.split() if len(kw) > 1
+            )]
+
+            if matched:
+                first_match = matched[0]
+                m = re.search(r"\[Round (\d+)\]", first_match["message"])
+                if m:
+                    round_id = m.group(1)
+                    # 抓取与之属于同一个 Round 的所有连续 commits
+                    round_commits = [c for c in commits if f"[Round {round_id}]" in c["message"]]
+                    # git log 按时间倒序，最后一个就是该轮次最早生成的 commit
+                    if round_commits:
+                        return [round_commits[-1]]
+                return matched
+
+            # 优先级 3: 没匹配到, 返回最近一个有 Round 标记的 commit 所在轮次
+            for c in commits:
+                m = re.search(r"\[Round (\d+)\]", c["message"])
+                if m:
+                    round_id = m.group(1)
+                    round_commits = [cc for cc in commits if f"[Round {round_id}]" in cc["message"]]
+                    if round_commits:
+                        return [round_commits[-1]]
+
+            return commits[:3]  # 最终兜底
+
+        except Exception as e:
+            logger.warning(f"git log 查询失败: {e}")
+            return []

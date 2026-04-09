@@ -179,7 +179,7 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         global_broadcaster.disconnect(websocket)
 
-def run_project_thread(prompt: str, out_dir: str, project_id: str):
+def run_project_thread(prompt: str, out_dir: str, project_id: str, mode: str = "auto"):
     """
     由于我们的 Agent 系统是同步阻塞写的，将其放入隔离的线程中运行。
     使用 project_id 级别的互斥锁防止同一项目被并发生成。
@@ -191,9 +191,9 @@ def run_project_thread(prompt: str, out_dir: str, project_id: str):
         return
 
     try:
-        logger.info(f"后台线程：AstreaEngine 启动 (Project: {project_id})...")
+        logger.info(f"后台线程：AstreaEngine 启动 (Project: {project_id}, mode={mode})...")
         engine = AstreaEngine(project_id=project_id)
-        success, final_dir = engine.run(prompt, out_dir or None)
+        success, final_dir = engine.run(prompt, out_dir or None, mode=mode)
         if not success:
             logger.error(f"项目生成失败，输出目录: {final_dir}")
     except Exception as e:
@@ -247,7 +247,7 @@ class ChatReq(BaseModel):
     project_id: str = "default_project"
 
 class ActionReq(BaseModel):
-    action: str  # "confirm" | "reject"
+    action: str  # "confirm" | "reject" | "rollback_confirm" | "rollback_cancel"
     project_id: str = "default_project"
 
 @app.post("/api/chat")
@@ -264,11 +264,12 @@ async def chat_action(req: ActionReq):
     response = pm.handle_action(req.action)
 
     if response.is_executing:
-        # 从 PM 获取已确认的需求文本，启动 Engine
+        # 从 PM 获取已确认的需求文本 + 执行模式，启动 Engine
         user_req = getattr(pm, 'confirmed_requirement', None) or "用户确认执行"
+        mode = getattr(pm, 'confirmed_mode', 'auto')
         t = threading.Thread(
             target=run_project_thread,
-            args=(user_req, None, req.project_id)
+            args=(user_req, None, req.project_id, mode)
         )
         t.start()
 

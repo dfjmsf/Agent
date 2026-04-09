@@ -141,6 +141,19 @@ class ReviewerAgent:
             if not l07_pass:
                 return False, l07_error
 
+        # --- L0.9 前后端 API 契约检查（fetch URL vs 后端路由返回类型）---
+        if sandbox_dir:
+            l09_pass, l09_error = self._l0_fetch_api_contract_check(
+                target_file, code_content, sandbox_dir)
+            if not l09_pass:
+                return False, l09_error
+
+        # --- L0.10 种子数据检查（init_db 中 CREATE TABLE 必须配 INSERT）---
+        if is_python and tree:
+            l10_pass, l10_error = self._l0_seed_data_check(target_file, code_content)
+            if not l10_pass:
+                return False, l10_error
+
         return True, ""
 
     def _l0_js_syntax_check(self, target_file: str, sandbox_dir: str) -> Tuple[bool, str]:
@@ -427,10 +440,12 @@ class ReviewerAgent:
         # 4. 提取 Jinja {{ }} 块中的字段访问
         jinja_blocks = re.findall(r'\{\{(.*?)\}\}', html_content, re.DOTALL)
 
-        # 跳过的变量名（Jinja 内置 / 非数据变量）
+        # 跳过的变量名（Jinja 内置 / 非数据变量 / WTForms 表单对象）
         skip_vars = {'loop', 'range', 'request', 'config', 'session',
                      'g', 'url_for', 'get_flashed_messages', 'true', 'false',
-                     'none', 'self', 'caller', 'joiner'}
+                     'none', 'self', 'caller', 'joiner',
+                     'form', 'csrf', 'pagination', 'paginate',  # WTForms / 分页对象
+                     }
 
         mismatches = []
         for block in jinja_blocks:
@@ -699,9 +714,9 @@ class ReviewerAgent:
 
         # 3. 对比：移除 Jinja 模板参数后匹配
         def normalize(url):
-            """移除 Jinja 变量如 /edit-entry/{{ entry.id }} → /edit-entry"""
-            cleaned = _re.sub(r'/\{\{[^}]*\}\}', '', url)
-            cleaned = _re.sub(r'/\{%[^%]*%\}', '', cleaned)
+            """将 Jinja 变量替换为通配段，如 /todos/{{ todo.id }}/delete → /todos/DYNVAR/delete"""
+            cleaned = _re.sub(r'\{\{[^}]*\}\}', 'DYNVAR', url)
+            cleaned = _re.sub(r'\{%[^%]*%\}', '', cleaned)
             return cleaned.rstrip('/') or '/'
 
         phantom_urls = set()
@@ -715,6 +730,22 @@ class ReviewerAgent:
                 if _re.fullmatch(route_pattern, norm_url):
                     matched = True
                     break
+                # 前缀匹配：/category 可以匹配 /category/<int:id>
+                # 取原始路由（非正则）的前缀段做比较
+                route_segments = route.rstrip('/').split('/')
+                if len(route_segments) > 1:
+                    # 去掉最后一段（参数段）→ 得到路由前缀
+                    route_prefix = '/'.join(route_segments[:-1])
+                    if route_prefix and norm_url == route_prefix:
+                        matched = True
+                        break
+                # 反向前缀匹配：DYNVAR 替换后的 /category/DYNVAR
+                # 也匹配 /category/<int:id>
+                if 'DYNVAR' in norm_url:
+                    dynvar_pattern = norm_url.replace('DYNVAR', '[^/]+')
+                    if _re.fullmatch(dynvar_pattern, route.rstrip('/')):
+                        matched = True
+                        break
             if not matched:
                 phantom_urls.add(url)
 
@@ -841,6 +872,251 @@ class ReviewerAgent:
             return False, error
 
         return True, ""
+
+    @staticmethod
+    def _l0_seed_data_check(target_file: str, code_content: str) -> Tuple[bool, str]:
+        """
+        L0.10: 种子数据检查。
+
+        场景：models.py 的 init_db() 创建了 categories 等表但未插入种子数据
+        → 前端下拉框为空 → 用户无法正常使用。
+
+        检查逻辑：
+        1. 在 init_db 函数体中查找 CREATE TABLE
+        2. 如果表名包含 categor/type/tag/status 等分类关键词
+        3. 检查同函数体内是否有 INSERT 语句
+        """
+        # 仅检查可能包含 init_db 的文件
+        if 'init_db' not in code_content:
+            return True, ""
+
+        # 提取 init_db 函数体（简化：从 def init_db 到下一个 def 或文件末）
+        init_match = re.search(r'def\s+init_db\s*\([^)]*\)\s*:', code_content)
+        if not init_match:
+            return True, ""
+
+        func_start = init_match.end()
+        next_def = re.search(r'\ndef\s+\w+\s*\(', code_content[func_start:])
+        func_body = code_content[func_start:func_start + next_def.start()] if next_def else code_content[func_start:]
+
+        # 查找 CREATE TABLE 语句中的分类相关表名
+        SEED_KEYWORDS = {'categor', 'type', 'tag', 'status', 'role', 'level', 'priority'}
+        create_tables = re.findall(
+            r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["\']?(\w+)["\']?',
+            func_body, re.IGNORECASE
+        )
+
+        needs_seed = []
+        for table in create_tables:
+            table_lower = table.lower()
+            for kw in SEED_KEYWORDS:
+                if kw in table_lower:
+                    needs_seed.append(table)
+                    break
+
+        if not needs_seed:
+            return True, ""  # 没有分类相关表，跳过
+
+        # 检查是否有 INSERT 语句
+        has_insert = bool(re.search(r'INSERT\s+(?:OR\s+\w+\s+)?INTO', func_body, re.IGNORECASE))
+
+        if not has_insert:
+            error = (
+                f"[L0.10 种子数据缺失] {target_file}: "
+                f"init_db() 创建了 {', '.join(needs_seed)} 表但未插入种子数据。"
+                f"前端下拉框/选择器将为空！"
+                f"请在 init_db() 中使用 INSERT OR IGNORE 插入默认分类数据"
+                f"（如：餐饮、交通、购物、娱乐等）。"
+            )
+            logger.warning(f"❌ {error}")
+            global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+            return False, error
+
+        return True, ""
+
+    def _l0_fetch_api_contract_check(self, target_file: str, code_content: str,
+                                      sandbox_dir: str) -> Tuple[bool, str]:
+        """
+        L0.9 前后端 API 契约检查。
+
+        场景：前端用 fetch/axios 发 DELETE/PUT/POST/PATCH 请求，但后端对应路由
+        用 redirect() 响应 → 浏览器 302 跟随变 GET → 405 Method Not Allowed。
+
+        检查逻辑：
+        1. 仅在前端文件（HTML/JS/JSX/TSX/Vue）中扫描 fetch() 调用
+        2. 提取 URL 和 HTTP method
+        3. 在后端 Python 文件中查找对应路由
+        4. 检查路由函数体是否包含 redirect() 而非 jsonify/return JSON
+        """
+        FRONTEND_EXTS = {'.html', '.htm', '.js', '.jsx', '.tsx', '.vue', '.svelte'}
+        ext = os.path.splitext(target_file)[1].lower()
+
+        if ext not in FRONTEND_EXTS:
+            return True, ""  # 非前端文件，跳过
+
+        # 1. 提取 fetch() 调用中的 URL 和 method
+        fetch_calls = self._extract_fetch_calls(code_content)
+        if not fetch_calls:
+            return True, ""  # 没有 fetch 调用
+
+        # 2. 收集后端 Python 文件
+        backend_routes = self._collect_backend_routes(sandbox_dir)
+        if not backend_routes:
+            return True, ""  # 没有后端文件，跳过
+
+        # 3. 逐个检查：非 GET 的 fetch 请求 + 对应路由返回 redirect
+        violations = []
+        for fc in fetch_calls:
+            url = fc["url"]
+            method = fc["method"].upper()
+
+            if method == "GET":
+                continue  # GET 请求 redirect 通常无害
+
+            # 在后端路由中查找匹配
+            for route in backend_routes:
+                if self._url_matches_route(url, route["path"]):
+                    if method in route.get("methods", []):
+                        # 检查函数体是否有 redirect
+                        if route.get("has_redirect") and not route.get("has_jsonify"):
+                            violations.append(
+                                f"前端 fetch('{url}', method='{method}') → "
+                                f"后端 {route['file']}:{route['function']}() 使用了 redirect()。"
+                                f"前端 fetch 的非 GET 请求收到 302 会变成 GET，导致 405 错误。"
+                                f"请改为返回 jsonify 响应。"
+                            )
+
+        if violations:
+            error = f"[L0.9 API 契约违规] {target_file}: " + " | ".join(violations)
+            logger.warning(f"❌ {error}")
+            global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+            return False, error
+
+        return True, ""
+
+    @staticmethod
+    def _extract_fetch_calls(code: str) -> list:
+        """从前端代码中提取 fetch() 调用的 URL 和 HTTP method"""
+        results = []
+
+        # 模式 1: fetch('/url', { method: 'DELETE' })
+        pattern1 = re.compile(
+            r"""fetch\s*\(\s*['"`]([^'"`]+)['"`]\s*,\s*\{[^}]*method\s*:\s*['"`](\w+)['"`]""",
+            re.IGNORECASE | re.DOTALL
+        )
+        for m in pattern1.finditer(code):
+            results.append({"url": m.group(1), "method": m.group(2)})
+
+        # 模式 2: fetch('/url') — 默认 GET
+        pattern2 = re.compile(
+            r"""fetch\s*\(\s*['"`]([^'"`]+)['"`]\s*\)""",
+            re.IGNORECASE
+        )
+        for m in pattern2.finditer(code):
+            url = m.group(1)
+            # 排除已经在模式1中捕获的
+            if not any(r["url"] == url for r in results):
+                results.append({"url": url, "method": "GET"})
+
+        # 模式 3: axios.delete('/url'), axios.post('/url')
+        pattern3 = re.compile(
+            r"""axios\s*\.\s*(get|post|put|delete|patch)\s*\(\s*['"`]([^'"`]+)['"`]""",
+            re.IGNORECASE
+        )
+        for m in pattern3.finditer(code):
+            results.append({"url": m.group(2), "method": m.group(1)})
+
+        return results
+
+    def _collect_backend_routes(self, sandbox_dir: str) -> list:
+        """扫描 sandbox 中所有 Python 文件，提取 Flask/FastAPI 路由信息"""
+        routes = []
+        for root, dirs, files in os.walk(sandbox_dir):
+            dirs[:] = [d for d in dirs if d not in {'__pycache__', '.venv', 'node_modules', '.git'}]
+            for f in files:
+                if not f.endswith('.py'):
+                    continue
+                fpath = os.path.join(root, f)
+                try:
+                    with open(fpath, 'r', encoding='utf-8') as fp:
+                        py_code = fp.read()
+                    rel_path = os.path.relpath(fpath, sandbox_dir).replace('\\', '/')
+                    routes.extend(self._parse_routes_from_python(py_code, rel_path))
+                except Exception:
+                    continue
+        return routes
+
+    @staticmethod
+    def _parse_routes_from_python(py_code: str, file_path: str) -> list:
+        """从 Python 代码中解析路由装饰器，提取路径、方法、是否有 redirect/jsonify"""
+        routes = []
+
+        # Flask: @app.route('/path', methods=['DELETE'])
+        flask_pattern = re.compile(
+            r"""@\w+\.route\s*\(\s*['"]([^'"]+)['"]\s*(?:,\s*methods\s*=\s*\[([^\]]*)\])?\s*\)"""
+            r"""\s*def\s+(\w+)\s*\(""",
+            re.DOTALL
+        )
+
+        for m in flask_pattern.finditer(py_code):
+            path = m.group(1)
+            methods_str = m.group(2) or "'GET'"
+            func_name = m.group(3)
+            methods = re.findall(r"['\"](\w+)['\"]", methods_str)
+            methods = [m_val.upper() for m_val in methods]
+
+            # 提取函数体（简化：取装饰器后到下一个 def/class 或文件末）
+            func_start = m.end()
+            next_def = re.search(r'\ndef\s|\nclass\s', py_code[func_start:])
+            func_body = py_code[func_start:func_start + next_def.start()] if next_def else py_code[func_start:]
+
+            routes.append({
+                "path": path,
+                "methods": methods,
+                "function": func_name,
+                "file": file_path,
+                "has_redirect": "redirect(" in func_body,
+                "has_jsonify": "jsonify(" in func_body or "json.dumps(" in func_body or "JSONResponse(" in func_body,
+            })
+
+        # FastAPI: @app.delete('/path')
+        fastapi_pattern = re.compile(
+            r"""@\w+\.(get|post|put|delete|patch)\s*\(\s*['"]([^'"]+)['"]\s*\)"""
+            r"""\s*(?:async\s+)?def\s+(\w+)\s*\(""",
+            re.DOTALL
+        )
+        for m in fastapi_pattern.finditer(py_code):
+            method = m.group(1).upper()
+            path = m.group(2)
+            func_name = m.group(3)
+
+            func_start = m.end()
+            next_def = re.search(r'\ndef\s|\nclass\s|\nasync\s+def\s', py_code[func_start:])
+            func_body = py_code[func_start:func_start + next_def.start()] if next_def else py_code[func_start:]
+
+            routes.append({
+                "path": path,
+                "methods": [method],
+                "function": func_name,
+                "file": file_path,
+                "has_redirect": "redirect(" in func_body or "RedirectResponse(" in func_body,
+                "has_jsonify": "jsonify(" in func_body or "JSONResponse(" in func_body or "json.dumps(" in func_body or "return {" in func_body,
+            })
+
+        return routes
+
+    @staticmethod
+    def _url_matches_route(fetch_url: str, route_path: str) -> bool:
+        """简单的 URL vs 路由路径匹配（支持 Flask/FastAPI 的 <param> 和 {param} 语法）"""
+        # 将路由路径中的参数占位符替换为通配
+        route_regex = re.sub(r'<[^>]+>|\{[^}]+\}', r'[^/]+', route_path)
+        route_regex = '^' + route_regex + '$'
+        # 去掉 fetch URL 中的模板字符串变量
+        clean_url = re.sub(r'\$\{[^}]+\}', 'PLACEHOLDER', fetch_url)
+        try:
+            return bool(re.match(route_regex, clean_url))
+        except re.error:
+            return fetch_url == route_path
 
     def _l0_import_check(self, target_file: str, sandbox_dir: str) -> Tuple[bool, str]:
 
