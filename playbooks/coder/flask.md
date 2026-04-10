@@ -17,6 +17,17 @@
 ### 🚫 绝对禁止
 - 混用两种模式！后端 `render_template()` + 前端 `fetch()` = 必崩！
 - routes.py 用 `request.form` 但 HTML 用 `fetch + JSON.stringify` = 必崩！
+- **⛔ 严禁使用以下包（违反 = CSRF 崩溃 / 静默提交失败）：**
+  - `flask_wtf` — 禁止 import
+  - `wtforms` — 禁止 import
+  - `FlaskForm` — 禁止使用
+  - `CSRFProtect` — 禁止使用
+  - `validate_on_submit()` — 禁止调用
+  - **原因**：FlaskForm 需要 CSRF token，但 Coder 生成的 HTML 模板几乎不会包含 `{{ form.hidden_tag() }}`，导致表单提交报 400 Bad Request: CSRF token missing
+  - **正确做法**：`request.form['amount']` + 手动 `if not amount: flash('错误')` 校验
+- **严禁在 init_db() 中往主数据表（如 expenses）INSERT 种子数据！**
+  - NOT NULL 字段缺失 → IntegrityError → commit 不执行 → CREATE TABLE 回滚 → `no such table`
+  - 分类/标签数据必须用独立的 categories 表，见第 6 节
 
 ---
 
@@ -40,14 +51,15 @@ from flask import Flask
 from models import init_db
 from routes import index, add_expense_route
 
-# template_folder 必须指向 templates 目录的正确相对路径！
-# 如果 app.py 在 src/ 而 templates/ 在项目根目录：
-app = Flask(__name__, template_folder='../templates')
+# ⚠️ 标准布局：app.py 和 templates/ 在同一目录下
+# 此时 Flask 默认就能找到 templates/，不需要任何额外参数！
+app = Flask(__name__)
+app.secret_key = 'your-secret-key-here'
 
 init_db()
 
 app.add_url_rule('/', 'index', index, methods=['GET'])
-app.add_url_rule('/add', 'add_expense', add_expense_route, methods=['POST'])
+app.add_url_rule('/add', 'add_expense', add_expense_route, methods=['GET', 'POST'])
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5001, debug=True)
@@ -74,24 +86,34 @@ if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5001, debug=True)
 ```
 
-### 2. template_folder 路径铁律
-- `Flask(__name__)` 默认在 `app.py 所在目录/templates/` 找模板
-- 如果 app.py 在 `src/`，templates 在项目根的 `templates/`：
-  **必须** `Flask(__name__, template_folder='../templates')`
-- **无论在 app.py 还是 routes.py 的 create_app() 中创建 Flask 实例，都必须配 template_folder！**
-- 路径错误 → `TemplateNotFound` 错误！
+### 2. template_folder + static_folder 路径铁律（违反 = TemplateNotFound / 404）
+
+> ⚠️ **此条为 0 号铁律，优先级最高！每次生成 Flask() 实例时必须严格执行！**
+
+- **默认情况**：app.py 和 templates/ 在同一目录（平铺布局）→ **不要传任何路径参数**！
+- `Flask(__name__)` 默认在 **`app.py 所在目录`** 下找 `templates/` 和 `static/`
+- **只有当 app.py 在子目录（如 src/）而 templates/ 在父目录时**，才需要手动指定路径
 
 ```python
-# ✅ 正确：无论在哪创建都带 template_folder
-def create_app():
-    app = Flask(__name__, template_folder='../templates')
-    return app
+# ✅ 标准布局（绝大多数情况）：app.py 和 templates/ 在同一目录
+# 项目结构：app.py, templates/, models.py, routes.py 都在根目录
+app = Flask(__name__)  # 不要加 template_folder！
 
-# ❌ 致命错误：
-def create_app():
-    app = Flask(__name__)  # 找不到模板！
-    return app
+# ❌❌❌ 致命错误：app.py 在根目录但写了 ../templates
+app = Flask(__name__, template_folder='../templates')  # → TemplateNotFound！
+
+# ✅ 仅当 app.py 在 src/ 子目录时才需要（罕见）：
+app = Flask(__name__, template_folder='../templates', static_folder='../static')
 ```
+
+**自查清单**（每次写 Flask() 时必须过）：
+1. `app.py` 在哪个目录？
+2. `templates/` 在哪个目录？
+3. **如果在同一目录 → 用 `Flask(__name__)`，不加任何路径参数！**
+4. 只有不在同一目录时才手动指定
+2. `templates/` 在哪个目录？
+3. `static/` 在哪个目录？
+4. 如果三者不在同一目录 → **必须显式指定相对路径**
 
 
 ### 3. 路由注册
@@ -110,6 +132,39 @@ def get_users():
 # app.py 注册
 app.register_blueprint(bp)
 ```
+
+#### 🚫 SSR 表单路由铁律（违反 = 405 Method Not Allowed）
+
+凡是有**独立表单页面**（如 `add.html`、`edit.html`）的路由，**必须同时支持 GET 和 POST**：
+- GET = 显示空白表单页面
+- POST = 处理表单提交
+
+```python
+# ✅ 正确：GET 显示表单，POST 处理提交
+app.add_url_rule('/add', 'add', routes.add, methods=['GET', 'POST'])
+
+# routes.py 中必须处理两种情况：
+def add():
+    if request.method == 'POST':
+        # 处理表单提交
+        amount = float(request.form['amount'])
+        add_expense(amount, ...)
+        return redirect(url_for('index'))
+    else:
+        # GET: 显示空白表单页面
+        return render_template('add.html')
+
+# ❌ 致命错误：只注册 POST
+app.add_url_rule('/add', 'add', routes.add, methods=['POST'])
+# → 用户点击 <a href="/add"> 发送 GET → 405 Method Not Allowed！
+
+# ❌ 致命错误：routes.py 中只处理 POST 逻辑，没有 GET 分支
+def add():
+    amount = float(request.form['amount'])  # GET 请求没有 form 数据 → 崩溃！
+    ...
+```
+
+**自查**：如果存在 `templates/add.html` 或 `templates/edit.html`，对应路由必须有 `methods=['GET', 'POST']`！
 
 ### 4. 请求与响应
 
@@ -182,39 +237,6 @@ category_id = request.form['category_id'] # ✅ 'category_id'
 category_id = request.form['category']    # ❌ 不匹配！
 ```
 
-### 6. 数据库集成
-- SQLite 路径必须基于 `__file__`：
-```python
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
-```
-
-**🚫 种子数据铁律（违反 = 前端空白，严重 bug）**
-
-1. 凡涉及"分类/类型/标签"功能，**必须创建独立的 categories 表**，不能只在主表用 TEXT 字段：
-```python
-# ❌ 致命错误：category 是 TEXT → 新数据库时分类列表为空！
-cursor.execute('CREATE TABLE IF NOT EXISTS expenses (category TEXT)')
-
-# ✅ 正确：独立 categories 表 + 外键关联
-cursor.execute('CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY, name TEXT UNIQUE)')
-cursor.execute('CREATE TABLE IF NOT EXISTS expenses (category_id INTEGER REFERENCES categories(id))')
-```
-
-2. `init_db()` **必须**包含种子数据，否则前端下拉框为空：
-```python
-def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('CREATE TABLE IF NOT EXISTS categories (...)')
-    # 必须有种子数据！
-    cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES ('餐饮')")
-    cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES ('交通')")
-    cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES ('购物')")
-    cursor.execute("INSERT OR IGNORE INTO categories (name) VALUES ('娱乐')")
-    conn.commit()
-    conn.close()
-```
-
 ### 7. 错误处理
 ```python
 @app.errorhandler(404)
@@ -245,60 +267,27 @@ if __name__ == "__main__":
 - 端口必须与 api_contracts.base_url 中的端口一致
 - **禁止** 使用 8000 端口（被系统后端占用）
 
-### 10. 跨文件数据一致性（模式 A 极重要）
+### 10. SQLite 日期类型铁律
 
-#### 10.1 routes.py → index.html 数据字段一致性
-`render_template('index.html', expenses=expenses)` 传入的数据是什么结构，
-index.html 中 `{{ expense.xxx }}` 就只能引用该结构中存在的字段！
+> ⚠️ SQLite 没有原生 DATE 类型！`date TEXT NOT NULL` 存进去的是字符串 `"2026-04-10"`，读出来也是字符串！
 
-**关键：查看 models.py 中数据查询函数的返回结构来决定模板中能用什么字段。**
+从数据库读取日期用于回填编辑表单时，**直接用字符串即可**（因为 HTML `<input type="date">` 的 value 本身就是字符串格式 `YYYY-MM-DD`）：
 
 ```python
-# models.py 中的 get_all_expenses() 返回：
-# SELECT e.id, e.amount, e.description, e.date, c.name as category_name
-# → 返回的 dict 有: id, amount, description, date, category_name
+# ✅ 正确：编辑页面回填日期
+def edit_expense(expense_id):
+    expense = get_expense_by_id(expense_id)
+    if request.method == 'POST':
+        date_str = request.form['date']  # HTML input[type=date] 返回 "2026-04-10"
+        update_expense(expense_id, ..., date=date_str, ...)
+        return redirect(url_for('index'))
+    # GET: 传给模板，input value 直接填字符串
+    return render_template('edit.html', expense=expense)
 ```
+
 ```html
-<!-- index.html 中只能用这些字段！ -->
-{{ expense.amount }}         ✅ 存在
-{{ expense.category_name }}  ✅ 存在（SQL AS 别名）
-{{ expense.category.name }}  ❌ 不存在！expense 是 dict 不是对象！
-{{ expense.category_id }}    ❌ SQL 没有 SELECT 这个字段！
+<!-- 模板中日期回填 — expense['date'] 本身就是 "2026-04-10" 字符串，完美匹配 -->
+<input type="date" name="date" value="{{ expense.date }}">
 ```
 
-#### 10.2 routes.py 的 request.form key 必须查 HTML
-写 routes.py 的 `request.form['xxx']` 时：
-**先查看依赖文件中 index.html 的 `<input name="xxx">` / `<select name="xxx">`，name 必须完全一致！**
-
-如果还没有 index.html（先写 routes.py），则：
-- 在 routes.py 的注释中标注每个 form key
-- 后续写 index.html 时严格参照
-
-#### 10.3 index.html 的表单 name 必须查 routes.py
-写 index.html 的 `<input name="xxx">` 时：
-**先查看依赖文件中 routes.py 的 `request.form['xxx']`，name 必须完全一致！**
-
-#### 10.4 to_dict() 序列化后的数据类型
-如果 models.py 使用 `to_dict()` 将 ORM 对象转为 dict：
-- `datetime` 字段变成了 **字符串**（isoformat），不能再调 `.strftime()`！
-- `relationship` 字段变成了**嵌套 dict**，不是 ORM 对象
-
-**二选一**：
-- 方案 A（推荐）：`to_dict()` 中直接格式化好日期字符串，模板直接 `{{ expense.date }}`
-- 方案 B：routes.py 传原始 ORM 对象给模板（不调 to_dict），模板可以用 `.strftime()`
-
-```python
-# 方案 A: to_dict 中格式化（推荐）
-def to_dict(self):
-    return {
-        "date": self.timestamp.strftime('%Y-%m-%d %H:%M'),  # ← 这里格式化
-        "category_name": self.category.name,  # ← 展平嵌套关系
-    }
-```
-```html
-<!-- 模板直接显示，不调方法 -->
-{{ expense.date }}          ✅ 字符串直接显示
-{{ expense.category_name }} ✅ 展平后的字符串
-{{ expense.timestamp.strftime(...) }} ❌ 崩溃！str 没有 strftime！
-{{ expense.category.name }}  ❌ 嵌套 dict 可能不一致！
-```
+**关键**：既然禁止了 WTForms，就不存在 `.strftime()` 调用的问题。`request.form['date']` 拿到的是字符串，直接存进 SQLite TEXT 字段即可。

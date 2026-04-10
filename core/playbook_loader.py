@@ -205,6 +205,25 @@ class PlaybookLoader:
                         loaded_addons.add(filename)  # 用原始 filename 去重
                         logger.info(f"🧩 Addon 补丁: {actual_display}")
 
+        # 第四层：隐式环境补丁（根据上下文自动推断，不需要 tech_stack 明确指定关键词）
+        # 4.1 SSR 模板补丁
+        if any(kw in all_tech_lower for kw in ["flask", "django"]):
+            if "ssr_template.md" not in loaded_addons and ext in {".py", ".html"}:
+                addon = self._load_file("coder", "_patches", "ssr_template.md")
+                if addon:
+                    parts.append(f"\n\n【环境补丁：SSR 及跨文件契约规范】\n{addon}")
+                    loaded_addons.add("ssr_template.md")
+                    logger.info(f"🧩 环境补丁: SSR 及跨文件契约规范")
+
+        # 4.2 SQLite 原生补丁
+        if "sqlite" in all_tech_lower and not any(kw in all_tech_lower for kw in ["sqlalchemy", "orm", "sequelize", "prisma"]):
+            if "sqlite_native.md" not in loaded_addons and ext == ".py":
+                addon = self._load_file("coder", "_patches", "sqlite_native.md")
+                if addon:
+                    parts.append(f"\n\n【环境补丁：SQLite 原生安全规范】\n{addon}")
+                    loaded_addons.add("sqlite_native.md")
+                    logger.info(f"🧩 环境补丁: SQLite 原生安全规范")
+
         content = "\n\n".join(parts)
         if content:
             # Phase 1.2: P1 技术规范声明

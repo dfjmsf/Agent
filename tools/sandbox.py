@@ -458,11 +458,17 @@ class PythonSandbox:
             # 前端 CSS 框架
             'tailwind', 'tailwindcss', 'bootstrap', 'sass', 'scss', 'less',
             'material', 'antd', 'chakra',
-            # 通用概念
+            # 通用概念 & 常见噪声词
             'restful', 'rest', 'api', 'microservice', 'serverless', 'docker', 'kubernetes',
             'git', 'github', 'ci', 'cd',
+            'cdn', 'ssr', 'spa', 'mvc', 'orm', 'crud', 'http', 'https', 'tcp', 'udp',
+            'frontend', 'backend', 'fullstack', 'full-stack', 'web',
+            'native', 'hybrid', 'responsive', 'pwa',
         }
         
+        # 合法 pip 包名正则：只允许字母、数字、连字符、下划线、点号
+        _VALID_PACKAGE_NAME = re.compile(r'^[a-zA-Z][a-zA-Z0-9._-]*$')
+
         try:
             logger.info(f"🔥 Sandbox 预热启动: {project_id}, tech_stacks={tech_stacks}")
             self.venv_manager.get_or_create_venv(project_id)
@@ -480,14 +486,21 @@ class PythonSandbox:
                     key = re.sub(r'\s*[\d.]+$', '', key).strip()
                     if not key:
                         continue
+                    # 过滤非法字符（中文、符号等 → 绝不是 pip 包名）
+                    if not _VALID_PACKAGE_NAME.match(key):
+                        continue
                     if key in SKIP_NAMES:
                         continue
                     if key in TECH_STACK_TO_PACKAGES:
                         packages_to_install.update(TECH_STACK_TO_PACKAGES[key])
-                    else:
-                        pkg = IMPORT_TO_PACKAGE.get(key, key)
+                    elif key in IMPORT_TO_PACKAGE:
+                        # 只有在 IMPORT_TO_PACKAGE 明确存在映射时才安装
+                        pkg = IMPORT_TO_PACKAGE[key]
                         if pkg.lower() not in STDLIB_MODULES:
                             packages_to_install.add(pkg)
+                    else:
+                        # 未知名称：记录日志但不盲目安装
+                        logger.debug(f"⏭️ 跳过未识别的 tech_stack 项: '{key}'（不在已知映射中）")
             
             if packages_to_install:
                 logger.info(f"📦 预热安装: {packages_to_install}")
@@ -918,129 +931,121 @@ class PythonSandbox:
         self._auto_install_deps(code_string, project_id, sandbox_dir=sandbox_dir)
         
         # 3. 阅后即焚执行
+        temp_dir = tempfile.mkdtemp()
+        process = None
         try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                # v1.3: 从 VfsUtils sandbox 目录复制项目文件
-                if sandbox_dir and os.path.isdir(sandbox_dir):
-                    import shutil
-                    for item in os.listdir(sandbox_dir):
-                        src = os.path.join(sandbox_dir, item)
-                        dst = os.path.join(temp_dir, item)
-                        if os.path.isdir(src):
-                            shutil.copytree(src, dst, dirs_exist_ok=True)
-                        else:
-                            shutil.copy2(src, dst)
-                else:
-                    # sandbox_dir 未提供，无项目文件可复制
-                    logger.warning("⚠️ sandbox_dir 未提供，测试脚本将在空目录中执行")
+            # v1.3: 从 VfsUtils sandbox 目录复制项目文件
+            if sandbox_dir and os.path.isdir(sandbox_dir):
+                import shutil
+                for item in os.listdir(sandbox_dir):
+                    src = os.path.join(sandbox_dir, item)
+                    dst = os.path.join(temp_dir, item)
+                    if os.path.isdir(src):
+                        shutil.copytree(src, dst, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(src, dst)
+            else:
+                # sandbox_dir 未提供，无项目文件可复制
+                logger.warning("⚠️ sandbox_dir 未提供，测试脚本将在空目录中执行")
+            
+            # 生成运行脚本
+            task_id = uuid.uuid4().hex[:8]
+            script_name = f"_run_task_{task_id}.py"
+            script_path = os.path.join(temp_dir, script_name)
+            
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(code_string)
+            logger.info(f"⏳ 使用 sandbox venv 执行: {script_name} (Timeout: {timeout or EXECUTION_TIMEOUT}s)")
+            
+            # stdin 处理
+            stdin_pipe = subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL
+            
+            # 环境变量清洗：删除敏感信息
+            env = {k: v for k, v in os.environ.items() if k not in SENSITIVE_ENV_KEYS}
+            env["PYTHONIOENCODING"] = "utf-8"
+            
+            # 使用 Popen 替代 run，以便在 Windows 上正确杀死进程树
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+            
+            # 使用临时文件替代 PIPE 捕获输出
+            stdout_path = os.path.join(temp_dir, "_stdout.txt")
+            stderr_path = os.path.join(temp_dir, "_stderr.txt")
+            
+            stdout_file = open(stdout_path, "w", encoding="utf-8", errors="replace")
+            stderr_file = open(stderr_path, "w", encoding="utf-8", errors="replace")
+            
+            try:
+                process = subprocess.Popen(
+                    [sandbox_python, script_path],
+                    cwd=temp_dir,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+                    env=env,
+                    creationflags=creationflags,
+                )
                 
-                # 生成运行脚本
-                task_id = uuid.uuid4().hex[:8]
-                script_name = f"_run_task_{task_id}.py"
-                script_path = os.path.join(temp_dir, script_name)
-                
-                with open(script_path, "w", encoding="utf-8") as f:
-                    f.write(code_string)
-                logger.info(f"⏳ 使用 sandbox venv 执行: {script_name} (Timeout: {timeout or EXECUTION_TIMEOUT}s)")
-                
-                # stdin 处理
-                stdin_pipe = subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL
-                
-                # 环境变量清洗：删除敏感信息
-                env = {k: v for k, v in os.environ.items() if k not in SENSITIVE_ENV_KEYS}
-                env["PYTHONIOENCODING"] = "utf-8"
-                
-                # 使用 Popen 替代 run，以便在 Windows 上正确杀死进程树
-                # 背景：Flask 等框架的 reloader 会 spawn 子进程，
-                # subprocess.run(timeout=N) 只杀父进程，子进程持有管道导致 communicate() 永远挂死
-                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
-                
-                # 使用临时文件替代 PIPE 捕获输出
-                # 原因：communicate() 等待 PIPE 关闭，子进程（如 uvicorn worker）
-                # 继承 PIPE 句柄后会阻塞 communicate() 直到超时。
-                # wait() 只等进程退出，不受子进程句柄影响。
-                stdout_path = os.path.join(temp_dir, "_stdout.txt")
-                stderr_path = os.path.join(temp_dir, "_stderr.txt")
-                
-                stdout_file = open(stdout_path, "w", encoding="utf-8", errors="replace")
-                stderr_file = open(stderr_path, "w", encoding="utf-8", errors="replace")
-                
-                try:
-                    process = subprocess.Popen(
-                        [sandbox_python, script_path],
-                        cwd=temp_dir,
-                        stdout=stdout_file,
-                        stderr=stderr_file,
-                        stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-                        env=env,
-                        creationflags=creationflags,
-                    )
-                    
-                    # 如果有 stdin 数据则写入
-                    if stdin_data is not None:
-                        try:
-                            process.stdin.write(stdin_data.encode("utf-8"))
-                            process.stdin.close()
-                        except Exception:
-                            pass
-                    
-                    effective_timeout = timeout or EXECUTION_TIMEOUT
+                # 如果有 stdin 数据则写入
+                if stdin_data is not None:
                     try:
-                        process.wait(timeout=effective_timeout)
-                    except subprocess.TimeoutExpired:
-                        logger.error(f"⚠️ 执行超时 (>{effective_timeout}s)，正在强制终止进程树...")
-                        self._kill_process_tree(process.pid)
-                        try:
-                            process.wait(timeout=5)
-                        except Exception:
-                            pass
-                        
-                        if os.name == 'nt':
-                            time.sleep(0.3)
-                        
-                        # 关闭文件后读取
-                        stdout_file.close()
-                        stderr_file.close()
-                        stdout_str = self._read_file_safe(stdout_path)
-                        stderr_str = self._read_file_safe(stderr_path)
-                        
-                        return {
-                            "success": False,
-                            "stdout": self._truncate_output(stdout_str),
-                            "stderr": f"Execution timed out after {effective_timeout} seconds. (可能存在死循环或阻塞式服务器，进程树已被强制终止)\n{self._truncate_output(stderr_str)}",
-                            "returncode": -1
-                        }
-                finally:
-                    # 确保文件句柄关闭
-                    if not stdout_file.closed:
-                        stdout_file.close()
-                    if not stderr_file.closed:
-                        stderr_file.close()
+                        process.stdin.write(stdin_data.encode("utf-8"))
+                        process.stdin.close()
+                    except Exception:
+                        pass
                 
-                # 正常完成，读取输出
-                stdout_str = self._read_file_safe(stdout_path)
-                stderr_str = self._read_file_safe(stderr_path)
-                
-                stdout_truncated = self._truncate_output(stdout_str or "")
-                stderr_truncated = self._truncate_output(stderr_str or "")
-                
-                success = (process.returncode == 0)
-                
-                if success:
-                    logger.info("✅ 执行成功 (Return: 0)")
-                else:
-                    logger.warning(f"❌ 执行失败 (Return: {process.returncode})")
-                
-                # Windows: 等待文件句柄释放
-                if os.name == 'nt':
-                    time.sleep(0.3)
-                
-                return {
-                    "success": success,
-                    "stdout": stdout_truncated,
-                    "stderr": stderr_truncated,
-                    "returncode": process.returncode
-                }
+                effective_timeout = timeout or EXECUTION_TIMEOUT
+                try:
+                    process.wait(timeout=effective_timeout)
+                except subprocess.TimeoutExpired:
+                    logger.error(f"⚠️ 执行超时 (>{effective_timeout}s)，正在强制终止进程树...")
+                    self._kill_process_tree(process.pid)
+                    try:
+                        process.wait(timeout=5)
+                    except Exception:
+                        pass
+                    
+                    if os.name == 'nt':
+                        time.sleep(0.3)
+                    
+                    # 关闭文件后读取
+                    stdout_file.close()
+                    stderr_file.close()
+                    stdout_str = self._read_file_safe(stdout_path)
+                    stderr_str = self._read_file_safe(stderr_path)
+                    
+                    return {
+                        "success": False,
+                        "stdout": self._truncate_output(stdout_str),
+                        "stderr": f"Execution timed out after {effective_timeout} seconds. (可能存在死循环或阻塞式服务器，进程树已被强制终止)\n{self._truncate_output(stderr_str)}",
+                        "returncode": -1
+                    }
+            finally:
+                # 确保文件句柄关闭
+                if not stdout_file.closed:
+                    stdout_file.close()
+                if not stderr_file.closed:
+                    stderr_file.close()
+            
+            # 正常完成，读取输出
+            stdout_str = self._read_file_safe(stdout_path)
+            stderr_str = self._read_file_safe(stderr_path)
+            
+            stdout_truncated = self._truncate_output(stdout_str or "")
+            stderr_truncated = self._truncate_output(stderr_str or "")
+            
+            success = (process.returncode == 0)
+            
+            if success:
+                logger.info("✅ 执行成功 (Return: 0)")
+            else:
+                logger.warning(f"❌ 执行失败 (Return: {process.returncode})")
+            
+            return {
+                "success": success,
+                "stdout": stdout_truncated,
+                "stderr": stderr_truncated,
+                "returncode": process.returncode
+            }
         
         except Exception as e:
             logger.error(f"⚠️ 沙盒框架严重异常: {e}")
@@ -1050,6 +1055,48 @@ class PythonSandbox:
                 "stderr": f"Sandbox critical failure: {str(e)}",
                 "returncode": -1
             }
+        finally:
+            # === 鲁棒清理：杀进程 + 重试删除 ===
+            # 1. 杀进程树（兜底，防止 atexit 的 _cleanup 漏杀）
+            if process and process.pid:
+                self._kill_process_tree(process.pid)
+            # 2. Windows: 按端口杀残留（Flask reloader 的子进程可能逃逸进程树）
+            if os.name == 'nt':
+                try:
+                    # 从代码中提取端口号
+                    port_match = re.search(r'PORT\s*=\s*(\d+)', code_string)
+                    if port_match:
+                        kill_port = int(port_match.group(1))
+                        out = subprocess.check_output(
+                            f"netstat -ano | findstr :{kill_port}", shell=True
+                        ).decode(errors='replace')
+                        for line in out.splitlines():
+                            if f":{kill_port} " in line and "LISTENING" in line:
+                                orphan_pid = line.strip().split()[-1]
+                                subprocess.run(
+                                    ["taskkill", "/F", "/T", "/PID", orphan_pid],
+                                    capture_output=True, timeout=5
+                                )
+                                logger.info(f"🔪 杀死端口 {kill_port} 上的幽灵进程 PID={orphan_pid}")
+                except Exception:
+                    pass
+            # 3. 重试删除临时目录（最多 3 次，每次间隔递增）
+            import shutil
+            for attempt in range(3):
+                try:
+                    shutil.rmtree(temp_dir, ignore_errors=False)
+                    break
+                except Exception:
+                    if attempt < 2:
+                        delay = (attempt + 1) * 1.5
+                        time.sleep(delay)
+                    else:
+                        # 最终兜底：标记待清理，不阻塞后续流程
+                        logger.warning(f"⚠️ 临时目录清理失败（将由 OS 回收）: {temp_dir}")
+                        try:
+                            shutil.rmtree(temp_dir, ignore_errors=True)
+                        except Exception:
+                            pass
 
 
 sandbox_env = PythonSandbox()

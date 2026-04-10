@@ -37,12 +37,14 @@ class ManagerAgent:
         self.coder = CoderAgent(project_id)
         self.reviewer = ReviewerAgent(project_id)
 
-    def _generate_project_spec(self, user_requirement: str, plan_md: str = None) -> dict:
+    def _generate_project_spec(self, user_requirement: str, plan_md: str = None,
+                               playbook_hint: str = "") -> dict:
         """
         步骤 1: 生成或增量更新项目规划书 (Project Spec)。
         - 新项目: 全量生成
         - 已有规划书: 注入旧 spec，让 LLM 判断是否需要修改（允许原样输出）
         - plan_md: 用户确认过的 plan.md，作为 P0.5 合同约束
+        - playbook_hint: Playbook 铁律摘要，防止规划出被禁止的技术栈
         """
         logger.info("📋 Manager 正在生成/更新项目规划书...")
         
@@ -62,6 +64,15 @@ class ManagerAgent:
             system_prompt = Prompts.MANAGER_SPEC_SYSTEM
             logger.info("📋 新项目，全量生成规划书")
         
+        # P2: Playbook 铁律注入（防止规划出被禁止的技术栈）
+        if playbook_hint:
+            system_prompt += (
+                "\n\n═══ P2 — 编码铁律（规划时必须遵守，违反将导致后续构建熔断）═══\n"
+                f"{playbook_hint}\n"
+                "【重要】你在规划 module_interfaces 时，不得使用上述被禁止的包/类/函数！\n"
+            )
+            logger.info(f"📜 Playbook 铁律已注入 Manager Spec Prompt")
+
         # P0.5 合同注入：plan.md 约束高于一切
         if plan_md:
             contract_clause = (
@@ -458,10 +469,16 @@ class ManagerAgent:
             logger.error(f"❌ [两阶段] Stage 2 [{group_id}] 失败: {e}")
             return []
 
-    def plan_patch(self, user_requirement: str) -> dict:
+    def plan_patch(self, user_requirement: str, project_spec: str = "",
+                   playbook_hint: str = "") -> dict:
         """
         Patch Mode 精简规划：读取项目文件树 + Observer 骨架，
         只规划需要修改的文件（跳过 Spec 生成）。
+
+        Args:
+            user_requirement: 修改需求描述
+            project_spec: 项目规划书文本（可选，提供架构上下文）
+            playbook_hint: Playbook 核心铁律摘要（可选，防止修复方案与 Reviewer 冲突）
         """
         logger.info("⚡ [Patch Mode] Manager 精简规划启动...")
         global_broadcaster.emit_sync("Manager", "patch_plan_start", "Patch Mode: 分析需修改的文件...")
@@ -495,12 +512,19 @@ class ManagerAgent:
 
         file_skeletons = "\n\n".join(skeleton_parts) if skeleton_parts else "无骨架信息。"
 
-        # 3. 构建 prompt
+        # 3. 构建 prompt（注入规划书 + Playbook 铁律）
         system_prompt = Prompts.MANAGER_PATCH_SYSTEM.format(
             project_id=self.project_id,
             file_tree=file_tree,
             file_skeletons=file_skeletons,
         )
+        # P0 增强：注入项目规划书，让 Manager 了解架构
+        if project_spec:
+            system_prompt += f"\n\n【项目规划书（架构参考）】\n{project_spec[:3000]}"
+        # P0 增强：注入 Playbook 铁律，防止修复方案与 Reviewer 冲突
+        if playbook_hint:
+            system_prompt += f"\n\n【编码铁律（Reviewer 审查依据，修复方案不得违反）】\n{playbook_hint}"
+
         user_prompt = f"主人的修改需求：\n{user_requirement}\n请严格按照 JSON Schema 输出。"
 
         # 4. 调用 LLM

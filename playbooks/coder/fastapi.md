@@ -131,14 +131,9 @@
    - 不要分"业务函数"和"路由函数"——直接在被装饰的函数中写逻辑
    - 如果确实需要拆分，必须在 `@router.xxx` 装饰的函数中**调用**业务函数
 
-9. **🚨 SQLite 数据库必须在启动时初始化（创建表）**
-
-   > **不初始化 = `no such table` 错误 = 所有 API 返回 500！**
-
-   `models.py` 中定义 `init_db()` 创建表后，**必须在 `main.py` 启动时调用**：
-
+9. **SQLite 初始化（FastAPI 生命周期）**
+   - 必须在启动时调用 `init_db()`，推荐使用 `lifespan`：
    ```python
-   # main.py
    from contextlib import asynccontextmanager
    from models import init_db
 
@@ -149,14 +144,3 @@
 
    app = FastAPI(lifespan=lifespan)
    ```
-
-   **或者更简单的同步写法：**
-   ```python
-   # main.py
-   from models import init_db
-
-   app = FastAPI()
-   init_db()  # 模块加载时就创建表
-   ```
-
-   **❌ 严禁遗漏 `init_db()` 调用，否则数据库表不存在！**

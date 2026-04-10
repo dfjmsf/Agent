@@ -12,6 +12,9 @@ import { chatWithPM, chatAction, fetchChatHistory } from '../services/api';
 
 const WELCOME_MSG = { role: 'pm', content: '👋 你好！我是 ASTrea 项目经理。告诉我你想做什么项目，我来帮你规划。', plan_md: null, actions: null };
 
+// localStorage 持久化 key
+const getChatStorageKey = (projectId) => `astrea_pm_chat_${projectId}`;
+
 export default function PMChat({ currentProjectId }) {
   const [messages, setMessages] = useState([WELCOME_MSG]);
   const [input, setInput] = useState('');
@@ -19,25 +22,70 @@ export default function PMChat({ currentProjectId }) {
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
 
-  // 项目切换时：清空 → 加载历史
+  const messagesProjectRef = useRef(currentProjectId);
+  const isTransitioningRef = useRef(false);
+
+  // 项目切换时：从 localStorage 恢复（含 plan_md/actions），降级从后端加载
   useEffect(() => {
     if (!currentProjectId) return;
     setInput('');
     setIsLoading(false);
 
-    // 从后端加载持久化的对话历史
+    // 🔒 锁定：阻止持久化 effect 在过渡期写入旧数据
+    isTransitioningRef.current = true;
+
+    // 立即清空为初始状态
+    setMessages([WELCOME_MSG]);
+
+    // 标记 messages 归属的项目
+    messagesProjectRef.current = currentProjectId;
+
+    // 优先从 localStorage 恢复（包含完整的 plan_md、actions 等字段）
+    const storageKey = getChatStorageKey(currentProjectId);
+    const cached = localStorage.getItem(storageKey);
+    if (cached) {
+      try {
+        const parsed = JSON.parse(cached);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setMessages(parsed);
+          // 解锁：用 setTimeout 让 React 有机会完成 state 更新
+          setTimeout(() => { isTransitioningRef.current = false; }, 0);
+          return;
+        }
+      } catch (e) { /* JSON 解析失败，降级到后端 */ }
+    }
+
+    // 降级：从后端 FTS5 加载
     fetchChatHistory(currentProjectId)
       .then(data => {
+        if (messagesProjectRef.current !== currentProjectId) return;
         if (data.messages && data.messages.length > 0) {
           setMessages([WELCOME_MSG, ...data.messages]);
-        } else {
-          setMessages([WELCOME_MSG]);
         }
       })
-      .catch(() => {
-        setMessages([WELCOME_MSG]);
+      .catch(() => {})
+      .finally(() => {
+        // 无论成功失败，解锁持久化
+        setTimeout(() => { isTransitioningRef.current = false; }, 0);
       });
   }, [currentProjectId]);
+
+  // messages 变更时自动持久化到 localStorage
+  // ⚠️ 只依赖 [messages]，不依赖 currentProjectId！
+  // 使用 messagesProjectRef 确定写入哪个项目的 key
+  useEffect(() => {
+    // 过渡期间不写入（防止旧 messages 写到新项目 key 下）
+    if (isTransitioningRef.current) return;
+    const projectId = messagesProjectRef.current;
+    if (!projectId) return;
+    if (messages.length <= 1) return;
+    const storageKey = getChatStorageKey(projectId);
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(messages));
+    } catch (e) {
+      console.warn('PMChat: localStorage 写入失败', e);
+    }
+  }, [messages]);
 
   // 自动滚动到底部
   useEffect(() => {

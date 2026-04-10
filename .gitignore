@@ -17,6 +17,12 @@ __pycache__/
 
 # 临时执行沙盒脚本 (绝对禁止被 Git 追踪，防止污染仓库记录)
 _run_*.py
+_test_*.py
+_check_*.py
+_debug_*.py
+_fix_*.py
+_verify_*.py
+test.py
 workspace/_run_*.py
 
 # Agent 自动生成的产出项目 (防无限 Git 套娃)
@@ -29,6 +35,9 @@ sandboxes/
 # 上下文文件上传隔离沙盒
 uploads/
 
+# 数据目录 (可能含数据库文件)
+data/
+
 # Node.js 与前端构建产物
 frontend/node_modules/
 frontend/dist/
@@ -40,4 +49,6 @@ Thumbs.db
 
 # 个人开发与临时文件
 规划.txt
+思路.txt
+流程.txt
 logs.txt

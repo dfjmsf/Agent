@@ -1,11 +1,12 @@
 """
 PM Agent — ASTrea 化身，用户的唯一对话窗口
 
-Phase 2.5.1 双层架构：
-  Layer 1: 路由嗅探器（保守正则 + LLM 主力分类）
-  Layer 2: 人格化身（高情商回复 + 上下文按需注入）
+Phase 2.6 双层架构：
+  Layer 1: 保守正则命令前缀（零 Token 确定性快车道）
+  Layer 2: LLM Tool Calling 路由（原生结构化意图识别）
+  Layer 3: 人格化身（高情商回复 + 上下文按需注入）
 
-路由类型：create / patch / rollback / chat / scan / clarify
+路由工具：route_to_create / route_to_patch / route_to_rollback / reply_to_chat / ask_for_clarification
 状态机：idle / wait_confirm / wait_patch_confirm / wait_rollback_confirm / wait_clarify
 """
 import os
@@ -111,20 +112,34 @@ class PMAgent:
 
         # ---- 状态机优先分发 ----
         if self.state == "wait_confirm":
-            response = self._handle_plan_revision(user_message)
+            # 检测用户是否在给方案反馈，还是发起了全新意图
+            # 如果是新意图（patch/rollback/create），逃逸出 wait_confirm
+            probe = self._classify_intent(user_message)
+            probe_route = probe.get("route", "reply_to_chat")
+            if probe_route in ("route_to_patch", "route_to_rollback", "route_to_create"):
+                logger.info(f"用户在 wait_confirm 状态下发起了新意图: {probe_route}，逃逸！")
+                self.state = "idle"
+                self.pending_req = None
+                self.pending_plan_md = None
+                self._last_route = probe
+                response = self._dispatch_route(probe, user_message)
+            else:
+                # 正常的方案反馈
+                response = self._handle_plan_revision(user_message)
         elif self.state == "wait_patch_confirm":
             # 用户在修改确认阶段的回复，暂时走 chat 处理
             response = self._handle_chat(user_message)
         elif self.state == "wait_rollback_confirm":
             response = self._handle_chat(user_message)
         elif self.state == "wait_clarify":
-            # 用户澄清后重新路由
+            # 策略 B 蓄水池：用户澄清后，带着完整 conversation 窗口重新路由
             self.state = "idle"
             route_result = self._classify_intent(user_message)
             self._last_route = route_result
+            logger.info(f"澄清后重新路由: {route_result}")
             response = self._dispatch_route(route_result, user_message)
         else:
-            # idle 状态 → Layer 1 路由
+            # idle 状态 → Layer 1 正则 / Layer 2 Tool Calling
             route_result = self._classify_intent(user_message)
             self._last_route = route_result
             logger.info(f"路由结果: {route_result}")
@@ -149,10 +164,22 @@ class PMAgent:
         return response
 
     def _dispatch_route(self, route_result: dict, message: str) -> PMResponse:
-        """根据路由结果分发到对应处理器"""
-        route = route_result.get("route", "chat")
+        """根据路由结果分发到对应处理器（v2.6 Tool Calling 版）"""
+        route = route_result.get("route", "reply_to_chat")
+        args = route_result.get("args", {})
 
-        if route == "create":
+        if route == "route_to_create":
+            return self._handle_create(message)
+        elif route == "route_to_patch":
+            return self._handle_patch(message)
+        elif route == "route_to_rollback":
+            return self._handle_rollback(message)
+        elif route == "ask_for_clarification":
+            return self._handle_clarify_v2(args)
+        elif route == "reply_to_chat":
+            return self._handle_chat(message)
+        # 兼容旧路由名（正则层 /scan 等）
+        elif route == "create":
             return self._handle_create(message)
         elif route == "patch":
             return self._handle_patch(message)
@@ -160,8 +187,6 @@ class PMAgent:
             return self._handle_rollback(message)
         elif route == "scan":
             return self._handle_scan(message)
-        elif route == "clarify":
-            return self._handle_clarify(message)
         else:
             return self._handle_chat(message)
 
@@ -194,78 +219,76 @@ class PMAgent:
             return PMResponse(intent="action", reply=f"未知操作: {action}")
 
     # ============================================================
-    # Layer 1: 路由嗅探器（保守正则 + LLM 主力）
+    # Layer 1: 路由嗅探器（保守正则 + Tool Calling）
     # ============================================================
 
     def _classify_intent(self, message: str) -> dict:
         """
-        双层路由：
-        - 层 1: 保守正则 — 仅匹配显式命令前缀（100% 确定性）
-        - 层 2: LLM 分类 — 所有自然语言一律交给 LLM（~200 tokens）
-        - 安全网: 置信度 < 0.7 → clarify
+        双层路由 v2.6：
+        - 层 1: 保守正则 — 仅匹配显式命令前缀（100% 确定性，零 Token）
+        - 层 2: LLM Tool Calling — 原生结构化意图识别
         """
         msg = message.strip()
 
         # === 层 1: 显式命令前缀（100% 确定性，零 LLM）===
         if msg.startswith('/plan') or msg.startswith('/create'):
-            return {"route": "create", "confidence": 1.0, "context_needs": []}
+            return {"route": "route_to_create", "args": {"user_requirement": msg}}
         if msg.startswith('/scan'):
-            return {"route": "scan", "confidence": 1.0, "context_needs": []}
+            return {"route": "scan", "args": {}}
         if msg.startswith('/rollback'):
-            return {"route": "rollback", "confidence": 1.0, "context_needs": ["file_list"]}
+            return {"route": "route_to_rollback", "args": {"rollback_hint": msg}}
         if msg.startswith('/patch'):
-            return {"route": "patch", "confidence": 1.0, "context_needs": ["file_list"]}
+            return {"route": "route_to_patch", "args": {"modification_summary": msg}}
 
-        # === 层 2: LLM 分类（所有自然语言）===
-        result = self._llm_classify(message)
+        # === 层 2: LLM Tool Calling 路由 ===
+        return self._tool_call_route(message)
 
-        # === 安全网：置信度不够就追问 ===
-        if result.get("confidence", 0) < 0.7:
-            logger.info(f"路由置信度过低 ({result.get('confidence', 0)})，触发 clarify")
-            return {"route": "clarify", "confidence": result.get("confidence", 0), "context_needs": []}
-
-        return result
-
-    def _llm_classify(self, message: str) -> dict:
-        """调用 LLM 做五分类意图识别，输出结构化 dict"""
+    def _tool_call_route(self, message: str) -> dict:
+        """
+        通过 LLM Tool Calling 实现路由（v2.6 替代旧 JSON 分类器）。
+        LLM 从 5 个工具中选择一个，系统级结构化输出，无需 JSON 手动解析。
+        """
         project_exists = self._project_exists()
         project_status = f"项目 {self.project_id} — {'已存在，包含源代码文件' if project_exists else '不存在或为空项目'}"
 
         try:
-            prompt = Prompts.PM_INTENT_CLASSIFIER_V2.format(
+            system_prompt = Prompts.PM_ROUTE_SYSTEM.format(
                 project_status=project_status,
-                message=message,
             )
-            response = default_llm.chat_completion(
+            messages = [{"role": "system", "content": system_prompt}]
+            # 带上近几轮对话（策略 B 蓄水池：让 LLM 自动从上下文中累积信息）
+            messages.extend(self.conversation[-4:])
+
+            resp = default_llm.chat_completion(
                 model=self.model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
+                tools=Prompts.PM_ROUTE_TOOLS,
+                tool_choice="required",
                 temperature=0.0,
             )
-            raw = response.content.strip()
 
-            # 清理 Markdown 代码块包裹
-            if "```json" in raw:
-                raw = raw.split("```json")[1].split("```")[0].strip()
-            elif "```" in raw:
-                raw = raw.split("```")[1].split("```")[0].strip()
+            # 解析 Tool Call
+            if resp.tool_calls:
+                tc = resp.tool_calls[0]
+                func_name = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    args = {}
+                logger.info(f"Tool Calling 路由: {func_name}({args})")
+                # 根据路由类型自动推断 context_needs（兼容下游 _build_project_context）
+                context_needs = []
+                if func_name in ("route_to_patch", "route_to_rollback", "route_to_create"):
+                    context_needs = ["file_list"]
+                return {"route": func_name, "args": args, "context_needs": context_needs}
 
-            result = json.loads(raw)
+            # Fallback: 模型没选工具 → chat
+            logger.info("Tool Calling 未选择工具，降级为 chat")
+            return {"route": "reply_to_chat", "args": {}}
 
-            # 验证必要字段
-            route = result.get("route", "chat")
-            valid_routes = ("create", "patch", "rollback", "chat", "scan")
-            if route not in valid_routes:
-                logger.warning(f"LLM 返回非法路由 '{route}'，降级为 chat")
-                route = "chat"
-
-            return {
-                "route": route,
-                "confidence": float(result.get("confidence", 0.8)),
-                "context_needs": result.get("context_needs", []),
-            }
-        except (json.JSONDecodeError, Exception) as e:
-            logger.warning(f"LLM 意图分类失败: {e}，降级为 chat")
-            return {"route": "chat", "confidence": 0.5, "context_needs": []}
+        except Exception as e:
+            logger.warning(f"Tool Calling 路由失败: {e}，降级为 chat")
+            return {"route": "reply_to_chat", "args": {}}
 
     def _project_exists(self) -> bool:
         """检查当前项目是否已有真实文件"""
@@ -579,14 +602,26 @@ class PMAgent:
         )
 
     def _handle_clarify(self, message: str) -> PMResponse:
-        """意图不明确时追问用户"""
+        """[旧版兼容] 意图不明确时追问用户"""
         self.state = "wait_clarify"
-
-        # 根据上下文生成有温度的追问
         if self._project_exists():
             reply = "我不太确定您的意思——您是想对现有项目做一些修改，还是想创建一个全新的项目？"
         else:
             reply = "我想先确认一下，您是想创建一个新项目吗？如果是的话，可以跟我说说您想做什么。"
+        return PMResponse(intent="clarify", reply=reply)
+
+    def _handle_clarify_v2(self, args: dict) -> PMResponse:
+        """Tool Calling 触发的澄清（策略 A 熔断 + 策略 C 引导式收束）"""
+        self.state = "wait_clarify"
+        question = args.get("question", "能告诉我更多细节吗？")
+        options = args.get("options", [])
+
+        if options:
+            # 策略 C: 选项作为文本建议嵌入回复，用户自由回答
+            opts_text = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(options)])
+            reply = f"{question}\n\n{opts_text}\n\n您可以选择上述方向，也可以告诉我您自己的想法。"
+        else:
+            reply = question
 
         return PMResponse(intent="clarify", reply=reply)
 
@@ -603,7 +638,19 @@ class PMAgent:
         self.pending_req = structured_req
         self.pending_plan_md = plan_md
 
-        reply = "已经根据您的反馈更新了方案，请在方案面板查看最新版本。"
+        # 用 LLM 生成有温度的确认回复（而非硬编码）
+        try:
+            resp = default_llm.chat_completion(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "你是友好的项目经理。用一句话告知用户方案已根据反馈更新，请查看并确认。语气简洁自然，不要机械化。"},
+                    {"role": "user", "content": f"用户反馈：{message[:100]}"},
+                ],
+                temperature=0.7,
+            )
+            reply = resp.content.strip()
+        except Exception:
+            reply = f"好的，我已经根据您关于「{message[:30]}」的反馈重新调整了方案，请在右侧面板查看最新版本~"
 
         return PMResponse(
             intent="create",

@@ -45,8 +45,30 @@ function App() {
   // --- 日志追加 ---
   const appendLog = useCallback((role, type, text) => {
     const timestamp = new Date().toLocaleTimeString();
-    setReviewerLogs(prev => [...prev, { id: Date.now() + Math.random(), timestamp, role, type, text }]);
+    setReviewerLogs(prev => {
+      const newLogs = [...prev, { id: Date.now() + Math.random(), timestamp, role, type, text }];
+      if (currentProjectIdRef.current && currentProjectIdRef.current !== "default_project") {
+        localStorage.setItem(`reviewerLogs_${currentProjectIdRef.current}`, JSON.stringify(newLogs));
+      }
+      return newLogs;
+    });
   }, []);
+
+  // --- 加载历史日志 ---
+  useEffect(() => {
+    if (currentProjectId !== "default_project") {
+      const saved = localStorage.getItem(`reviewerLogs_${currentProjectId}`);
+      if (saved) {
+        try {
+          setReviewerLogs(JSON.parse(saved));
+        } catch(e) {
+          setReviewerLogs([]);
+        }
+      } else {
+        setReviewerLogs([]);
+      }
+    }
+  }, [currentProjectId]);
 
   // --- 拉取项目文件树 ---
   const refreshProjectFiles = useCallback(async (projectId) => {
@@ -158,7 +180,7 @@ function App() {
     setCurrentProjectId(newProjectId);
     setTasks([]);
     setCoderCode("// 正在聆听架构师指令...\n");
-    setReviewerLogs([]);
+    // reviewerLogs 会在副作用中自动加载目标项目的独立日志
     setActiveTask("");
   }, [currentProjectId]);
 
@@ -167,7 +189,11 @@ function App() {
     if (!prompt.trim()) return;
     setIsGenerating(true);
     setTasks([]);
+    // 当开始全新生成时，清空当前项目的沙盒日志
     setReviewerLogs([]);
+    if (currentProjectId !== "default_project") {
+      localStorage.removeItem(`reviewerLogs_${currentProjectId}`);
+    }
     setCoderCode("// 正在加载全局架构配置...\n");
     setActiveTask("");
 

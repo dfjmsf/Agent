@@ -356,6 +356,7 @@ class ReviewerAgent:
         L0.6: 跨文件字段一致性检查。
         检查 1: HTML Jinja 模板变量 vs models.py to_dict() 返回字段
         检查 2: routes.py request.form keys vs HTML name 属性
+        检查 3: render_template() 参数名 vs 模板顶层变量名
         """
         basename = os.path.basename(target_file).lower()
 
@@ -366,6 +367,12 @@ class ReviewerAgent:
                 target_file, code_content, sandbox_dir)
             if not jinja_pass:
                 return False, jinja_error
+
+            # L0.6-C: render_template 参数名 vs 模板顶层变量名
+            rt_pass, rt_error = self._l0_render_template_var_check(
+                target_file, code_content, sandbox_dir)
+            if not rt_pass:
+                return False, rt_error
 
             # L0.6-B 反向检查已禁用：
             # 审查 HTML 时反向检查 routes.py 的 form keys 会产生误报，
@@ -572,6 +579,109 @@ class ReviewerAgent:
         logger.info(f"✅ [L0.6-B] 表单字段校验通过: {target_file}")
         return True, ""
 
+    def _l0_render_template_var_check(self, target_file: str, html_content: str,
+                                       sandbox_dir: str) -> Tuple[bool, str]:
+        """
+        L0.6-C: 检查 render_template() 传入的顶层变量名是否与模板中使用的顶层变量名一致。
+        拦截典型 bug: render_template('index.html', summary=data) 但模板中
+        {% for item in summaries %} — summaries 不存在，导致空循环或 UndefinedError。
+        """
+        # 1. 确定当前 HTML 文件名
+        html_basename = os.path.basename(target_file)
+
+        # 2. 在沙盒中找所有 Python 路由文件提取 render_template 调用
+        route_files = ['routes.py', 'views.py', 'app.py']
+        render_kwargs = set()  # render_template 传入的关键字参数名
+
+        for rf in route_files:
+            rf_path = self._find_file_in_sandbox(sandbox_dir, rf)
+            if not rf_path:
+                continue
+            try:
+                with open(rf_path, 'r', encoding='utf-8') as f:
+                    routes_content = f.read()
+            except Exception:
+                continue
+
+            # 匹配 render_template('index.html', key1=..., key2=...)
+            # 支持单引号和双引号
+            for m in re.finditer(
+                r"render_template\s*\(\s*['\"]" + re.escape(html_basename) + r"['\"]\s*,([^)]+)\)",
+                routes_content
+            ):
+                args_str = m.group(1)
+                # 提取所有 keyword=value 中的 keyword
+                for kw in re.finditer(r'(\w+)\s*=', args_str):
+                    render_kwargs.add(kw.group(1))
+
+        if not render_kwargs:
+            return True, ""  # 没找到 render_template 调用，跳过
+
+        # 3. 提取模板中使用的顶层变量名
+        template_vars = set()
+
+        # 3a. {% for xxx in YYY %} → YYY 是顶层变量
+        for m in re.finditer(r'\{%\s*for\s+\w+\s+in\s+(\w+)', html_content):
+            template_vars.add(m.group(1))
+
+        # 3b. {% if YYY %} / {% if YYY|length %} → YYY 是顶层变量
+        for m in re.finditer(r'\{%\s*(?:if|elif)\s+(\w+)', html_content):
+            template_vars.add(m.group(1))
+
+        # 3c. {{ YYY }} / {{ YYY|filter }} → 单独的顶层变量（不含点号的）
+        for m in re.finditer(r'\{\{\s*(\w+)(?:\s*[|}]|\s*\}\})', html_content):
+            template_vars.add(m.group(1))
+
+        # 过滤掉 Jinja 内置变量和 for 循环局部变量
+        jinja_builtins = {
+            'loop', 'range', 'request', 'config', 'session', 'g',
+            'url_for', 'get_flashed_messages', 'true', 'false', 'none',
+            'self', 'caller', 'joiner', 'namespace',
+        }
+        # 提取 for 循环的迭代变量（局部变量，不算顶层）
+        loop_vars = set()
+        for m in re.finditer(r'\{%\s*for\s+(\w+)\s+in\s+', html_content):
+            loop_vars.add(m.group(1))
+
+        template_vars -= jinja_builtins
+        template_vars -= loop_vars
+
+        if not template_vars:
+            return True, ""  # 模板中没有可检查的顶层变量
+
+        # 4. 检查：模板使用的顶层变量是否都在 render_template 参数中
+        missing = template_vars - render_kwargs
+        if missing:
+            # 进一步过滤：只报告那些看起来像数据变量的（排除 CSS class 等）
+            # 如果 missing 中有变量同时出现在 for/if 块中，才认为是真正的数据变量
+            confirmed_missing = set()
+            for var in missing:
+                # 确认该变量确实在 for/if 上下文中被引用（不是随机的单词）
+                if re.search(r'\{%\s*(?:for|if|elif)\s+.*?\b' + re.escape(var) + r'\b', html_content):
+                    confirmed_missing.add(var)
+
+            if confirmed_missing:
+                routes_tag = ""
+                for rf in route_files:
+                    rf_path = self._find_file_in_sandbox(sandbox_dir, rf)
+                    if rf_path:
+                        routes_tag = f"[CROSS_FILE:{os.path.relpath(rf_path, sandbox_dir)}] "
+                        break
+
+                error = (
+                    f"{routes_tag}[L0.6-C render_template 变量缺失] {target_file}: "
+                    f"模板引用了 render_template() 未传入的顶层变量: {sorted(confirmed_missing)}。"
+                    f"render_template('{html_basename}', ...) 实际传入的变量名: {sorted(render_kwargs)}。"
+                    f"修复方法：确保 render_template 的关键字参数名与模板中 "
+                    f"'{{% for x in YYY %}}' / '{{% if YYY %}}' 的 YYY 完全一致。"
+                )
+                logger.warning(f"❌ {error}")
+                global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+                return False, error
+
+        logger.info(f"✅ [L0.6-C] render_template 变量校验通过: {target_file}")
+        return True, ""
+
     @staticmethod
     def _extract_to_dict_keys(models_content: str) -> dict:
         """
@@ -604,6 +714,72 @@ class ReviewerAgent:
                     keys.add(m.group(1))
                 if keys:
                     class_keys[cls_name] = keys
+        # 模式 2: 原生 SQL — 提取 SELECT 列名和 AS 别名（按函数分组）
+        sql_keywords = {
+            'SELECT', 'FROM', 'WHERE', 'GROUP', 'BY', 'ORDER', 'DESC', 'ASC',
+            'DISTINCT', 'NULL', 'NOT', 'AND', 'OR', 'INTEGER', 'TEXT', 'REAL',
+            'PRIMARY', 'KEY', 'AUTOINCREMENT', 'DEFAULT', 'CURRENT_TIMESTAMP',
+            'IF', 'EXISTS', 'TABLE', 'CREATE', 'INSERT', 'UPDATE', 'DELETE',
+            'INTO', 'VALUES', 'SET', 'HAVING', 'LIMIT', 'OFFSET', 'JOIN',
+            'LEFT', 'RIGHT', 'INNER', 'ON', 'AS', 'LIKE', 'IN', 'BETWEEN',
+        }
+        func_blocks = re.finditer(
+            r'def\s+(\w+)\s*\([^)]*\)\s*.*?(?=\ndef\s|\Z)',
+            models_content, re.DOTALL
+        )
+        for func_match in func_blocks:
+            func_name = func_match.group(1)
+            func_body = func_match.group(0)
+
+            select_blocks = re.finditer(
+                r'SELECT\s+(.*?)\s+FROM\s',
+                func_body, re.DOTALL | re.IGNORECASE
+            )
+            for sel in select_blocks:
+                select_clause = sel.group(1)
+                keys = set()
+
+                columns = re.split(r',\s*(?![^(]*\))', select_clause)
+                for col in columns:
+                    col = col.strip()
+                    if not col or col == '*':
+                        continue
+
+                    as_match = re.search(r'\bAS\s+(\w+)\s*$', col, re.IGNORECASE)
+                    if as_match:
+                        keys.add(as_match.group(1))
+                    else:
+                        ident_match = re.search(r'(\w+)\s*$', col)
+                        if ident_match:
+                            name = ident_match.group(1)
+                            if name.upper() not in sql_keywords:
+                                keys.add(name)
+
+                if keys:
+                    group_name = f"_sql_{func_name}"
+                    class_keys[group_name] = keys
+
+        # 模式 3: CREATE TABLE 列名 → 作为兜底字段集
+        table_keys = set()
+        create_blocks = re.finditer(
+            r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\((.*?)\)',
+            models_content, re.DOTALL | re.IGNORECASE
+        )
+        for tbl_match in create_blocks:
+            columns_def = tbl_match.group(2)
+            for col_def in columns_def.split(','):
+                col_def = col_def.strip()
+                if not col_def:
+                    continue
+                first_word = col_def.split()[0] if col_def.split() else ''
+                constraint_kw = {'PRIMARY', 'FOREIGN', 'UNIQUE', 'CHECK', 'CONSTRAINT'}
+                if first_word.upper() in constraint_kw:
+                    continue
+                if first_word and first_word.upper() not in sql_keywords:
+                    table_keys.add(first_word)
+
+        if table_keys:
+            class_keys["_table"] = table_keys
 
         return class_keys
 

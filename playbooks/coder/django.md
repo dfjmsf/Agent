@@ -52,6 +52,7 @@ class User(models.Model):
 - 每个模型必须有 `__str__` 方法
 - 必须有 `to_dict()` 方法（或使用 DRF Serializer）
 - `auto_now_add=True` 用于创建时间，`auto_now=True` 用于更新时间
+- 🚨 **外键级联铁律**：所有 `models.ForeignKey` 必须明确指定 `on_delete` 参数（通常为 `models.CASCADE`），否则迁移直接报错！
 
 ### 3. URL 路由
 ```python
@@ -71,8 +72,11 @@ urlpatterns = [
 ]
 ```
 - App 内部使用相对导入 `from . import views`（Django 项目例外，允许相对导入）
-- URL 末尾必须有斜杠 `/`
 - 使用 `include()` 分层路由
+- 🚨 **Trailing Slash (末尾斜杠) 铁律**：
+  - Django 路由默认要求末尾有 `/`（如 `path('users/', ...)`）。
+  - **如果前端 `fetch('/api/users')` 漏了末尾斜杠，Django 会触发 301 重定向到 `/api/users/`，导致 POST 请求被浏览器强制转为 GET 并丢弃 Body！**最终引发毫无头绪的 CORS 错误或 405 错误。
+  - **前后端必须严格对齐：要么全带 `/`，要么全不带！推荐前端一律加 `/`**。
 
 ### 4. 视图函数（Function-Based Views）
 ```python
@@ -93,6 +97,8 @@ def user_list(request):
 - API 端点必须加 `@csrf_exempt`（或配置 CSRF 中间件豁免）
 - 返回列表时 `JsonResponse(list, safe=False)`（safe=False 必须）
 - 解析 POST body：`json.loads(request.body)`
+- 🚨 **传统 SSR 表单的 CSRF 403 铁律**：
+  - 如果不使用 `@csrf_exempt` 而是渲染 HTML 表单提给后端，**`<form>` 内部必须包含 `{% csrf_token %}`**，否则提交 100% 报 `403 Forbidden`！
 
 ### 5. Django REST Framework（DRF）模式
 ```python

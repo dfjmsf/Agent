@@ -254,7 +254,9 @@ class AstreaEngine:
                 if not integration_ok:
                     logger.warning("⚠️ 确定性集成测试 2 次未通过，降级为警告交付")
                     global_broadcaster.emit_sync("System", "integration_warning", "⚠️ 集成测试未完全通过，降级为警告交付")
-                    success = True
+                    # 标记为 warning 而非 success，前端可据此展示差异化 UI
+                    update_project_status(self.project_id, "warning")
+                    success = True  # 仍然交付，但状态为 warning
 
         # Phase 3: 结算
         if success:
@@ -355,6 +357,15 @@ class AstreaEngine:
             f"用户需求: {user_requirement}"
         )
 
+        # 🔧 Patch Mode 关键补丁：从已有项目文件推断 tech_stack
+        # 否则 playbook_loader 匹配不到任何 playbook → Coder 不遵守编码规范
+        inferred_tech_stack = self._infer_tech_stack(final_dir)
+        if inferred_tech_stack:
+            if not self.blackboard.state.project_spec:
+                self.blackboard.state.project_spec = {}
+            self.blackboard.state.project_spec["tech_stack"] = inferred_tech_stack
+            logger.info(f"🔍 [Patch Mode] 推断 tech_stack: {inferred_tech_stack}")
+
         # 记录事件
         append_event("manager", "patch_plan", json.dumps(plan, ensure_ascii=False),
                      project_id=self.project_id)
@@ -382,7 +393,12 @@ class AstreaEngine:
                 success = self._retry_from_integration()
                 if success:
                     integration_ok = self._phase_integration_test()
-                    success = integration_ok
+                if not integration_ok:
+                    # 与 Create Mode 保持一致：降级为警告交付
+                    logger.warning("⚠️ [Patch] 确定性集成测试 2 次未通过，降级为警告交付")
+                    global_broadcaster.emit_sync("System", "integration_warning", "⚠️ 集成测试未完全通过，降级为警告交付")
+                    update_project_status(self.project_id, "warning")
+                    success = True
 
         if success:
             self.blackboard.set_project_status(ProjectStatus.COMPLETED)
@@ -417,6 +433,79 @@ class AstreaEngine:
             self.vfs.clean_sandbox()
 
         return success, final_dir
+
+    # ============================================================
+    # Tech Stack 推断（Patch Mode 用）
+    # ============================================================
+
+    def _infer_tech_stack(self, project_dir: str) -> list:
+        """
+        从已有项目文件推断 tech_stack（用于 Patch Mode 加载 Playbook）。
+        规则：按文件扩展名、关键 import 语句和配置文件嗅探。
+        确保 PlaybookLoader 的 Addon Assembly 能在 Patch Mode 下正确注入补丁。
+        """
+        stack = set()
+        if not os.path.isdir(project_dir):
+            return []
+
+        for root, dirs, files in os.walk(project_dir):
+            # 跳过隐藏目录和缓存
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__pycache__' and d != 'node_modules']
+            for fname in files:
+                ext = os.path.splitext(fname)[1].lower()
+                fpath = os.path.join(root, fname)
+
+                if ext == '.py':
+                    stack.add("Python")
+                    try:
+                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                            head = f.read(2000)
+                        # 后端框架嗅探
+                        if "from flask" in head or "import flask" in head:
+                            stack.add("Flask")
+                        if "from django" in head or "import django" in head:
+                            stack.add("Django")
+                        if "from fastapi" in head or "import fastapi" in head:
+                            stack.add("FastAPI")
+                        # 数据库嗅探
+                        if "import sqlite3" in head:
+                            stack.add("SQLite")
+                        if "from sqlalchemy" in head or "import sqlalchemy" in head:
+                            stack.add("SQLAlchemy")
+                    except Exception:
+                        pass
+                elif ext == '.html':
+                    stack.add("HTML")
+                elif ext == '.css':
+                    stack.add("CSS")
+                elif ext in ('.js', '.jsx'):
+                    stack.add("JavaScript")
+                elif ext in ('.ts', '.tsx'):
+                    stack.add("TypeScript")
+                elif ext == '.vue':
+                    stack.add("Vue3")
+
+                # 配置文件嗅探
+                fname_lower = fname.lower()
+                if fname_lower == 'package.json':
+                    try:
+                        with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                            pkg = json.loads(f.read())
+                        all_deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+                        if "react" in all_deps:
+                            stack.add("React")
+                        if "vue" in all_deps:
+                            stack.add("Vue3")
+                        if "next" in all_deps:
+                            stack.add("Next.js")
+                    except Exception:
+                        pass
+                elif fname_lower in ('tailwind.config.js', 'tailwind.config.ts', 'tailwind.config.mjs'):
+                    stack.add("Tailwind")
+                elif fname_lower == 'next.config.js' or fname_lower == 'next.config.mjs':
+                    stack.add("Next.js")
+
+        return sorted(stack)
 
     # ============================================================
     # Rollback Mode: 版本回退
@@ -618,12 +707,11 @@ class AstreaEngine:
 
     def _phase_integration_test(self) -> bool:
         """Phase 2.5: 端到端集成测试"""
-        from agents.integration_tester import IntegrationTester
+        qa_mode = os.getenv("QA_MODE", "react")  # react | legacy
 
-        logger.info("🧪 [Phase 2.5] 集成测试启动...")
-        global_broadcaster.emit_sync("System", "integration_test", "🧪 Phase 2.5: 启动集成测试")
-
-        tester = IntegrationTester(self.project_id)
+        logger.info(f"🧪 [Phase 2.5] 集成测试启动... (模式: {qa_mode})")
+        global_broadcaster.emit_sync("System", "integration_test",
+            f"🧪 Phase 2.5: 启动集成测试 ({qa_mode} 模式)")
 
         # 收集项目所有代码（从真理区，非仅 task 列表）
         # Patch 模式下 tasks 只有被修改的文件，但入口文件（app.py）可能不在其中
@@ -661,11 +749,33 @@ class AstreaEngine:
 
         sandbox_dir = self.vfs.sandbox_dir if self.vfs else ""
 
-        result = tester.run_integration_test(
-            project_spec=self.blackboard.state.spec_text,
-            all_code=all_code,
-            sandbox_dir=sandbox_dir,
-        )
+        # 获取 sandbox venv python 路径
+        venv_python = ""
+        try:
+            from tools.sandbox import sandbox_env
+            venv_python = sandbox_env.venv_manager.get_or_create_venv(self.project_id)
+        except Exception:
+            pass
+
+        if qa_mode == "react":
+            # 新: QA Agent (ReAct Tool Calling)
+            from agents.qa_agent import QAAgent
+            qa = QAAgent(self.project_id)
+            result = qa.run_qa(
+                project_spec=self.blackboard.state.spec_text,
+                all_code=all_code,
+                sandbox_dir=sandbox_dir,
+                venv_python=venv_python,
+            )
+        else:
+            # 旧: IntegrationTester (legacy fallback)
+            from agents.integration_tester import IntegrationTester
+            tester = IntegrationTester(self.project_id)
+            result = tester.run_integration_test(
+                project_spec=self.blackboard.state.spec_text,
+                all_code=all_code,
+                sandbox_dir=sandbox_dir,
+            )
 
         if result["passed"]:
             if result.get("warning"):
@@ -686,13 +796,13 @@ class AstreaEngine:
                         task.status = TaskStatus.TODO  # 重置为 TODO 让调度器可以重新选取
                         break
 
-            # 如果 failed_files 为空但测试确实失败，标记所有 py 文件
+            # 如果 failed_files 为空但测试确实失败，
+            # 将错误信息写入所有已完成的 task（让 _retry_from_integration 的 Manager 来分诊）
             if not result.get("failed_files"):
                 for task in self.blackboard.state.tasks:
-                    if task.target_file.endswith('.py') and task.status == TaskStatus.DONE:
+                    if task.status == TaskStatus.DONE:
                         task.log_error(f"[集成测试] {result['feedback'][:500]}")
-                        task.status = TaskStatus.TODO
-                        break  # 只重置第一个后端文件
+                # 不再随机重置某个文件为 TODO，交由 Manager plan_patch 精确判定
 
             logger.warning(f"❌ [Phase 2.5] 集成测试失败: {result['feedback'][:200]}")
             global_broadcaster.emit_sync("System", "integration_failed",
@@ -745,7 +855,32 @@ class AstreaEngine:
                 f"[集成测试失败，需要修复]\n{feedback}\n\n"
                 f"请根据以上错误信息，精确判断哪些文件需要修改、如何修改。"
             )
-            patch_plan = manager.plan_patch(patch_requirement)
+
+            # P0 增强：传入规划书让 Manager 了解项目架构
+            spec_text = self.blackboard.state.spec_text or ""
+
+            # P0 增强：提取 Playbook 核心铁律摘要，防止 Manager 给出与 Reviewer 冲突的修复方案
+            playbook_hint = ""
+            try:
+                from core.playbook_loader import PlaybookLoader
+                _pb = PlaybookLoader()
+                _tech = (self.blackboard.state.project_spec or {}).get("tech_stack", [])
+                # 只提取铁律/禁令部分（包含"禁止"、"严禁"、"铁律"的行）
+                full_pb = _pb.load_for_coder(_tech, "app.py")
+                if full_pb:
+                    iron_rules = [line for line in full_pb.split("\n")
+                                  if any(k in line for k in ("禁止", "严禁", "铁律", "绝对不", "MUST NOT"))]
+                    if iron_rules:
+                        playbook_hint = "\n".join(iron_rules[:20])  # 最多 20 条
+                        logger.info(f"📜 [Mini Re-plan] 注入 {len(iron_rules)} 条 Playbook 铁律")
+            except Exception as e:
+                logger.warning(f"⚠️ Playbook 铁律提取失败: {e}")
+
+            patch_plan = manager.plan_patch(
+                patch_requirement,
+                project_spec=spec_text,
+                playbook_hint=playbook_hint,
+            )
 
             tasks_to_fix = patch_plan.get("tasks", [])
 
@@ -758,14 +893,27 @@ class AstreaEngine:
             reset_count = 0
             for patch_task in tasks_to_fix:
                 target = patch_task.get("target_file", "")
-                desc = patch_task.get("description", "")
+                fix_desc = patch_task.get("description", "")
                 for task in self.blackboard.state.tasks:
                     if task.target_file == target:
-                        task.description = desc  # 覆盖为精确修复指令
+                        # 保留原始 description，追加修复指令（可追溯）
+                        fix_round = len([log for log in (task.error_logs or [])
+                                        if "[集成测试]" in str(log)]) + 1
+                        original_desc = task.description
+                        task.description = (
+                            f"[FIX_{fix_round}] {fix_desc}\n"
+                            f"--- 原始任务 ---\n{original_desc}"
+                        )
                         task.status = TaskStatus.TODO
-                        task.retry_count = 0  # 重置熔断计数，集成测试回退不继承之前的重试次数
+                        task.retry_count = 0  # 重置熔断计数
+                        # P0 修复：将 QA 原始报错注入 tech_lead_feedback
+                        # _execute_task 启动时会将此作为初始 feedback → Coder 走修复路径
+                        task.tech_lead_feedback = (
+                            f"【集成测试失败 — QA 原始报错】\n{feedback}\n\n"
+                            f"【Manager 修复指令】\n{fix_desc}"
+                        )
                         reset_count += 1
-                        logger.info(f"🎯 [Mini Re-plan] {target}: {desc[:80]}")
+                        logger.info(f"🎯 [Mini Re-plan] {target}: [FIX_{fix_round}] {fix_desc[:80]}")
                         break
 
             if reset_count == 0:
@@ -800,8 +948,29 @@ class AstreaEngine:
         if plan_md_content:
             logger.info(f"plan.md 已读取 ({len(plan_md_content)} 字符)，将作为合同约束注入 Manager")
 
-        # Step 1: 生成规划书（含 project_name + tech_stack），注入 plan.md 合同
-        project_spec = manager._generate_project_spec(user_requirement, plan_md=plan_md_content)
+        # Step 0.6: 提取 Playbook 铁律（防止 Manager 规划出被禁止的技术栈）
+        playbook_hint = ""
+        try:
+            from core.playbook_loader import PlaybookLoader
+            _pb = PlaybookLoader()
+            # 先用用户需求推测技术栈（spec 还没生成，无法确定）
+            # 默认加载 Flask（最常见）+ 通用规则
+            for tech_guess in [["Flask"], ["FastAPI"]]:
+                full_pb = _pb.load_for_coder(tech_guess, "app.py")
+                if full_pb:
+                    iron_rules = [line for line in full_pb.split("\n")
+                                  if any(k in line for k in ("禁止", "严禁", "铁律", "绝对不", "MUST NOT"))]
+                    if iron_rules:
+                        playbook_hint += "\n".join(iron_rules[:15]) + "\n"
+            if playbook_hint:
+                logger.info(f"📜 [Phase 1] Playbook 铁律已提取，将注入 Spec 生成")
+        except Exception as e:
+            logger.warning(f"⚠️ Playbook 铁律提取失败: {e}")
+
+        # Step 1: 生成规划书（含 project_name + tech_stack），注入 plan.md 合同 + Playbook 铁律
+        project_spec = manager._generate_project_spec(
+            user_requirement, plan_md=plan_md_content, playbook_hint=playbook_hint
+        )
 
         # Step 1.5: 从 spec 提取项目名 → 立即重命名 + 启动 sandbox 预热
         project_name = (project_spec.get("project_name", "") or "").replace(" ", "_") if project_spec else ""
@@ -2020,12 +2189,13 @@ class AstreaEngine:
                 session.commit()
                 if stale:
                     logger.info(f"🧹 旧轨迹已归档: {stale} 条")
-            except Exception:
+            except Exception as e:
+                logger.warning(f"⚠️ 旧轨迹归档失败（已 rollback）: {e}")
                 session.rollback()
             finally:
                 ScopedSession.remove()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"⚠️ 旧轨迹归档 session 创建失败: {e}")
 
     def _record_tdd_event(self, task: TaskItem, code: str,
                           is_pass: bool, feedback: str):

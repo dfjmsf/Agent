@@ -45,30 +45,17 @@
    - 如果定义了 class，必须在 `DOMContentLoaded` 回调中 new 它，禁止只定义不实例化！
    - 如果 class 中有用于创建/渲染 DOM 的方法（如 `renderEditor`、`renderUI`），必须在 constructor 或 `init()` 中调用，禁止定义了不用！
 
-6. **事件绑定方式**
-   - 使用 `document.getElementById('xxx').addEventListener('click', ...)` 绑定交互事件。
-   - 或者在 HTML 中使用 `onclick="myApp.handleClick()"` 内联绑定（需确保实例挂到 window 上）。
+6. **事件绑定与动态 DOM 铁律 (Event Delegation)**
+   - 对于写死在 HTML 中的静态元素，可以使用 `document.getElementById('xxx').addEventListener('click', ...)` 或 HTML 内联 `onclick="myApp.handleClick()"`。
+   - 🚨 **动态 DOM 绑定失效坑**：如果是通过 `fetch` 获取数据后用 `innerHTML` 动态拼接生成的元素（例如列表项的“删除”按钮），**绝对禁止在 `DOMContentLoaded` 就去 `getElementById` 绑定事件！**（此时必定报错 `Cannot read property 'addEventListener' of null`）。
+   - **正确做法（事件委托）**：将事件绑定到永远存在的父容器（如 `document.body` 或 `#list-container`）上：
+     ```javascript
+     document.getElementById('list-container').addEventListener('click', (e) => {
+         if (e.target.closest('.delete-btn')) {
+             const id = e.target.closest('.delete-btn').dataset.id;
+             this.deleteItem(id);
+         }
+     });
+     ```
 
-## Jinja 模板规则（如果 HTML 包含 `{% %}` / `{{ }}` 语法）
 
-7. **Jinja 数据字段一致性铁律**
-   - `{{ expense.xxx }}` 中的 xxx 必须是**后端传入数据中实际存在的字段**。
-   - **查看依赖文件中 models.py 的 SQL 查询返回了哪些字段**来确定可用字段名。
-   - 数据是 dict（来自 `sqlite3.Row`），不是对象！禁止用 `expense.category.name` 这种嵌套访问！
-   - 如果 SQL 用了 `AS category_name`，模板中用 `{{ expense.category_name }}`，不是 `{{ expense.category.name }}`。
-
-8. **Jinja 表单字段名一致性**
-   - `<input name="xxx">` 的 name 必须与依赖文件中 routes.py 的 `request.form['xxx']` 完全一致！
-   - 写 HTML 前**先查看 routes.py 中的 request.form key**，严格对齐。
-
-9. **Jinja 禁止在序列化数据上调用方法**
-   - 如果后端用了 `to_dict()` 转换数据，所有字段都是 str/int/float/dict，**不是 Python 对象**！
-   - `{{ expense.timestamp.strftime('%Y-%m-%d') }}` → ❌ 崩溃（str 没有 strftime）
-   - `{{ expense.timestamp }}` → ✅ 直接显示字符串
-   - **规则：Jinja 模板中只做 `{{ xxx }}` 显示和 `{% for %}` 循环，禁止调用 `.strftime()` / `.lower()` 等 Python 方法**
-
-10. **禁止引用不存在的模板文件**
-    - `{% extends "base.html" %}` 和 `{% include "header.html" %}` 会引用其他模板文件。
-    - **如果 base.html / header.html 不在当前项目的文件列表中 → 绝对禁止使用 extends/include！**
-    - 所有 HTML 内容必须写在单个 index.html 中（包含完整的 `<!DOCTYPE html>` 结构）。
-    - `{% extends "base.html" %}` + base.html 不存在 = `TemplateNotFound` 崩溃！

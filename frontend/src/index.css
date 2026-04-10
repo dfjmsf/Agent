@@ -322,6 +322,12 @@ body {
   min-height: 0;
 }
 
+.tree-content {
+  flex-grow: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
 /* Right Main Area - Artifact Preview */
 .right-workspace {
   flex: 1;

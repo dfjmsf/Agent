@@ -156,3 +156,16 @@ export default App
 - **列表渲染必须有 key**：`items.map(item => <div key={item.id}>...)</div>)`
 - **状态更新不可变**：禁止直接 `items.push()`，必须 `setItems([...items, newItem])`
 - **构建产物在 dist/**：`npm run build` 后生成 `dist/index.html` + `dist/assets/`
+
+### 🚨 致命坑点防御：无限渲染死循环 (Infinite Loop)
+> **Agent 最容易犯的毁灭性错误：组件无限发请求刷爆后端！**
+
+- **严禁直接在组件主体内发请求**：`fetch()` 改变状态 -> 触发重渲染 -> 再次 `fetch()` -> 死循环！
+- **`useEffect` 依赖数组铁律**：如果是只在挂载时获取一次数据，**必须**传入空数组 `[]`！
+  ```jsx
+  // ⛔ 致命错误：漏写 [] 会导致每次渲染都重新触发！
+  useEffect(() => { loadItems() }) 
+  
+  // ✅ 标准安全阵法
+  useEffect(() => { loadItems() }, []) 
+  ```

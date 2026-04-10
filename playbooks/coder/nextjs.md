@@ -49,9 +49,9 @@ export default function Counter() {
   return <button onClick={() => setCount(c => c + 1)}>{count}</button>;
 }
 ```
-- **铁律**：只有需要 `useState`/`useEffect`/事件处理器的组件才加 `'use client'`
-- Server Component 禁止使用 React hooks
-- Client Component 不能直接 import Server Component
+- 🚨 **客户端组件声明铁律**：如果是需要交互（`onClick`, `onChange`）或使用了 React hooks（`useState`, `useEffect`），**文件第一行必须是 `'use client';`**（连空格都不能在它前面）！否则页面将直接引发 Server Error 500！
+- Server Component **绝对禁止**使用任何 React hooks 或事件绑定。
+- Client Component 不能直接 import Server Component。
 
 ### 3. API Routes（Route Handlers）
 ```javascript

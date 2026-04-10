@@ -142,6 +142,7 @@ class LLMClient:
         messages: List[Dict[str, str]], 
         model: str, 
         tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
         temperature: float = 0.2,
         enable_thinking: bool = False,
     ) -> Any:
@@ -153,6 +154,7 @@ class LLMClient:
             messages: 消息字典列表 (包含 role 和 content)
             model: 目标模型名称 (如 qwen3-max, Gemini3.1pro, glm-5)
             tools: 可选的工具定义列表，用于 Function Calling
+            tool_choice: 工具选择策略 ("auto"/"required"/"none")
             temperature: 生成温度系数
             enable_thinking: 是否启用深度思考（仅 qwen3 系列有效）
             
@@ -169,6 +171,8 @@ class LLMClient:
         }
         if tools:
             kwargs["tools"] = tools
+            if tool_choice:
+                kwargs["tool_choice"] = tool_choice
 
         # qwen3/3.5 系列：通过 enable_thinking 控制深度思考
         if "qwen3" in model:
