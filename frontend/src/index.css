@@ -1488,6 +1488,214 @@ body {
   flex-shrink: 0;
 }
 
+/* Add Provider button */
+.ms-add-provider-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 12px;
+  background: rgba(59, 199, 199, 0.08);
+  border: 1px dashed rgba(59, 199, 199, 0.3);
+  border-radius: 20px;
+  font-family: 'Inter', sans-serif;
+  font-size: 11px;
+  color: #3bc7c7;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.ms-add-provider-btn:hover {
+  background: rgba(59, 199, 199, 0.15);
+  border-color: #3bc7c7;
+}
+
+/* Add Provider form */
+.ms-add-form {
+  padding: 12px 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  animation: msFadeIn 0.2s ease;
+}
+
+@keyframes msFadeIn {
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.ms-form-row {
+  display: flex;
+  gap: 8px;
+}
+
+.ms-form-row input {
+  flex: 1;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  padding: 7px 10px;
+  color: var(--text-main);
+  font-family: 'Fira Code', monospace;
+  font-size: 11px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.ms-form-row input:focus {
+  border-color: #3bc7c7;
+}
+
+.ms-form-row input::placeholder {
+  color: var(--text-dim);
+  font-family: 'Inter', sans-serif;
+}
+
+.ms-form-submit {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 7px 16px;
+  background: rgba(59, 199, 199, 0.12);
+  border: 1px solid #3bc7c7;
+  border-radius: 5px;
+  color: #3bc7c7;
+  font-family: 'Inter', sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  align-self: flex-end;
+}
+
+.ms-form-submit:hover:not(:disabled) {
+  background: #3bc7c7;
+  color: #000;
+}
+
+.ms-form-submit:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Custom providers list */
+.ms-custom-providers {
+  padding: 12px 16px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.ms-custom-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  border-radius: 5px;
+  margin-bottom: 4px;
+  transition: background 0.15s;
+}
+
+.ms-custom-row:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.ms-custom-info {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  min-width: 0;
+}
+
+.ms-custom-name {
+  font-family: 'Inter', sans-serif;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-main);
+  flex-shrink: 0;
+}
+
+.ms-custom-key {
+  font-family: 'Fira Code', monospace;
+  font-size: 10px;
+  color: #f0883e;
+  background: rgba(240, 136, 62, 0.1);
+  padding: 2px 8px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.ms-custom-url {
+  font-family: 'Fira Code', monospace;
+  font-size: 10px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ms-custom-delete {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 4px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  transition: color 0.2s;
+  flex-shrink: 0;
+}
+
+.ms-custom-delete:hover {
+  color: #f85149;
+}
+
+/* 思考模式下拉选择 */
+.ms-thinking-select {
+  width: 62px;
+  flex-shrink: 0;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-family: 'Fira Code', monospace;
+  font-size: 11px;
+  padding: 5px 6px;
+  cursor: pointer;
+  transition: all 0.2s;
+  appearance: none;
+  text-align: center;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10'%3E%3Cpath fill='%23888' d='M2 4l3 3 3-3'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 4px center;
+  padding-right: 16px;
+}
+
+.ms-thinking-select:hover {
+  border-color: rgba(177, 74, 237, 0.3);
+  background-color: rgba(177, 74, 237, 0.05);
+}
+
+.ms-thinking-select:focus {
+  outline: none;
+  border-color: #b14aed;
+  box-shadow: 0 0 0 1px rgba(177, 74, 237, 0.3);
+}
+
+.ms-thinking-select.on {
+  color: #b14aed;
+  border-color: #b14aed;
+  background-color: rgba(177, 74, 237, 0.12);
+  box-shadow: 0 0 8px rgba(177, 74, 237, 0.15);
+}
+
+.ms-thinking-select option {
+  background: #1a1a2e;
+  color: var(--text-main);
+}
+
+
 /* ============================================================
    PM Chat — 对话组件样式
    ============================================================ */

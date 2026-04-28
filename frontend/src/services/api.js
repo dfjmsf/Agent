@@ -118,11 +118,39 @@ export async function fetchModelConfig() {
   return res.json();
 }
 
-export async function updateModelConfig(config) {
+export async function updateModelConfig(config, thinking = null) {
+  const body = { config };
+  if (thinking) body.thinking = thinking;
   const res = await fetch(`${API_BASE}/api/config/models`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ config })
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+// --- 自定义 Provider CRUD ---
+
+export async function fetchCustomProviders() {
+  const res = await fetch(`${API_BASE}/api/config/custom_providers`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function addCustomProvider({ name, api_key, base_url, models }) {
+  const res = await fetch(`${API_BASE}/api/config/custom_providers`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name, api_key, base_url, models })
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function deleteCustomProvider(name) {
+  const res = await fetch(`${API_BASE}/api/config/custom_providers/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
@@ -131,13 +159,28 @@ export async function updateModelConfig(config) {
 // --- PM Agent 对话 API ---
 
 export async function chatWithPM(message, projectId) {
-  const res = await fetch(`${API_BASE}/api/chat`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message, project_id: projectId })
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+  const controller = new AbortController();
+  const timeoutSeconds = 240;
+  const timer = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
+  try {
+    const res = await fetch(`${API_BASE}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message, project_id: projectId }),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    console.log('[chatWithPM] 收到响应:', data?.intent, 'reply_len:', data?.reply?.length);
+    return data;
+  } catch (e) {
+    clearTimeout(timer);
+    if (e.name === 'AbortError') {
+      throw new Error(`PM 响应超时（${timeoutSeconds}s），请重试`);
+    }
+    throw e;
+  }
 }
 
 export async function chatAction(action, projectId) {

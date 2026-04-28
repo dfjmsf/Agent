@@ -72,6 +72,21 @@ def extract_xml_files(raw_text: str) -> List[Dict[str, str]]:
                 "content": content,
             })
 
+    # Fallback 2: 内嵌 <file_path> 和 <file_content> 格式
+    if not results:
+        pattern_inner = re.compile(
+            r'<astrea_file>.*?<file_path>([^<]+)</file_path>.*?<file_content>\s*(.*?)\s*</file_content>.*?</astrea_file>',
+            re.DOTALL
+        )
+        for match in pattern_inner.finditer(raw_text):
+            path = match.group(1).strip()
+            content = match.group(2).strip()
+            results.append({
+                "path": path,
+                "action": "create",
+                "content": content,
+            })
+
     # 最终 Fallback: markdown 代码块清洗
     if not results:
         cleaned = _clean_markdown_legacy(raw_text)
@@ -99,8 +114,16 @@ def _clean_markdown_legacy(raw_text: str) -> str:
             if in_block:
                 cleaned_lines.append(line)
         if cleaned_lines:
-            return '\n'.join(cleaned_lines)
-    return code
+            code = '\n'.join(cleaned_lines)
+            
+    # 清理可能残留的 astrea_file 标签
+    code = re.sub(r'<astrea_file[^>]*>', '', code)
+    code = re.sub(r'</astrea_file>', '', code)
+    code = re.sub(r'<file_path>[^<]*</file_path>', '', code)
+    code = re.sub(r'<file_content>', '', code)
+    code = re.sub(r'</file_content>', '', code)
+    
+    return code.strip()
 
 
 # ============================================================

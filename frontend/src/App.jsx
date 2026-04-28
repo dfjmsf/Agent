@@ -118,6 +118,12 @@ function App() {
       appendLog("Reviewer", "success", "✓ 审核通过！合并入主分支。");
       setActiveRole("Manager");
     }
+    else if (action_type === 'execution_complete') {
+      // v4.1: PM 执行完成的引导性回复 → 追加到 PMChat
+      setIsGenerating(false);
+      appendLog("PM", "success", content);
+      window.dispatchEvent(new CustomEvent('pm-guided-reply', { detail: { content } }));
+    }
     else if (action_type === 'project_renamed') {
       const { old_id, new_id } = payload;
       setProjectsList(prev => prev.map(p => (p === old_id ? new_id : p)));

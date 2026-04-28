@@ -174,6 +174,21 @@ class Observer:
                 entry = {"name": node.name, "fields": fields}
                 if table_name:
                     entry["table"] = table_name
+
+                # P1-a: 提取 to_dict() 返回的 key（解决 Column 名 ≠ to_dict key 的偏差）
+                to_dict_keys = []
+                for method in ast.iter_child_nodes(node):
+                    if (isinstance(method, ast.FunctionDef) and
+                            method.name == 'to_dict'):
+                        for stmt in ast.walk(method):
+                            if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Dict):
+                                for k in stmt.value.keys:
+                                    if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                                        to_dict_keys.append(k.value)
+                        break
+                if to_dict_keys:
+                    entry["to_dict_keys"] = to_dict_keys
+
                 models.append(entry)
 
         if models:
@@ -207,6 +222,8 @@ class Observer:
                 route_info = self._parse_route_decorator(dec, source)
                 if route_info:
                     route_info["function"] = node.name
+                    # P1-d: Flask 装饰器路由的 endpoint 默认等于函数名
+                    route_info["endpoint"] = node.name
                     routes.append(route_info)
 
         # 方式 2: 扫描 add_url_rule('/', 'name', func, methods=[...]) 调用
@@ -231,7 +248,11 @@ class Observer:
             # 提取函数名（第 3 个位置参数）
             if len(node.args) >= 3 and isinstance(node.args[2], ast.Name):
                 func_name = node.args[2].id
-            routes.append({"method": method, "path": path, "function": func_name})
+            # P1-d: 提取 endpoint 名（第 2 个位置参数）
+            endpoint = func_name  # 默认 endpoint = 函数名
+            if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                endpoint = str(node.args[1].value)
+            routes.append({"method": method, "path": path, "function": func_name, "endpoint": endpoint})
 
         if routes:
             logger.info(f"🛤️ extract_routes({file_path}) → {len(routes)} 个路由")

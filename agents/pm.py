@@ -6,25 +6,31 @@ Phase 2.6 双层架构：
   Layer 2: LLM Tool Calling 路由（原生结构化意图识别）
   Layer 3: 人格化身（高情商回复 + 上下文按需注入）
 
-路由工具：route_to_create / route_to_patch / route_to_rollback / reply_to_chat / ask_for_clarification
-状态机：idle / wait_confirm / wait_patch_confirm / wait_rollback_confirm / wait_clarify
+路由工具：execute_project_task / route_to_revise_plan / reply_to_chat / ask_for_clarification
+状态机：idle / wait_confirm / wait_clarify
 """
 import os
 import re
 import json
 import logging
 import subprocess
+import threading
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict, Any
 
+from core.audit_guard import render_audit_report_markdown
+from core.blackboard import BlackboardState
 from core.llm_client import default_llm
+from core.project_scanner import scan_existing_project
 from core.prompt import Prompts
+from core.techlead_scope import TargetScope, resolve_target_scope
 from core.ws_broadcaster import global_broadcaster
 
 logger = logging.getLogger("PMAgent")
 
-# 滑动窗口大小（5 轮 = 10 条消息：5 user + 5 assistant）
-_SLIDING_WINDOW_SIZE = 10
+# 滑动窗口 — Token 预算制（弹性设计：超出不截断当前对话对）
+_WINDOW_TOKEN_BUDGET = 4000   # 目标 token 预算（v2: 从 3000 扩容，plan 锚定已解决核心失忆）
+_CHAR_PER_TOKEN = 2           # 中英混合估算：~2 chars/token
 
 
 @dataclass
@@ -48,7 +54,10 @@ class PMAgent:
 
     def __init__(self, project_id: str):
         self.project_id = project_id
-        self.model = os.getenv("MODEL_PM", "deepseek-chat")
+        self.model = os.getenv("MODEL_PM", "deepseek-v4-flash")
+        _et, _re = default_llm.parse_thinking_config(os.getenv("THINKING_PM", "false"))
+        self.enable_thinking = _et
+        self._reasoning_effort = _re
 
         # 对话滑动窗口（内存态）
         self.conversation: List[dict] = []
@@ -56,15 +65,19 @@ class PMAgent:
         # 待确认的规划（等待用户 confirm/reject）
         self.pending_req: Optional[dict] = None
         self.pending_plan_md: Optional[str] = None
+        self._plan_created_at_round: int = 0  # plan 产生时的 round_id（安全窗口用）
+        self._plan_version: int = 0           # 当前 plan 版本号
 
         # patch / rollback 暂存
         self.pending_patch: Optional[str] = None          # 用户的修改意图描述
+        self.pending_extend: Optional[str] = None         # 用户的新增模块意图描述
+        self.pending_continue: Optional[str] = None       # 继续修复上一轮 QA 失败的确认上下文
         self.pending_rollback_commit: Optional[str] = None # 待回滚的 commit hash
 
-        # 状态机
+        # 状态机（v3.0 透明化路由）
         self.state: str = "idle"
-        # 有效状态: "idle" | "wait_confirm" | "wait_patch_confirm"
-        #           | "wait_rollback_confirm" | "wait_clarify"
+        # 有效状态: "idle" | "wait_confirm" | "wait_clarify"
+        self.pending_mode: str = ""  # execute_project_task 的 mode: create/modify/continue/rollback/audit
 
         # Engine 执行时的 mode（create/patch/rollback）
         self.confirmed_mode: str = "auto"
@@ -75,8 +88,43 @@ class PMAgent:
         # 轮次计数（用于 FTS5 round_id）
         self.round_id: int = 0
 
+        # 决策备忘录（Phase 2 Letta-Lite Core Memory）
+        self._memo: Dict[str, str] = {
+            "tech_stack": "",      # 技术栈决策
+            "features": "",        # 已确认功能列表
+            "design": "",          # 设计偏好
+            "pending": "",         # 待定事项
+            "user_prefs": "",      # 用户性格/偏好
+        }
+        self._memo_log: List[str] = []  # 审计日志
+        self._memo_lock = threading.Lock()
+        self._archiving_event = threading.Event()
+        self._archiving_event.set()  # 初始：无归档任务
+
+        # v4.0: 执行账本（每轮 Engine 执行的结构化摘要）
+        self.execution_ledger: List[dict] = []
+
+        # v4.0: Phase 分步构建
+        self.project_phases: List[dict] = []     # [{index, name, features, status}]
+        self.current_phase_index: int = 0
+        self._full_plan_md: Optional[str] = None  # 完整 plan（含所有 Phase）
+
         # FTS5 对话存储（延迟初始化，需要 project_dir）
         self._store = None
+
+    def refresh_runtime_config(self):
+        """从当前环境变量刷新 PM 运行时模型配置。"""
+        self.model = os.getenv("MODEL_PM", "deepseek-v4-flash")
+        _et, _re = default_llm.parse_thinking_config(os.getenv("THINKING_PM", "false"))
+        self.enable_thinking = _et
+        self._reasoning_effort = _re
+
+    def _chat_completion(self, **kwargs):
+        self.refresh_runtime_config()
+        kwargs.setdefault("model", self.model)
+        kwargs.setdefault("enable_thinking", self.enable_thinking)
+        kwargs.setdefault("reasoning_effort", self._reasoning_effort)
+        return default_llm.chat_completion(**kwargs)
 
     def _get_store(self):
         """延迟初始化 ConversationStore"""
@@ -95,6 +143,91 @@ class PMAgent:
         return self._store
 
     # ============================================================
+    # 决策备忘录管理（Phase 2 Letta-Lite）
+    # ============================================================
+
+    _MEMO_FIELDS = {"tech_stack", "features", "design", "pending", "user_prefs"}
+
+    def _execute_update_memo(self, field: str, action: str, value: str):
+        """字段级备忘录更新执行器（代码层强制安全约束）"""
+        if field not in self._MEMO_FIELDS:
+            logger.warning(f"非法备忘录字段: {field}")
+            return
+        if not value or not value.strip():
+            logger.warning(f"拒绝空值写入: {field}")
+            return
+
+        with self._memo_lock:
+            old = self._memo.get(field, "")
+            if action == "set":
+                self._memo[field] = value.strip()
+                self._memo_log.append(f"R{self.round_id} SET {field}: {old!r} → {value!r}")
+            elif action == "append":
+                self._memo[field] = f"{old}, {value.strip()}" if old else value.strip()
+                self._memo_log.append(f"R{self.round_id} APPEND {field}: +{value!r}")
+            else:
+                logger.warning(f"非法备忘录操作: {action}")
+                return
+            logger.info(f"备忘录更新: [{action}] {field} = {self._memo[field]}")
+
+    def _build_memo_text(self) -> str:
+        """将备忘录序列化为注入 prompt 的文本"""
+        labels = {
+            "tech_stack": "技术栈",
+            "features": "已确认功能",
+            "design": "设计偏好",
+            "pending": "待定事项",
+            "user_prefs": "用户偏好",
+        }
+        with self._memo_lock:
+            parts = []
+            for key, label in labels.items():
+                val = self._memo.get(key, "")
+                if val:
+                    parts.append(f"{label}: {val}")
+            memo_text = "\n".join(parts) if parts else ""
+        # v4.0: 注入执行账本摘要
+        if self.execution_ledger:
+            recent = self.execution_ledger[-3:]
+            ledger_lines = []
+            for e in recent:
+                status = "✅" if e["success"] else "❌"
+                features = ", ".join(e["built_features"][:3]) if e["built_features"] else "无"
+                ledger_lines.append(f"  R{e['round']} {status} {e['mode']}: {features}")
+            memo_text += "\n【执行历史】\n" + "\n".join(ledger_lines)
+        return memo_text
+
+    def _async_archive(self, user_msg: str, pm_reply: str):
+        """后台线程：提取本轮决策变更并更新备忘录（用户无感知）"""
+        try:
+            current_memo = self._build_memo_text() or "（暂无记录）"
+            resp = self._chat_completion(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": Prompts.PM_MEMO_EXTRACT.format(
+                        current_memo=current_memo
+                    )},
+                    {"role": "user", "content": f"用户: {user_msg}\nPM: {pm_reply}"},
+                ],
+                tools=Prompts.MEMO_UPDATE_TOOL,
+                tool_choice="auto",
+                temperature=0.0,
+            )
+            if resp.tool_calls:
+                for tc in resp.tool_calls:
+                    try:
+                        args = json.loads(tc.function.arguments)
+                        self._execute_update_memo(**args)
+                    except (json.JSONDecodeError, TypeError, KeyError) as e:
+                        logger.warning(f"备忘录 tool call 解析失败: {e}")
+            else:
+                logger.debug("本轮无决策变更，备忘录无更新")
+        except Exception as e:
+            logger.warning(f"异步归档失败（不影响主流程）: {e}")
+        finally:
+            self._archiving_event.set()  # 标记归档完成
+
+    # ============================================================
     # 主入口
     # ============================================================
 
@@ -104,53 +237,28 @@ class PMAgent:
 
         流程：追加历史 → 状态机分发/意图分类 → 处理 → 截断窗口 → 持久化 → 返回
         """
+        self.refresh_runtime_config()
         self.round_id += 1
         logger.info(f"PM 收到消息 (round={self.round_id}): {user_message[:80]}...")
+
+        # Phase 2: 等待上一轮异步归档完成（最多 3s，前端显示"正在思考..."）
+        if not self._archiving_event.wait(timeout=3.0):
+            logger.warning("上一轮归档超时，跳过等待继续处理")
 
         # 追加用户消息到窗口
         self.conversation.append({"role": "user", "content": user_message})
 
-        # ---- 状态机优先分发 ----
-        if self.state == "wait_confirm":
-            # 检测用户是否在给方案反馈，还是发起了全新意图
-            # 如果是新意图（patch/rollback/create），逃逸出 wait_confirm
-            probe = self._classify_intent(user_message)
-            probe_route = probe.get("route", "reply_to_chat")
-            if probe_route in ("route_to_patch", "route_to_rollback", "route_to_create"):
-                logger.info(f"用户在 wait_confirm 状态下发起了新意图: {probe_route}，逃逸！")
-                self.state = "idle"
-                self.pending_req = None
-                self.pending_plan_md = None
-                self._last_route = probe
-                response = self._dispatch_route(probe, user_message)
-            else:
-                # 正常的方案反馈
-                response = self._handle_plan_revision(user_message)
-        elif self.state == "wait_patch_confirm":
-            # 用户在修改确认阶段的回复，暂时走 chat 处理
-            response = self._handle_chat(user_message)
-        elif self.state == "wait_rollback_confirm":
-            response = self._handle_chat(user_message)
-        elif self.state == "wait_clarify":
-            # 策略 B 蓄水池：用户澄清后，带着完整 conversation 窗口重新路由
-            self.state = "idle"
-            route_result = self._classify_intent(user_message)
-            self._last_route = route_result
-            logger.info(f"澄清后重新路由: {route_result}")
-            response = self._dispatch_route(route_result, user_message)
-        else:
-            # idle 状态 → Layer 1 正则 / Layer 2 Tool Calling
-            route_result = self._classify_intent(user_message)
-            self._last_route = route_result
-            logger.info(f"路由结果: {route_result}")
-            response = self._dispatch_route(route_result, user_message)
+        # v4.0: 统一意图引擎 — 无状态机分支，每轮都走 LLM 路由
+        route_result = self._classify_intent(user_message)
+        self._last_route = route_result
+        logger.info(f"路由结果: {route_result}")
+        response = self._dispatch_route(route_result, user_message)
 
         # 追加 PM 回复到窗口
         self.conversation.append({"role": "assistant", "content": response.reply})
 
-        # 截断滑动窗口
-        if len(self.conversation) > _SLIDING_WINDOW_SIZE:
-            self.conversation = self.conversation[-_SLIDING_WINDOW_SIZE:]
+        # 弹性 Token 截断滑动窗口
+        self.conversation = self._trim_window_by_tokens(self.conversation)
 
         # 持久化到 FTS5
         store = self._get_store()
@@ -161,6 +269,14 @@ class PMAgent:
             except Exception as e:
                 logger.warning(f"FTS5 写入失败: {e}")
 
+        # Phase 2: 异步归档 — 后台提取决策到备忘录（用户无感知）
+        self._archiving_event.clear()  # 标记：归档中
+        threading.Thread(
+            target=self._async_archive,
+            args=(user_message, response.reply),
+            daemon=True,
+        ).start()
+
         return response
 
     def _dispatch_route(self, route_result: dict, message: str) -> PMResponse:
@@ -168,79 +284,69 @@ class PMAgent:
         route = route_result.get("route", "reply_to_chat")
         args = route_result.get("args", {})
 
-        if route == "route_to_create":
-            return self._handle_create(message)
-        elif route == "route_to_patch":
-            return self._handle_patch(message)
-        elif route == "route_to_rollback":
-            return self._handle_rollback(message)
+        if route == "execute_project_task":
+            mode = args.get("mode", "modify")
+            if mode == "create":
+                # v4.0: 如果有待确认方案，"确认"意图直接触发执行
+                if self.pending_plan_md:
+                    return self._handle_confirm()
+                # v5.1 兜底: 项目已存在时 create 强制降级为 modify
+                # 防止 LLM 路由器将"功能变更"误判为"新建项目"导致全量覆盖
+                if self._project_exists():
+                    logger.warning(
+                        "⚠️ [路由纠正] LLM 选了 create 但项目已存在 (%s)，"
+                        "强制降级为 modify（_handle_patch）",
+                        self.project_id,
+                    )
+                    return self._handle_patch(message)
+                return self._handle_create(message)
+            elif mode == "modify":
+                # v4.0: 如果有待确认的 patch 方案，直接触发执行
+                if self.pending_patch:
+                    return self._handle_patch_execute()
+                return self._handle_patch(message)
+            elif mode == "continue":
+                # v4.0: 如果有待确认的 extend（Phase 续期），直接触发
+                if self.pending_extend:
+                    return self._handle_extend_execute()
+                # 如果有 pending_continue（上轮 QA 修复确认），直接执行
+                if self.pending_continue:
+                    return self._handle_continue_execute()
+                # v4.1 兆底: 如果有 Phase 待执行，自动预装并走 extend
+                if self.project_phases:
+                    next_phase = next((p for p in self.project_phases if p["status"] == "pending"), None)
+                    if next_phase and self._full_plan_md:
+                        self.pending_extend = self._build_phase_plan(self._full_plan_md, next_phase["index"] - 1)
+                        logger.info(f"⚡ Phase 兆底预装: Phase {next_phase['index']}「{next_phase['name']}」")
+                        return self._handle_extend_execute()
+                return self._handle_continue(message)
+            elif mode == "rollback":
+                return self._handle_rollback(message)
+            elif mode == "audit":
+                return self._handle_audit(message)
+            else:
+                return self._handle_patch(message)  # 未知 mode 降级为 modify
+        elif route == "route_to_revise_plan":
+            # v4.1: 修复残留的 self.state 判断，改用 pending_plan_md
+            if self.pending_plan_md:
+                return self._handle_plan_revision(message)
+            else:
+                return self._handle_create(message)
         elif route == "ask_for_clarification":
             return self._handle_clarify_v2(args)
         elif route == "reply_to_chat":
             return self._handle_chat(message)
-        # 兼容旧路由名（正则层 /scan 等）
-        elif route == "create":
-            return self._handle_create(message)
-        elif route == "patch":
-            return self._handle_patch(message)
-        elif route == "rollback":
-            return self._handle_rollback(message)
-        elif route == "scan":
-            return self._handle_scan(message)
         else:
             return self._handle_chat(message)
 
-    def handle_action(self, action: str) -> PMResponse:
-        """
-        处理确定性按钮动作（零 LLM 分类成本）。
-
-        Args:
-            action: "confirm" | "reject" | "rollback_confirm" | "rollback_cancel"
-        """
-        logger.info(f"PM 收到按钮动作: {action}")
-
-        if action == "confirm":
-            return self._handle_confirm()
-        elif action == "reject":
-            return self._handle_reject()
-        elif action == "patch_confirm":
-            return self._handle_patch_execute()
-        elif action == "patch_cancel":
-            self.state = "idle"
-            self.pending_patch = None
-            return PMResponse(intent="action", reply="好的，取消修改。")
-        elif action == "rollback_confirm":
-            return self._handle_rollback_execute()
-        elif action == "rollback_cancel":
-            self.state = "idle"
-            self.pending_rollback_commit = None
-            return PMResponse(intent="action", reply="好的，取消回滚操作。")
-        else:
-            return PMResponse(intent="action", reply=f"未知操作: {action}")
+    # [已删除] handle_action — v4.0 取消按钮确认，纯对话驱动
 
     # ============================================================
-    # Layer 1: 路由嗅探器（保守正则 + Tool Calling）
+    # 意图识别引擎（v4.0 — 纯 LLM，零正则）
     # ============================================================
 
     def _classify_intent(self, message: str) -> dict:
-        """
-        双层路由 v2.6：
-        - 层 1: 保守正则 — 仅匹配显式命令前缀（100% 确定性，零 Token）
-        - 层 2: LLM Tool Calling — 原生结构化意图识别
-        """
-        msg = message.strip()
-
-        # === 层 1: 显式命令前缀（100% 确定性，零 LLM）===
-        if msg.startswith('/plan') or msg.startswith('/create'):
-            return {"route": "route_to_create", "args": {"user_requirement": msg}}
-        if msg.startswith('/scan'):
-            return {"route": "scan", "args": {}}
-        if msg.startswith('/rollback'):
-            return {"route": "route_to_rollback", "args": {"rollback_hint": msg}}
-        if msg.startswith('/patch'):
-            return {"route": "route_to_patch", "args": {"modification_summary": msg}}
-
-        # === 层 2: LLM Tool Calling 路由 ===
+        """v4.0: 纯 LLM 意图识别，零正则。所有消息 100% 走 Tool Calling。"""
         return self._tool_call_route(message)
 
     def _tool_call_route(self, message: str) -> dict:
@@ -249,7 +355,38 @@ class PMAgent:
         LLM 从 5 个工具中选择一个，系统级结构化输出，无需 JSON 手动解析。
         """
         project_exists = self._project_exists()
-        project_status = f"项目 {self.project_id} — {'已存在，包含源代码文件' if project_exists else '不存在或为空项目'}"
+        # Phase 2 PM A-1: 注入结构化项目状态（而非仅 bool）
+        if project_exists:
+            project_dir = self._get_project_dir()
+            file_info = self._scan_project_files(project_dir)
+            tech = self._detect_tech_stack(file_info['files'])
+            desc = self._extract_project_description(project_dir)
+            project_status = (
+                f"项目 {self.project_id} — 已存在 ({file_info['total']} 个文件)\n"
+                f"  技术栈: {tech or '未识别'} | 描述: {desc or '无'}"
+            )
+        else:
+            project_status = f"项目 {self.project_id} — 不存在或为空项目"
+
+        # v4.0: 路由器感知所有待确认状态
+        if self.pending_plan_md:
+            project_status += "\n⚠️ 有待确认的项目方案"
+        if self.pending_patch:
+            project_status += "\n⚠️ 有待确认的修改方案"
+        if self.pending_extend:
+            project_status += "\n⚠️ 有待确认的扩展方案（下一 Phase）"
+        if self.pending_continue:
+            project_status += "\n⚠️ 有待确认的修复方案"
+
+        # Phase 2: 路由器感知历史决策
+        memo_text = self._build_memo_text()
+        if memo_text:
+            project_status += f"\n【历史决策】{memo_text}"
+
+        # v4.1: 活跃项目记忆 — plan.md + Phase 进度
+        if self._full_plan_md:
+            phase_summary = self._build_phase_status_text()
+            project_status += f"\n【活跃项目方案】\n{phase_summary}"
 
         try:
             system_prompt = Prompts.PM_ROUTE_SYSTEM.format(
@@ -259,7 +396,7 @@ class PMAgent:
             # 带上近几轮对话（策略 B 蓄水池：让 LLM 自动从上下文中累积信息）
             messages.extend(self.conversation[-4:])
 
-            resp = default_llm.chat_completion(
+            resp = self._chat_completion(
                 model=self.model,
                 messages=messages,
                 tools=Prompts.PM_ROUTE_TOOLS,
@@ -278,7 +415,7 @@ class PMAgent:
                 logger.info(f"Tool Calling 路由: {func_name}({args})")
                 # 根据路由类型自动推断 context_needs（兼容下游 _build_project_context）
                 context_needs = []
-                if func_name in ("route_to_patch", "route_to_rollback", "route_to_create"):
+                if func_name == "execute_project_task":
                     context_needs = ["file_list"]
                 return {"route": func_name, "args": args, "context_needs": context_needs}
 
@@ -309,27 +446,281 @@ class PMAgent:
         return False
 
     # ============================================================
-    # 需求标准化
+    # Plan 生成（Phase 2: 替代 PlannerLite 管道）
     # ============================================================
+
+    def _generate_plan(self) -> str:
+        """
+        直接从对话窗口生成 plan.md。
+        PM 持有完整上下文（颜色/布局/功能讨论），一次 LLM 调用搞定。
+
+        v2: 安全窗口内注入旧 plan 作为参考（防止 reject 后重建时丢失讨论细节）。
+        """
+        # 构建对话文本
+        conv_text = "\n".join(
+            f"{'用户' if m['role'] == 'user' else 'PM'}: {m['content']}"
+            for m in self.conversation
+        )
+
+        # 安全窗口内注入旧 plan（<=3 轮）
+        old_plan_hint = ""
+        if self.pending_plan_md and self._plan_age_in_rounds() <= 3:
+            old_plan_hint = f"\n\n【上一版方案（仅供参考，可全部推翻）】\n{self.pending_plan_md}"
+
+        try:
+            response = self._chat_completion(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": Prompts.PM_GENERATE_PLAN},
+                    {"role": "user", "content": f"以下是与用户的对话，请从中生成技术方案文档：\n\n{conv_text}{old_plan_hint}"},
+                ],
+                temperature=0.3,
+            )
+            plan_md = response.content.strip()
+
+            # 清理可能的 Markdown 代码块包裹
+            if plan_md.startswith("```markdown"):
+                plan_md = plan_md[len("```markdown"):].strip()
+            if plan_md.startswith("```"):
+                plan_md = plan_md[3:].strip()
+            if plan_md.endswith("```"):
+                plan_md = plan_md[:-3].strip()
+
+            logger.info(f"plan.md 生成完毕 ({len(plan_md)} 字符)")
+            return plan_md
+
+        except Exception as e:
+            logger.error(f"Plan 生成失败: {e}")
+            return "# 项目方案\n\n（方案生成失败，请重试）"
+
+    def _revise_plan(self, revision_request: str) -> str:
+        """
+        增量修订 plan：基于旧 plan + 用户修改意见，只改用户指定的部分。
+        Fix A 核心：替代旧的全量重新生成。
+        """
+        if not self.pending_plan_md:
+            # 没有旧 plan，降级为全量生成
+            logger.warning("_revise_plan 没有旧 plan，降级为 _generate_plan")
+            return self._generate_plan()
+
+        # 构建对话上下文（供 LLM 理解语境）
+        conv_text = "\n".join(
+            f"{'用户' if m['role'] == 'user' else 'PM'}: {m['content']}"
+            for m in self.conversation[-6:]  # 只取最近 6 条，修订不需要远古历史
+        )
+
+        try:
+            system_prompt = Prompts.PM_REVISE_PLAN.format(
+                existing_plan=self.pending_plan_md,
+            )
+            response = self._chat_completion(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"用户的修改意见：{revision_request}\n\n对话上下文：\n{conv_text}"},
+                ],
+                temperature=0.2,
+            )
+            plan_md = response.content.strip()
+
+            # 清理 Markdown 代码块包裹
+            if plan_md.startswith("```markdown"):
+                plan_md = plan_md[len("```markdown"):].strip()
+            if plan_md.startswith("```"):
+                plan_md = plan_md[3:].strip()
+            if plan_md.endswith("```"):
+                plan_md = plan_md[:-3].strip()
+
+            logger.info(f"plan.md 增量修订完毕 ({len(plan_md)} 字符)")
+            return plan_md
+
+        except Exception as e:
+            logger.error(f"Plan 增量修订失败: {e}，降级为全量生成")
+            return self._generate_plan()
+
+    def _plan_age_in_rounds(self) -> int:
+        """计算当前 pending_plan_md 的年龄（距离产生时过了多少轮对话）"""
+        if self._plan_created_at_round <= 0:
+            return 999  # 没有记录 → 视为远古
+        return self.round_id - self._plan_created_at_round
+
+    def _save_plan_to_disk(self, plan_md: str, project_dir: str) -> int:
+        """保存 plan.md，同时备份历史版本。返回版本号。"""
+        try:
+            astrea_dir = os.path.join(project_dir, ".astrea")
+            os.makedirs(astrea_dir, exist_ok=True)
+
+            # 确定版本号
+            version = self._get_next_plan_version(astrea_dir)
+
+            # 备份到 plan_v{N}.md
+            versioned_path = os.path.join(astrea_dir, f"plan_v{version}.md")
+            with open(versioned_path, "w", encoding="utf-8") as f:
+                f.write(plan_md)
+
+            # 同时写入 plan.md（始终是最新版，向下兼容）
+            plan_path = os.path.join(astrea_dir, "plan.md")
+            with open(plan_path, "w", encoding="utf-8") as f:
+                f.write(plan_md)
+
+            logger.info(f"plan.md v{version} 已保存: {versioned_path}")
+            return version
+        except Exception as e:
+            logger.warning(f"plan.md 保存失败: {e}")
+            return 0
+
+    @staticmethod
+    def _get_next_plan_version(astrea_dir: str) -> int:
+        """扫描 plan_v*.md 确定下一个版本号"""
+        import glob
+        existing = glob.glob(os.path.join(astrea_dir, "plan_v*.md"))
+        if not existing:
+            return 1
+        versions = []
+        for p in existing:
+            m = re.search(r'plan_v(\d+)\.md$', p)
+            if m:
+                versions.append(int(m.group(1)))
+        return max(versions) + 1 if versions else 1
+
+    @staticmethod
+    def _extract_plan_title(plan_md: str) -> str:
+        """从 plan.md 的 # 标题行提取项目名称"""
+        for line in plan_md.split("\n"):
+            line = line.strip()
+            if line.startswith("# ") and not line.startswith("## "):
+                return line[2:].strip()
+        return "您的项目"
+
+    @staticmethod
+    def _extract_plan_defaults(plan_md: str) -> list:
+        """从 plan.md 中提取标注了'（默认）'的技术栈字段"""
+        defaults = []
+        for line in plan_md.split("\n"):
+            if "（默认）" in line or "(默认)" in line:
+                # 提取 **字段名** 中的内容
+                m = re.search(r'\*\*(.+?)\*\*', line)
+                if m:
+                    defaults.append(m.group(1))
+        return defaults
+
+    # ============================================================
+    # [已废弃] 需求标准化 — Phase 2 后不再使用，保留以防回退
+    # ============================================================
+
+    # ============================================================
+    # v4.0: Phase 拆分器
+    # ============================================================
+
+    def _extract_phases(self, plan_md: str) -> list:
+        """从 plan.md 中解析 Phase 结构。无 Phase 章节时返回空列表。"""
+        import re as _re
+        phases = []
+        pattern = r'### Phase (\d+):\s*(.+?)(?:\n|$)([\s\S]*?)(?=### Phase|\Z)'
+        for m in _re.finditer(pattern, plan_md):
+            phase_body = m.group(3).strip()
+            features = [
+                line.strip('- ').strip()
+                for line in phase_body.split('\n')
+                if line.strip().startswith('- ')
+            ]
+            phases.append({
+                "index": int(m.group(1)),
+                "name": m.group(2).strip().rstrip('—').strip(),
+                "features": features,
+                "status": "pending",  # pending / executing / done / failed
+            })
+        if phases:
+            logger.info(f"Phase 解析: 共 {len(phases)} 个阶段 — "
+                         + ", ".join(f"P{p['index']}:{p['name']}({len(p['features'])})" for p in phases))
+        return phases
+
+    def _build_phase_plan(self, full_plan: str, phase_index: int) -> str:
+        """从完整 plan 中提取指定 Phase 的子集 plan。
+        保留技术栈和设计风格，替换核心功能为 Phase 的功能子集。"""
+        if phase_index >= len(self.project_phases):
+            return full_plan
+
+        phase = self.project_phases[phase_index]
+        features = phase["features"]
+
+        # 提取技术栈章节（## 技术栈 到下一个 ## 之间）
+        import re as _re
+        tech_match = _re.search(r'(## 技术栈[\s\S]*?)(?=\n## |\Z)', full_plan)
+        tech_section = tech_match.group(1).strip() if tech_match else ""
+
+        # 提取设计风格章节（如有）
+        design_match = _re.search(r'(## 设计风格[\s\S]*?)(?=\n## |\Z)', full_plan)
+        design_section = design_match.group(1).strip() if design_match else ""
+
+        # 构建 Phase 子集 plan
+        title_match = _re.match(r'#\s+(.+)', full_plan)
+        title = title_match.group(1) if title_match else "项目"
+
+        phase_plan_parts = [f"# {title} — Phase {phase['index']}: {phase['name']}"]
+        if tech_section:
+            phase_plan_parts.append(f"\n{tech_section}")
+        phase_plan_parts.append("\n## 核心功能")
+        for i, feat in enumerate(features, 1):
+            phase_plan_parts.append(f"{i}. {feat}")
+        if design_section:
+            phase_plan_parts.append(f"\n{design_section}")
+
+        return "\n".join(phase_plan_parts)
+
+    def _build_phase_status_text(self) -> str:
+        """构建 Phase 进度摘要，注入路由器 system prompt。
+        解决 PM 在 Phase 续期时失忆的问题。"""
+        if not self.project_phases:
+            return ""
+
+        # 项目标题
+        title = self._extract_plan_title(self._full_plan_md) if self._full_plan_md else "当前项目"
+
+        parts = [f"项目: {title}"]
+        parts.append(f"共 {len(self.project_phases)} 个阶段:")
+
+        for phase in self.project_phases:
+            status_icon = {
+                "done": "✅",
+                "executing": "🔄",
+                "failed": "❌",
+                "pending": "⏳",
+            }.get(phase["status"], "⏳")
+            features_preview = ", ".join(phase["features"][:3])
+            if len(phase["features"]) > 3:
+                features_preview += f" 等{len(phase['features'])}项"
+            parts.append(
+                f"  {status_icon} Phase {phase['index']}: {phase['name']} [{phase['status']}] — {features_preview}"
+            )
+
+        # 当前阶段提示
+        current = self.current_phase_index + 1
+        next_phase = next((p for p in self.project_phases if p["status"] == "pending"), None)
+        if next_phase:
+            parts.append(f"\n下一待执行阶段: Phase {next_phase['index']}「{next_phase['name']}」")
+            if self.pending_extend:
+                parts.append("⚠️ 该阶段已预装为待确认扩展方案，用户说「继续」即可启动")
+
+        return "\n".join(parts)
 
     def _standardize_requirement(self, user_message: str) -> dict:
         """
         将用户自然语言需求翻译为 structured_req JSON。
         LLM 只做翻译，不做创造。
         """
-        # 构建对话历史上下文
+        # 构建对话历史上下文（使用完整窗口，不再截断）
         history_text = ""
         if self.conversation:
-            recent = self.conversation[-6:]  # 最近 3 轮
             history_text = "\n".join(
                 f"{'用户' if m['role'] == 'user' else 'PM'}: {m['content']}"
-                for m in recent
+                for m in self.conversation
             )
 
         user_prompt = f"对话历史：\n{history_text}\n\n当前用户需求：\n{user_message}"
 
         try:
-            response = default_llm.chat_completion(
+            response = self._chat_completion(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": Prompts.PM_STANDARDIZE_REQUIREMENT},
@@ -393,6 +784,16 @@ class PMAgent:
 
         context_needs = self._last_route.get("context_needs", []) if self._last_route else []
         project_context = self._build_project_context(context_needs)
+
+        # Fix D: 在 wait_confirm 阶段注入完整 plan 作为锚定上下文（不截断）
+        if self.state == "wait_confirm" and self.pending_plan_md:
+            project_context += f"\n\n【当前待确认方案（完整内容）】\n{self.pending_plan_md}"
+
+        # Phase 2: 注入决策备忘录（Letta-Lite Core Memory）
+        memo_text = self._build_memo_text()
+        if memo_text:
+            project_context += f"\n\n【决策备忘录】\n{memo_text}"
+
         route_hint = ""  # chat 模式无特殊 hint
         system_prompt = Prompts.PM_SYSTEM.format(
             project_context=project_context,
@@ -403,7 +804,7 @@ class PMAgent:
             messages = [{"role": "system", "content": system_prompt}]
             messages.extend(self.conversation[-6:])
 
-            response = default_llm.chat_completion(
+            response = self._chat_completion(
                 model=self.model,
                 messages=messages,
                 temperature=0.7,
@@ -414,86 +815,197 @@ class PMAgent:
             return PMResponse(intent="chat", reply="抱歉，我暂时无法回复，请稍后再试。")
 
     def _handle_create(self, message: str) -> PMResponse:
-        """创建处理 — 标准化需求 → 规划组生成 plan.md → 返回给用户确认"""
+        """
+        创建处理（v2 升级版）：
+        PM 直接从完整对话上下文生成 plan.md，不再经过 structured_req JSON 中转。
+        v2: 分隔符协议检测 + 条件按钮 + 版本管理。
+        """
         global_broadcaster.emit_sync("PM", "info", "正在分析您的需求...")
 
-        # 1. 标准化需求
-        structured_req = self._standardize_requirement(message)
+        # 1. 直接从对话生成 plan.md
+        raw_plan = self._generate_plan()
 
-        # 2. 调用规划组生成 plan.md（自动保存到 .astrea/plan.md）
-        from agents.planner_lite import PlannerLiteAgent
-        planner = PlannerLiteAgent()
-        projects_dir = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "projects"
-        )
-        project_dir = os.path.join(projects_dir, self.project_id)
-        plan_md = planner.generate_plan(structured_req, project_dir=project_dir)
+        # 2. 分隔符协议：提取 PM 的追问（Fix B）
+        pm_questions = ""
+        if "===PM_QUESTIONS===" in raw_plan:
+            plan_md, pm_questions = raw_plan.split("===PM_QUESTIONS===", 1)
+            plan_md = plan_md.strip()
+            pm_questions = pm_questions.strip()
+        else:
+            plan_md = raw_plan
 
-        # 3. 保存待确认状态
-        self.pending_req = structured_req
-        self.pending_plan_md = plan_md
-        self.state = "wait_confirm"
+        # 3. 版本化保存（Fix C）
+        project_dir = self._get_project_dir()
+        version = self._save_plan_to_disk(plan_md, project_dir)
+        self._plan_version = version
 
-        # 4. PM 口语化归纳
-        summary = structured_req.get("summary", "您的项目")
-        defaults = structured_req.get("defaults_applied", [])
-        features = structured_req.get("core_features", [])
+        # 4. v4.0: Phase 解析
+        phases = self._extract_phases(plan_md)
+        if phases:
+            self.project_phases = phases
+            self.current_phase_index = 0
+            self._full_plan_md = plan_md  # 保留完整 plan
+            # 仅将 Phase 1 作为待确认范围
+            phase_plan = self._build_phase_plan(plan_md, 0)
+            self.pending_plan_md = phase_plan
+            self.pending_mode = "create"
+        else:
+            self.pending_plan_md = plan_md
+            self.pending_mode = "create"
 
-        reply_parts = [f"我帮您梳理了一下「{summary}」的方案"]
-        if features:
-            feature_str = "、".join(f[:20] for f in features[:3])
-            reply_parts.append(f"，核心功能包括{feature_str}")
-        reply_parts.append("。详细的技术方案在右侧方案面板里，您看看有没有要调整的。")
+        self._plan_created_at_round = self.round_id
 
-        if defaults:
-            notices = [f"{d['field']}用的是{d['value']}" for d in defaults]
-            reply_parts.append(f"\n\n另外，{', '.join(notices)}，这些是默认选择，需要换的话随时告诉我。")
-
-        reply = "".join(reply_parts)
+        # 5. v5.1: LLM 基于 plan.md 事实生成自然回复（替代硬编码拼接）
+        reply = self._generate_plan_summary_reply(plan_md, pm_questions, version)
 
         global_broadcaster.emit_sync("PM", "plan_preview", "技术方案预览已就绪")
 
+        # v4.0: 不再输出按钮，PM 通过引导式回复等待用户自然语言确认
         return PMResponse(
             intent="create",
             reply=reply,
             plan_md=plan_md,
-            actions=[
-                {"id": "confirm", "label": "确认执行", "style": "primary"},
-                {"id": "reject", "label": "我要调整", "style": "secondary"},
-            ]
         )
+
+    def _generate_plan_summary_reply(
+        self, plan_md: str, pm_questions: str, version: int
+    ) -> str:
+        """
+        v5.1: 让 LLM 基于 plan.md 事实生成自然的方案确认回复。
+        替代旧的硬编码 reply_parts 拼接。
+        """
+        # 构建上下文：plan + 追问 + 版本 + 近几轮对话
+        user_input = f"【技术方案 v{version}】\n{plan_md}"
+        if pm_questions:
+            user_input += f"\n\n===PM_QUESTIONS===\n{pm_questions}"
+
+        # 带上近几轮对话供 LLM 理解语境
+        recent_conv = "\n".join(
+            f"{'用户' if m['role'] == 'user' else 'PM'}: {m['content']}"
+            for m in self.conversation[-4:]
+        )
+        if recent_conv:
+            user_input += f"\n\n【近期对话】\n{recent_conv}"
+
+        try:
+            resp = self._chat_completion(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": Prompts.PM_PLAN_SUMMARY},
+                    {"role": "user", "content": user_input},
+                ],
+                temperature=0.5,
+            )
+            reply = resp.content.strip() if resp.content else ""
+            if reply:
+                return reply
+        except Exception as e:
+            logger.warning(f"PM 方案回复生成失败: {e}，使用降级回复")
+
+        # 降级：极简回复
+        title = self._extract_plan_title(plan_md)
+        return f"「{title}」的方案（v{version}）已生成，您看看有没有要调整的。"
 
     def _handle_patch(self, message: str) -> PMResponse:
         """
-        修改处理（二步确认）：
-        Step 1: PM 确认理解了修改意图，展示确认按钮
-        Step 2: 用户点击确认 → _handle_patch_execute() 启动 Engine patch mode
+        修改处理（v5.0 统一调查版）：
+        - PM 委托 TechLead 做白盒调查（替代旧的 read_file 循环）
+        - TechLead 的结构化 verdict 翻译为用户确认文本
+        - diagnosis 缓存供 Engine 复用，避免二次调查
         """
         self.pending_patch = message
         self.state = "wait_patch_confirm"
 
         if self._project_exists():
-            # 项目存在，PM 确认修改意图
-            context_needs = self._last_route.get("context_needs", []) if self._last_route else []
-            project_context = self._build_project_context(context_needs)
+            project_dir = self._get_project_dir()
 
-            # 用 LLM 生成一个有温度的确认回复
-            route_hint = "【当前场景：用户想修改已有项目，请简洁确认理解了修改需求，告知用户点击确认按钮即可启动修改】"
-            system_prompt = Prompts.PM_SYSTEM.format(
-                project_context=project_context,
-                route_hint=route_hint,
-            )
+            # === TechLead 委托调查（替代旧的 PM read_file 循环）===
+            diagnosis = None
             try:
+                from agents.tech_lead import TechLeadAgent
+
+                task_context = (
+                    f"【用户修改请求】\n{message}\n\n"
+                    "请逐个读取可能受影响的文件，定位 bug 的根因和需要修改的具体行号。\n"
+                    "重点关注：函数签名是否匹配、模板变量是否存在、路由路径是否正确。"
+                )
+
+                logger.info("🔍 [PM] 委托 TechLead 调查用户报告的问题...")
+                global_broadcaster.emit_sync(
+                    "TechLead", "patch_investigate_start",
+                    "🔍 TechLead 正在白盒调查修改范围..."
+                )
+                tech_lead = TechLeadAgent()
+                diagnosis = tech_lead.investigate(
+                    project_dir=project_dir,
+                    task_context=task_context,
+                    max_steps=10,
+                )
+                if diagnosis:
+                    confidence = diagnosis.get("confidence", 0.0)
+                    logger.info(
+                        "✅ [PM] TechLead 调查完成 (confidence=%.2f): %s",
+                        confidence,
+                        diagnosis.get("root_cause", "")[:120],
+                    )
+                else:
+                    logger.warning("⚠️ [PM] TechLead 调查未产出判定")
+            except Exception as e:
+                logger.warning(f"⚠️ [PM] TechLead 调查异常: {e}")
+
+            # 缓存 diagnosis 供 Engine 复用
+            self._cached_tech_lead_diagnosis = diagnosis
+
+            # === 将 TechLead verdict 翻译为用户友好的确认回复 ===
+            if diagnosis and diagnosis.get("root_cause"):
+                root_cause = diagnosis.get("root_cause", "")
+                fix_instruction = diagnosis.get("fix_instruction", "")
+                guilty_file = diagnosis.get("guilty_file", "")
+                confidence = diagnosis.get("confidence", 0.0)
+
+                # 基于骨架 + TechLead 结果生成用户确认文本
+                reply_parts = ["我已经定位到了问题所在：\n"]
+                if guilty_file:
+                    reply_parts.append(f"📍 **问题文件**: `{guilty_file}`")
+                reply_parts.append(f"🔍 **根因分析**: {root_cause}")
+                if fix_instruction:
+                    reply_parts.append(f"🔧 **修复方向**: {fix_instruction}")
+                reply_parts.append(f"\n置信度: {confidence:.0%}。确认后我将立即修复。")
+                reply = "\n".join(reply_parts)
+
+                # manager_brief 用 TechLead 的结构化输出（比 PM 的猜测更精确）
+                self._last_manager_brief = (
+                    f"root_cause: {root_cause}\n"
+                    f"guilty_file: {guilty_file}\n"
+                    f"fix_instruction: {fix_instruction}\n"
+                    f"confidence: {confidence}"
+                )
+            else:
+                # TechLead 调查失败，降级为骨架推理
+                context_needs = ["file_tree", "skeleton", "git_log"]
+                project_context = self._build_project_context(context_needs)
+
+                route_hint = (
+                    "【当前场景：用户想修改已有项目】\n"
+                    "基于骨架信息做粗粒度影响分析即可，确认后会有专业工程师深入调查。\n"
+                    "回复简洁友好，告知用户点击确认按钮。"
+                )
+                system_prompt = Prompts.PM_SYSTEM.format(
+                    project_context=project_context,
+                    route_hint=route_hint,
+                )
                 messages = [{"role": "system", "content": system_prompt}]
                 messages.extend(self.conversation[-6:])
-                resp = default_llm.chat_completion(
-                    model=self.model,
-                    messages=messages,
-                    temperature=0.5,
-                )
-                reply = resp.content.strip()
-            except Exception:
-                reply = "明白，我来帮您处理这个修改。"
+                try:
+                    resp = self._chat_completion(
+                        model=self.model,
+                        messages=messages,
+                        temperature=0.5,
+                    )
+                    reply = resp.content.strip() if resp.content else "明白，我来帮您处理这个修改。"
+                except Exception:
+                    reply = "明白，我来帮您处理这个修改。"
+                self._last_manager_brief = None
 
             return PMResponse(
                 intent="patch",
@@ -512,19 +1024,194 @@ class PMAgent:
                 reply="目前这个项目还没有文件呢，是不是想先创建一个新项目？直接告诉我您想做什么就行。",
             )
 
+    def _handle_extend(self, message: str) -> PMResponse:
+        """新增模块处理：先扫描老项目上下文，再进入二次确认。"""
+        if not self._project_exists():
+            self.state = "idle"
+            self.pending_extend = None
+            return PMResponse(
+                intent="extend",
+                reply="当前项目还不存在，不能直接新增模块。请先创建项目，或切换到一个已有项目。",
+            )
+
+        project_dir = self._get_project_dir()
+        try:
+            existing_context = scan_existing_project(project_dir)
+        except Exception as e:
+            logger.warning(f"Extend 上下文扫描失败: {e}")
+            existing_context = {}
+
+        file_count = len(existing_context.get("file_tree") or [])
+        route_count = len(existing_context.get("existing_routes") or [])
+        model_count = len(existing_context.get("existing_models") or [])
+        tech_stack = ", ".join(existing_context.get("tech_stack") or []) or "未识别"
+        entrypoint = (
+            existing_context.get("architecture_contract", {}).get("entrypoint_file")
+            or "未识别"
+        )
+        route_preview = []
+        for item in (existing_context.get("existing_routes") or [])[:3]:
+            method = str(item.get("method") or "?").upper()
+            path = str(item.get("path") or "?")
+            route_preview.append(f"{method} {path}")
+        route_hint = f"已有路由示例：{'；'.join(route_preview)}。" if route_preview else "当前未识别到明确路由。"
+
+        self.pending_extend = message
+        self.pending_mode = "extend"
+        self.state = "wait_confirm"
+
+        return PMResponse(
+            intent="extend",
+            reply=(
+                f"检测到当前项目已有 {file_count} 个文件、{route_count} 个路由、{model_count} 个模型。"
+                f"技术栈：{tech_stack}；入口文件：{entrypoint}。"
+                f"{route_hint}我会基于现有架构规划新增模块，并把老文件修改限制为焊接式局部编辑。是否开始？"
+            ),
+            actions=[
+                {"id": "confirm", "label": "✅ 开始", "style": "primary"},
+                {"id": "cancel", "label": "取消", "style": "default"},
+            ],
+        )
+
+    def _handle_continue(self, message: str) -> PMResponse:
+        """确认是否基于上一轮 QA 失败上下文继续修复。"""
+        if not self._project_exists():
+            return PMResponse(
+                intent="continue",
+                reply="当前项目不存在，无法继续修复。请先创建项目或切换到已有项目。",
+            )
+
+        project_dir = self._get_project_dir()
+        state = BlackboardState.load_from_disk(project_dir)
+        failure_context = state.failure_context if state else {}
+        endpoint_results = failure_context.get("endpoint_results") or []
+        failed_endpoints = [
+            ep for ep in endpoint_results
+            if isinstance(ep, dict) and not ep.get("ok")
+        ]
+
+        if not endpoint_results or not failed_endpoints:
+            return PMResponse(
+                intent="continue",
+                reply="没有可用的上一轮 QA 失败端点上下文，不能进入继续修复。请先运行一次项目验证，或明确说明要修改的功能。",
+            )
+
+        repair_scope = failure_context.get("repair_scope") or failure_context.get("failed_files") or []
+        if isinstance(repair_scope, str):
+            repair_scope = [repair_scope]
+        if not repair_scope:
+            return PMResponse(
+                intent="continue",
+                reply="上一轮失败上下文缺少 repair_scope/failed_files，无法安全限定修复范围。请明确要修复的文件或功能。",
+            )
+
+        endpoint_lines = []
+        for ep in failed_endpoints[:5]:
+            endpoint_lines.append(
+                f"{ep.get('method', '?')} {ep.get('url', '?')} -> {ep.get('status_code', '?')}"
+            )
+        endpoint_text = "；".join(endpoint_lines)
+        scope_text = ", ".join(str(x) for x in repair_scope)
+
+        self.pending_continue = message
+        self.pending_mode = "continue"
+        self.state = "wait_confirm"
+
+        return PMResponse(
+            intent="continue",
+            reply=(
+                f"检测到上一轮 QA 失败端点 {len(failed_endpoints)} 个：{endpoint_text}。"
+                f"本次继续修复将严格限制在这些文件内：{scope_text}。是否开始？"
+            ),
+            actions=[
+                {"id": "confirm", "label": "✅ 开始", "style": "primary"},
+                {"id": "cancel", "label": "取消", "style": "default"},
+            ],
+        )
+
+    def _handle_continue_execute(self) -> PMResponse:
+        """用户确认继续修复后，启动 Engine continue mode。"""
+        if not self.pending_continue:
+            return PMResponse(intent="action", reply="没有待执行的继续修复。")
+
+        self.confirmed_requirement = self.pending_continue
+        self.confirmed_mode = "continue"
+        continue_desc = self.pending_continue[:60]
+        self.pending_continue = None
+        self.state = "idle"
+
+        global_broadcaster.emit_sync("PM", "info", "用户已确认继续修复，正在启动 Continue 模式...")
+
+        return PMResponse(
+            intent="action",
+            reply=f"收到，正在基于上一轮 QA 失败上下文继续修复：{continue_desc}",
+            is_executing=True,
+        )
+
+    def _handle_extend_execute(self) -> PMResponse:
+        """用户确认新增模块后，启动 Engine extend mode。"""
+        if not self.pending_extend:
+            return PMResponse(intent="action", reply="没有待执行的新增模块请求。")
+
+        self.confirmed_requirement = self.pending_extend
+        self.confirmed_mode = "extend"
+        # v5.1: 提取 plan 标题作为描述，避免截取 raw Markdown 泄漏源码
+        extend_desc = self._extract_plan_title(self.pending_extend)
+        self.pending_extend = None
+        self.state = "idle"
+
+        global_broadcaster.emit_sync("PM", "info", "用户已确认新增模块，正在启动 Extend 模式...")
+
+        return PMResponse(
+            intent="action",
+            reply=f"收到！正在为「{extend_desc}」启动开发团队，请在左侧面板关注进度。",
+            is_executing=True,
+        )
+
+    def _parse_dual_output(self, content: str) -> tuple:
+        """解析 PM 的双输出：用户回复 + Manager Brief"""
+        if "---" in content:
+            parts = content.split("---", 1)
+            reply = parts[0].strip()
+            brief = parts[1].strip()
+            return reply, brief
+        return content, ""
+
     def _handle_patch_execute(self) -> PMResponse:
         """
         用户确认修改 → 启动 Engine patch mode。
+        v5.0: 将 PM 阶段缓存的 TechLead diagnosis 传给 Engine，跳过二次调查。
         """
         if not self.pending_patch:
             return PMResponse(intent="action", reply="没有待执行的修改。")
 
-        # 保存修改需求作为 Engine prompt
-        self.confirmed_requirement = self.pending_patch
+        # v5.0: 优先使用 TechLead 的结构化 diagnosis 作为影响分析
+        pm_analysis = ""
+        cached_diagnosis = getattr(self, '_cached_tech_lead_diagnosis', None)
+        manager_brief = getattr(self, '_last_manager_brief', '') or ''
+
+        if manager_brief:
+            pm_analysis = manager_brief
+        elif not cached_diagnosis:
+            # Fallback: 从对话窗口中提取 PM 最后一次非空回复作为分析
+            for msg in reversed(self.conversation):
+                if msg["role"] == "assistant" and len(msg["content"]) > 50:
+                    pm_analysis = msg["content"]
+                    break
+
+        if pm_analysis:
+            self.confirmed_requirement = (
+                f"【用户需求】\n{self.pending_patch}\n\n"
+                f"【TechLead 诊断（已验证，包含精确的修改位置和方向）】\n{pm_analysis}"
+            )
+        else:
+            self.confirmed_requirement = self.pending_patch
+
         self.confirmed_mode = "patch"
 
         patch_desc = self.pending_patch[:60]
         self.pending_patch = None
+        self._last_manager_brief = None
         self.state = "idle"
 
         global_broadcaster.emit_sync("PM", "info", f"用户已确认修改，正在启动 Patch 模式...")
@@ -626,40 +1313,67 @@ class PMAgent:
         return PMResponse(intent="clarify", reply=reply)
 
     def _handle_plan_revision(self, message: str) -> PMResponse:
-        """用户在 wait_confirm 状态下发送了修改意见 → 重新标准化 + 重新生成 plan"""
+        """
+        用户在 wait_confirm 状态下发送了修改意见 → 增量修订 plan（不再全量重写）。
+        v2: 调用 _revise_plan 基于旧 plan 做增量编辑。
+        """
         global_broadcaster.emit_sync("PM", "info", "正在根据您的反馈调整方案...")
 
-        structured_req = self._standardize_requirement(message)
+        # 1. 增量修订（Fix A 核心）
+        raw_plan = self._revise_plan(message)
 
-        from agents.planner_lite import PlannerLiteAgent
-        planner = PlannerLiteAgent()
-        plan_md = planner.generate_plan(structured_req)
+        # 2. 分隔符协议（Fix B）
+        pm_questions = ""
+        if "===PM_QUESTIONS===" in raw_plan:
+            plan_md, pm_questions = raw_plan.split("===PM_QUESTIONS===", 1)
+            plan_md = plan_md.strip()
+            pm_questions = pm_questions.strip()
+        else:
+            plan_md = raw_plan
 
-        self.pending_req = structured_req
+        # 3. 版本化保存（Fix C）
+        project_dir = self._get_project_dir()
+        version = self._save_plan_to_disk(plan_md, project_dir)
+        self._plan_version = version
+
+        # 4. 更新待确认状态
         self.pending_plan_md = plan_md
+        self._plan_created_at_round = self.round_id
 
-        # 用 LLM 生成有温度的确认回复（而非硬编码）
+        # 5. 用 LLM 生成有温度的确认回复
         try:
-            resp = default_llm.chat_completion(
+            resp = self._chat_completion(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "你是友好的项目经理。用一句话告知用户方案已根据反馈更新，请查看并确认。语气简洁自然，不要机械化。"},
-                    {"role": "user", "content": f"用户反馈：{message[:100]}"},
+                    {"role": "system", "content": "你是友好的项目经理。用一句话告知用户方案已根据反馈更新至新版本，请查看并确认。语气简洁自然，不要机械化。"},
+                    {"role": "user", "content": f"用户反馈：{message[:100]}，当前版本：v{version}"},
                 ],
                 temperature=0.7,
             )
             reply = resp.content.strip()
         except Exception:
-            reply = f"好的，我已经根据您关于「{message[:30]}」的反馈重新调整了方案，请在右侧面板查看最新版本~"
+            reply = f"好的，方案已更新至第 {version} 版，我只改了您提到的部分，请在右侧面板查看~"
+
+        # 6. 追问放在对话框
+        if pm_questions:
+            reply += f"\n\n另外还有个问题想确认：\n{pm_questions}"
+
+        # 7. 条件按钮
+        if pm_questions:
+            actions = [
+                {"id": "reject", "label": "我来回答", "style": "secondary"},
+            ]
+        else:
+            actions = [
+                {"id": "confirm", "label": "确认执行", "style": "primary"},
+                {"id": "reject", "label": "继续调整", "style": "secondary"},
+            ]
 
         return PMResponse(
             intent="create",
             reply=reply,
             plan_md=plan_md,
-            actions=[
-                {"id": "confirm", "label": "确认执行", "style": "primary"},
-                {"id": "reject", "label": "继续调整", "style": "secondary"},
-            ]
+            actions=actions,
         )
 
     def _handle_scan(self, message: str) -> PMResponse:
@@ -695,20 +1409,259 @@ class PMAgent:
             return PMResponse(intent="scan", reply=f"扫描过程中出了点问题：{str(e)}")
 
     # ============================================================
+    # 代码审查（TechLead A-1）
+    # ============================================================
+
+    def _handle_audit(self, message: str) -> PMResponse:
+        """
+        代码审查处理：TechLead 侦查 → PM 撰写报告。
+
+        流程：
+        1. 唤醒 TechLead ReAct 扫描项目 → 输出结构化发现列表 (JSON)
+        2. PM 根据用户对话上下文 + 发现列表 → 撰写用户友好的 Markdown 报告
+        3. 保存报告到项目目录 + 在对话中展示摘要
+        """
+        if not self._project_exists():
+            return PMResponse(
+                intent="audit",
+                reply="这个项目还没有代码文件，没法审查。要不要先创建一个项目？",
+            )
+
+        project_dir = self._get_project_dir()
+        target_scope = resolve_target_scope(project_dir, message)
+        if not target_scope.is_resolved():
+            return PMResponse(
+                intent="audit",
+                reply=target_scope.clarify_question,
+            )
+
+        global_broadcaster.emit_sync("PM", "info", "🔬 正在调度技术团队审查代码...")
+
+        # Step 1: TechLead 侦查
+        try:
+            from agents.tech_lead import TechLeadAgent
+            tech_lead = TechLeadAgent()
+            findings = tech_lead.audit(project_dir, message, target_scope=target_scope)
+        except Exception as e:
+            logger.error(f"❗ TechLead 审查失败: {e}")
+            return PMResponse(
+                intent="audit",
+                reply=f"审查过程中遇到了问题：{str(e)}。可以稍后再试。",
+            )
+
+        if not findings:
+            report_md = self._write_audit_report(findings, message, target_scope)
+            try:
+                report_path = os.path.join(project_dir, "code_audit_report.md")
+                with open(report_path, "w", encoding="utf-8") as f:
+                    f.write(report_md)
+                logger.info(f"审查报告已保存: {report_path}")
+            except Exception as e:
+                logger.warning(f"审查报告保存失败: {e}")
+            return PMResponse(
+                intent="audit",
+                reply=(
+                    "定向审查完成，在以下范围内没有发现明显问题："
+                    f"{', '.join(target_scope.candidate_files)}。"
+                    "已生成审查报告并保存至 code_audit_report.md。"
+                ),
+                plan_md=report_md,
+            )
+
+        # Step 2: PM 根据发现列表 + 对话上下文撰写报告
+        report_md = self._write_audit_report(findings, message, target_scope)
+
+        # Step 3: 保存报告
+        try:
+            report_path = os.path.join(project_dir, "code_audit_report.md")
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write(report_md)
+            logger.info(f"审查报告已保存: {report_path}")
+        except Exception as e:
+            logger.warning(f"审查报告保存失败: {e}")
+
+        # 摘要
+        high_count = sum(1 for f in findings if f.get("severity") == "high")
+        medium_count = sum(1 for f in findings if f.get("severity") == "medium")
+        summary = f"审查完成！发现 {len(findings)} 个问题"
+        if high_count:
+            summary += f"（其中 {high_count} 个高危）"
+        elif medium_count:
+            summary += f"（其中 {medium_count} 个中危）"
+        summary += (
+            f"。本次为定向审查，范围：{', '.join(target_scope.candidate_files)}。"
+            "报告已保存至 code_audit_report.md，详细内容在右侧方案面板中。"
+        )
+
+        return PMResponse(intent="audit", reply=summary, plan_md=report_md)
+
+    # ============================================================
     # 确认/拒绝处理
     # ============================================================
 
+    def _write_audit_report(self, findings: list, user_request: str,
+                            target_scope: Optional[TargetScope] = None) -> str:
+        """
+        报告阶段直接基于已校验 findings 生成确定性 Markdown，避免二次幻觉。
+        """
+        scope_text = target_scope.summary_text() if target_scope else "未指定定向范围。"
+        return render_audit_report_markdown(findings, user_request, scope_text)
+
+    # ============================================================
+    # v4.0: 执行回传环 + 引导式回复
+    # ============================================================
+
+    def on_execution_complete(self, success: bool, mode: str, round_id: str, summary: dict):
+        """
+        Engine 执行完成后的回调。
+        写入执行账本 → 推进 Phase → LLM 生成引导性回复 → WebSocket 推送。
+        """
+        from datetime import datetime
+        entry = {
+            "round": round_id,
+            "mode": mode,
+            "success": success,
+            "built_features": summary.get("completed_descriptions", []),
+            "fused_tasks": summary.get("fused_tasks", []),
+            "error_tasks": summary.get("error_tasks", []),
+            "open_issues": summary.get("open_issues", []),
+            "files_created": summary.get("files_created", 0),
+            "files_modified": summary.get("files_modified", 0),
+            "timestamp": datetime.now().isoformat(),
+        }
+        self.execution_ledger.append(entry)
+        logger.info(f"📒 执行账本写入: R{round_id} {mode} success={success} "
+                     f"done={len(entry['built_features'])} fused={len(entry['fused_tasks'])}")
+
+        # Phase 推进
+        self._advance_phase(entry)
+
+        # LLM 生成引导性回复
+        try:
+            guided_reply = self._generate_post_execution_reply(entry)
+        except Exception as e:
+            logger.warning(f"引导回复生成失败: {e}")
+            status = "成功" if success else "存在一些问题"
+            guided_reply = f"本轮执行已完成（{status}）。告诉我接下来要做什么。"
+
+        # 写入对话历史 + WebSocket 推送
+        self.conversation.append({"role": "assistant", "content": guided_reply})
+        global_broadcaster.emit_sync("PM", "execution_complete", guided_reply)
+
+    def _generate_post_execution_reply(self, execution_entry: dict) -> str:
+        """让 LLM 根据执行结果生成引导性回复（禁止硬编码模板）"""
+        context_parts = []
+        context_parts.append(f"执行模式: {execution_entry['mode']}, "
+                             f"结果: {'成功' if execution_entry['success'] else '失败'}")
+
+        if execution_entry["built_features"]:
+            features = execution_entry["built_features"][:5]
+            context_parts.append(f"本轮新增/修改的功能: {', '.join(features)}")
+
+        if execution_entry["fused_tasks"]:
+            context_parts.append(f"失败/跳过的任务: {len(execution_entry['fused_tasks'])} 个")
+
+        if execution_entry["error_tasks"]:
+            context_parts.append(f"出错任务: {len(execution_entry['error_tasks'])} 个")
+
+        if execution_entry.get("open_issues"):
+            issues = execution_entry["open_issues"]
+            context_parts.append(f"待修复问题: {len(issues)} 个")
+            for iss in issues[:3]:
+                context_parts.append(f"  - [{iss['category']}] {iss['summary']}")
+
+        context_parts.append(f"文件创建: {execution_entry.get('files_created', 0)}, "
+                             f"文件修改: {execution_entry.get('files_modified', 0)}")
+
+        # Phase 进度
+        if self.project_phases:
+            done = [p for p in self.project_phases if p["status"] == "done"]
+            pending = [p for p in self.project_phases if p["status"] == "pending"]
+            context_parts.append(f"Phase 进度: {len(done)}/{len(self.project_phases)} 完成")
+            if pending:
+                next_p = pending[0]
+                context_parts.append(f"下一阶段: Phase {next_p['index']}「{next_p['name']}」"
+                                     f"(功能: {', '.join(next_p['features'][:3])})")
+            elif not pending and len(done) == len(self.project_phases):
+                context_parts.append("所有阶段已全部完成")
+
+        context = "\n".join(context_parts)
+
+        # 安全替换（避免 context 含 {} 导致 format 爆炸）
+        system_content = Prompts.PM_POST_EXECUTION_GUIDE.replace(
+            "{execution_context}", context)
+        resp = self._chat_completion(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_content},
+                {"role": "user", "content": "请根据执行结果生成引导性回复"},
+            ],
+            temperature=0.5,
+        )
+        return resp.content.strip()
+
+    def _advance_phase(self, execution_entry: dict):
+        """Phase 完成后自动推进到下一个"""
+        if not self.project_phases:
+            return
+
+        # 找到当前正在执行的 Phase
+        current = None
+        for p in self.project_phases:
+            if p["status"] in ("pending", "executing"):
+                current = p
+                break
+
+        if not current:
+            return
+
+        if execution_entry["success"]:
+            current["status"] = "done"
+            logger.info(f"Phase {current['index']}「{current['name']}」已完成")
+
+            # 查找下一个待执行的 Phase
+            next_phase = next((p for p in self.project_phases if p["status"] == "pending"), None)
+            if next_phase:
+                self.current_phase_index = next_phase["index"] - 1
+                # 预装下一 Phase 为 pending_extend
+                if self._full_plan_md:
+                    self.pending_extend = self._build_phase_plan(self._full_plan_md, next_phase["index"] - 1)
+                logger.info(f"Phase {next_phase['index']}「{next_phase['name']}」已预装为待确认")
+            else:
+                logger.info("所有 Phase 已全部完成")
+        else:
+            current["status"] = "failed"
+            logger.warning(f"Phase {current['index']}「{current['name']}」执行失败")
+
+    def _build_phase_status_text(self) -> str:
+        """构建 Phase 进度文本，注入路由上下文（供 LLM 感知项目全貌）"""
+        lines = []
+        if self._full_plan_md:
+            for line in self._full_plan_md.split('\n'):
+                if line.startswith('# '):
+                    lines.append(f"项目: {line[2:].strip()}")
+                    break
+        for p in (self.project_phases or []):
+            icon = {"done": "✅", "pending": "⏳", "executing": "🔄", "failed": "❌"}.get(p["status"], "?")
+            lines.append(f"  {icon} Phase {p['index']}「{p['name']}」{p['status']}")
+        if self.pending_extend:
+            lines.append("  ⚠️ 下一 Phase 已预装，等待用户确认继续")
+        return "\n".join(lines)
+
     def _handle_confirm(self) -> PMResponse:
-        """用户确认 → 保存需求文本 → 通知 server.py 启动 Engine"""
-        if not self.pending_req:
+        """
+        用户确认 → 将 plan.md 作为 confirmed_requirement 传给 Engine。
+        Phase 2: 不再依赖 structured_req JSON，直接用 plan.md。
+        """
+        if not self.pending_plan_md:
             return PMResponse(intent="action", reply="没有待确认的方案。")
 
-        summary = self.pending_req.get("summary", "用户项目")
+        title = self._extract_plan_title(self.pending_plan_md)
 
-        self.confirmed_requirement = self._structured_req_to_prompt(self.pending_req)
+        # 直接把 plan.md 作为 Engine 的需求输入
+        self.confirmed_requirement = self.pending_plan_md
         self.confirmed_mode = "create"
 
-        self.pending_req = None
         self.pending_plan_md = None
         self.state = "idle"
 
@@ -716,7 +1669,7 @@ class PMAgent:
 
         return PMResponse(
             intent="action",
-            reply=f"收到！正在为「{summary}」启动开发团队，请在左侧面板关注进度。",
+            reply=f"收到！正在为「{title}」启动开发团队，请在左侧面板关注进度。",
             is_executing=True,
         )
 
@@ -728,67 +1681,440 @@ class PMAgent:
         )
 
     # ============================================================
-    # Layer 2: 上下文按需注入
+    # Layer 2: 项目感知上下文（Phase 2 PM A-1）
     # ============================================================
 
-    def _build_project_context(self, context_needs: list = None) -> str:
-        """根据 context_needs 按需构建项目上下文，避免全量灌入"""
-        if context_needs is None:
-            context_needs = []
-
+    def _get_project_dir(self) -> str:
+        """获取当前项目的绝对路径"""
         projects_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "projects"
         )
-        project_dir = os.path.join(projects_dir, self.project_id)
+        return os.path.join(projects_dir, self.project_id)
 
-        parts = [f"项目: {self.project_id}"]
+    _SKIP_DIRS = {'__pycache__', 'venv', '.venv', 'node_modules', '.sandbox', '.astrea', '.git'}
 
-        project_exists = os.path.isdir(project_dir)
-
-        if not project_exists:
-            parts.append("状态: 新项目（尚无文件）")
-            return " | ".join(parts)
-
-        # 基础信息：总是包含文件数
-        file_count = 0
-        file_names = []
-        for root, dirs, files in os.walk(project_dir):
-            dirs[:] = [d for d in dirs if d not in
-                       ('__pycache__', 'venv', '.venv', 'node_modules', '.sandbox', '.astrea', '.git')]
-            for f in files:
-                if not f.startswith('.'):
-                    file_count += 1
-                    file_names.append(os.path.relpath(os.path.join(root, f), project_dir))
-        parts.append(f"文件数: {file_count}")
-
-        # 按需注入详细上下文
-        if "file_list" in context_needs and file_names:
-            parts.append(f"\n项目文件: {', '.join(file_names[:20])}")
-
-        if "tech_stack" in context_needs:
-            # 尝试从 plan.md 提取技术栈
-            plan_path = os.path.join(project_dir, ".astrea", "plan.md")
-            if os.path.isfile(plan_path):
+    def _scan_project_files(self, project_dir: str) -> dict:
+        """遍历项目目录，收集文件元信息"""
+        files = []
+        for root, dirs, filenames in os.walk(project_dir):
+            dirs[:] = [d for d in dirs if d not in self._SKIP_DIRS]
+            for fname in filenames:
+                if fname.startswith('.') or fname == 'plan.md':
+                    continue
+                fpath = os.path.join(root, fname)
+                rel = os.path.relpath(fpath, project_dir).replace('\\', '/')
+                ext = os.path.splitext(fname)[1].lower()
                 try:
-                    with open(plan_path, "r", encoding="utf-8") as f:
-                        plan_content = f.read(500)
-                    parts.append(f"\n技术方案摘要: {plan_content[:200]}")
+                    with open(fpath, encoding='utf-8', errors='ignore') as fh:
+                        line_count = sum(1 for _ in fh)
+                except Exception:
+                    line_count = 0
+                files.append({"name": rel, "basename": fname, "ext": ext, "lines": line_count})
+        return {"total": len(files), "files": files}
+
+    def _detect_tech_stack(self, files: list) -> str:
+        """根据文件后缀和内容关键词检测技术栈（确定性，零 LLM）"""
+        names = {f["basename"] for f in files}
+        exts = {f["ext"] for f in files}
+        parts = []
+
+        # 后端
+        if any(f["basename"] in ("app.py", "routes.py") for f in files):
+            # 尝试区分 Flask / FastAPI
+            project_dir = self._get_project_dir()
+            for f in files:
+                if f["basename"] in ("app.py", "main.py", "routes.py"):
+                    try:
+                        with open(os.path.join(project_dir, f["name"]), encoding='utf-8', errors='ignore') as fh:
+                            head = fh.read(500)
+                        if "fastapi" in head.lower():
+                            parts.append("FastAPI")
+                            break
+                        elif "flask" in head.lower():
+                            parts.append("Flask")
+                            break
+                        elif "django" in head.lower():
+                            parts.append("Django")
+                            break
+                    except Exception:
+                        pass
+            if not parts:
+                parts.append("Python")
+        elif "package.json" in names:
+            # 检查是否是 Express
+            project_dir = self._get_project_dir()
+            pkg_path = os.path.join(project_dir, "package.json")
+            if os.path.isfile(pkg_path):
+                try:
+                    with open(pkg_path, encoding='utf-8') as fh:
+                        pkg = fh.read(300)
+                    if "express" in pkg.lower():
+                        parts.append("Express")
+                    elif "next" in pkg.lower():
+                        parts.append("Next.js")
                 except Exception:
                     pass
 
-        if "frontend_skeleton" in context_needs:
-            # 列出前端相关文件
-            frontend_files = [f for f in file_names if any(
-                f.endswith(ext) for ext in ('.html', '.js', '.jsx', '.vue', '.css', '.ts', '.tsx')
-            )]
-            if frontend_files:
-                parts.append(f"\n前端文件: {', '.join(frontend_files[:10])}")
+        # 前端
+        if ".vue" in exts:
+            parts.append("Vue 3 Vite" if "vite.config" in ' '.join(names) else "Vue 3 CDN")
+        elif ".jsx" in exts or ".tsx" in exts:
+            parts.append("React Vite" if "vite.config" in ' '.join(names) else "React")
+        elif ".html" in exts and "templates" in ' '.join(f["name"] for f in files):
+            parts.append("Jinja2 SSR")
+        elif ".html" in exts:
+            parts.append("Vanilla JS")
 
-        if "project_progress" in context_needs:
-            parts.append(f"\n进度: 项目包含 {file_count} 个文件")
+        # 数据库
+        for f in files:
+            if f["basename"] in ("models.py", "database.py", "db.py"):
+                project_dir = self._get_project_dir()
+                try:
+                    with open(os.path.join(project_dir, f["name"]), encoding='utf-8', errors='ignore') as fh:
+                        head = fh.read(500)
+                    if "sqlite" in head.lower() or "db.sqlite" in head.lower():
+                        parts.append("SQLite")
+                    elif "sqlalchemy" in head.lower():
+                        parts.append("SQLAlchemy")
+                    elif "sequelize" in head.lower():
+                        parts.append("Sequelize")
+                    break
+                except Exception:
+                    pass
 
-        return " | ".join(parts[:2]) + "".join(parts[2:])
+        return " + ".join(parts) if parts else ""
+
+    def _extract_project_description(self, project_dir: str) -> str:
+        """从 .astrea/plan.md 提取项目描述（首行标题）"""
+        plan_path = os.path.join(project_dir, ".astrea", "plan.md")
+        if not os.path.isfile(plan_path):
+            return ""
+        try:
+            with open(plan_path, encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("# "):
+                        return line[2:].strip()
+                    if line and not line.startswith("#"):
+                        return line[:60]
+        except Exception:
+            pass
+        return ""
+
+    def _build_file_tree(self, files: list, project_dir: str) -> str:
+        """生成缩进文件树（含行数）"""
+        # 按路径排序，目录优先
+        sorted_files = sorted(files, key=lambda f: f["name"])
+        lines = []
+        seen_dirs = set()
+        for f in sorted_files:
+            parts = f["name"].split("/")
+            # 显示目录层级
+            if len(parts) > 1:
+                dir_path = "/".join(parts[:-1])
+                if dir_path not in seen_dirs:
+                    seen_dirs.add(dir_path)
+                    lines.append(f"  {dir_path}/")
+            indent = "    " if len(parts) > 1 else "  "
+            lines.append(f"{indent}{parts[-1]} ({f['lines']}行)")
+        return "\n".join(lines[:25])  # 最多 25 行
+
+    def _build_skeleton_index(self, files: list, project_dir: str, max_files: int = 5) -> str:
+        """为关键文件生成带行号+依赖标注的骨架索引（PM 的目录页）"""
+        KEY_BASENAMES = {
+            'app.py', 'main.py', 'routes.py', 'views.py', 'models.py',
+            'index.html', 'style.css', 'app.js',
+            'App.vue', 'App.jsx', 'page.js', 'page.jsx',
+        }
+
+        index_parts = []
+        for f in files:
+            if f["basename"] not in KEY_BASENAMES:
+                continue
+            if len(index_parts) >= max_files:
+                break
+
+            filepath = os.path.join(project_dir, f["name"])
+            if not os.path.isfile(filepath):
+                continue
+
+            skeleton = self._extract_file_skeleton(filepath, f["ext"], files, project_dir)
+            if skeleton:
+                index_parts.append(f"{f['name']} ({f['lines']}行):\n{skeleton}")
+
+        return "\n\n".join(index_parts)
+
+    def _extract_file_skeleton(self, filepath: str, ext: str,
+                                all_files: list = None, project_dir: str = None) -> str:
+        """提取单个文件的骨架签名 + 行号范围 + 依赖标注"""
+        try:
+            with open(filepath, encoding='utf-8', errors='ignore') as fh:
+                lines = fh.readlines()
+        except Exception:
+            return ""
+
+        # 收集 import 的模块名（用于依赖标注）
+        imported_modules = set()
+        for line in lines[:30]:
+            m = re.match(r'^\s*(?:from|import)\s+(\w+)', line)
+            if m:
+                imported_modules.add(m.group(1))
+
+        entries = []
+
+        if ext == '.py':
+            i = 0
+            while i < len(lines):
+                stripped = lines[i].strip()
+                line_no = i + 1
+
+                # class 定义
+                if stripped.startswith('class ') and '(' in stripped:
+                    class_match = re.match(r'class\s+(\w+)', stripped)
+                    if class_match:
+                        end = self._find_block_end_py(lines, i)
+                        entries.append(f"  class {class_match.group(1)}  [L{line_no}-{end + 1}]")
+                        # 提取字段（如 SQLAlchemy Column 或简单赋值）
+                        columns = []
+                        for ci in range(i + 1, min(end + 1, len(lines))):
+                            col_m = re.match(r'\s+(\w+)\s*=\s*(?:db\.Column|models\.\w+Field|Column)', lines[ci])
+                            if col_m:
+                                columns.append(col_m.group(1))
+                        if columns:
+                            entries.append(f"    columns: {', '.join(columns[:8])}")
+
+                # def 定义
+                elif stripped.startswith('def '):
+                    func_match = re.match(r'def\s+(\w+)\s*\(([^)]*)\)', stripped)
+                    if func_match:
+                        end = self._find_block_end_py(lines, i)
+                        sig = f"def {func_match.group(1)}({func_match.group(2)})"
+
+                        # 提取路由装饰器
+                        route = ""
+                        if i > 0:
+                            for di in range(max(0, i - 3), i):
+                                route_m = re.search(r"@\w+\.(?:route|get|post|put|delete)\(['\"](.+?)['\"]", lines[di])
+                                if route_m:
+                                    method_m = re.search(r'\.(get|post|put|delete)\(', lines[di])
+                                    method = method_m.group(1).upper() if method_m else ""
+                                    route = f"  → {method} {route_m.group(1)}" if method else f"  → {route_m.group(1)}"
+                                    break
+
+                        entries.append(f"  {sig}  [L{line_no}-{end + 1}]{route}")
+
+                        # 扫描函数体内的依赖关系
+                        body_text = "".join(lines[i:end + 1])
+                        deps = self._extract_deps_from_body(body_text, imported_modules)
+                        for dep in deps:
+                            entries.append(f"    ↳ {dep}")
+
+                i += 1
+
+        elif ext in ('.html', '.vue', '.jsx', '.tsx'):
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                line_no = i + 1
+                # 主要结构元素
+                tag_m = re.match(r'<(main|section|form|table|nav|header|footer|ul|ol)\b', stripped)
+                if tag_m:
+                    # 提取 class/id
+                    attr = ""
+                    id_m = re.search(r'id=["\']([^"\']+)["\']', stripped)
+                    cls_m = re.search(r'class=["\']([^"\']+)["\']', stripped)
+                    if id_m:
+                        attr = f' id="{id_m.group(1)}"'
+                    elif cls_m:
+                        attr = f' class="{cls_m.group(1)}"'
+                    entries.append(f"  <{tag_m.group(1)}{attr}>  [L{line_no}]")
+
+                # form action
+                action_m = re.search(r'action=["\']([^"\']+)["\']', stripped)
+                if action_m:
+                    entries.append(f"    ↳ calls: {action_m.group(1)}")
+
+                # fetch 调用
+                fetch_m = re.search(r"fetch\(['\"]([^'\"]+)['\"]", stripped)
+                if fetch_m:
+                    entries.append(f"    ↳ calls: {fetch_m.group(1)}")
+
+                # Jinja extends
+                ext_m = re.search(r"\{%\s*extends\s+['\"](.+?)['\"]", stripped)
+                if ext_m:
+                    entries.append(f"  ↳ extends: {ext_m.group(1)}")
+
+        elif ext == '.css':
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                line_no = i + 1
+                if stripped and not stripped.startswith(('/*', '*', '//', '}', '@')) and '{' in stripped:
+                    selector = stripped.split('{')[0].strip()
+                    if selector:
+                        entries.append(f"  {selector}  [L{line_no}]")
+
+        return "\n".join(entries[:15])  # 每个文件最多 15 个条目
+
+    def _extract_deps_from_body(self, body_text: str, imported_modules: set) -> list:
+        """从函数体中提取依赖标注"""
+        deps = []
+        seen = set()
+
+        # render_template 依赖
+        for m in re.finditer(r"render_template\(['\"](.+?)['\"]", body_text):
+            dep = f"renders: templates/{m.group(1)}"
+            if dep not in seen:
+                deps.append(dep)
+                seen.add(dep)
+
+        # 模块调用依赖 (xxx.func())
+        for m in re.finditer(r"(\w+)\.(\w+)\(", body_text):
+            mod, func = m.group(1), m.group(2)
+            if mod in imported_modules and mod not in ('self', 'os', 'json', 'logging', 'request', 'db', 'app', 're'):
+                dep = f"calls: {mod}.{func}()"
+                if dep not in seen:
+                    deps.append(dep)
+                    seen.add(dep)
+
+        # redirect + url_for 依赖
+        for m in re.finditer(r"redirect\(url_for\(['\"](.+?)['\"]", body_text):
+            dep = f"redirects: {m.group(1)}"
+            if dep not in seen:
+                deps.append(dep)
+                seen.add(dep)
+
+        return deps[:5]  # 每个函数最多 5 个依赖
+
+    @staticmethod
+    def _find_block_end_py(lines: list, start_idx: int) -> int:
+        """找到 Python 函数/类块的结束行（基于缩进）"""
+        if start_idx >= len(lines):
+            return start_idx
+        # 获取定义行的缩进
+        first_line = lines[start_idx]
+        base_indent = len(first_line) - len(first_line.lstrip())
+
+        end = start_idx
+        for j in range(start_idx + 1, len(lines)):
+            line = lines[j]
+            if not line.strip():  # 空行跳过
+                continue
+            current_indent = len(line) - len(line.lstrip())
+            if current_indent <= base_indent:
+                break
+            end = j
+        return end
+
+    def _get_recent_git_log(self, project_dir: str, max_count: int = 3) -> str:
+        """格式化最近 N 条 git log"""
+        git_dir = os.path.join(project_dir, ".git")
+        if not os.path.isdir(git_dir):
+            return ""
+        try:
+            import subprocess as sp
+            result = sp.run(
+                ["git", "log", f"--max-count={max_count}", "--format=%s|%ar"],
+                cwd=project_dir,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+            )
+            if result.returncode != 0 or not result.stdout.strip():
+                return ""
+            lines = []
+            for line in result.stdout.strip().split('\n'):
+                parts = line.split('|', 1)
+                if len(parts) == 2:
+                    lines.append(f"  {parts[0].strip()} ({parts[1].strip()})")
+            return "\n".join(lines)
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _trim_window_by_tokens(conversation: list) -> list:
+        """
+        弹性 Token 截断：按 token 预算裁剪对话窗口。
+
+        规则：
+        - 从最新消息往回计算，累计 token 不超过 _WINDOW_TOKEN_BUDGET
+        - 弹性设计：不在对话对（user+assistant）中间截断
+          → 如果加入某条消息后超预算，仍然保留该消息及其配对
+        - 最坏情况：窗口只剩最后一轮对话
+        """
+        if not conversation:
+            return conversation
+
+        budget = _WINDOW_TOKEN_BUDGET
+        total_tokens = 0
+        cut_index = 0  # 从这个 index 开始保留
+
+        # 从后往前扫描
+        for i in range(len(conversation) - 1, -1, -1):
+            msg_tokens = len(conversation[i].get("content", "")) / _CHAR_PER_TOKEN
+            total_tokens += msg_tokens
+
+            if total_tokens > budget:
+                # 超预算了，但要保证弹性：不在对话对中间截断
+                # 确保 cut_index 落在 user 消息的位置（偶数 index 或第一条）
+                cut_index = i + 1
+                # 如果 cut_index 指向 assistant 消息，再往前推一条（保留完整对）
+                if cut_index < len(conversation) and conversation[cut_index]["role"] == "assistant":
+                    cut_index = max(0, cut_index - 1)
+                break
+
+        result = conversation[cut_index:]
+        if len(result) < len(conversation):
+            logger.debug(
+                f"滑动窗口截断: {len(conversation)} → {len(result)} 条消息, "
+                f"≈{int(total_tokens)} tokens"
+            )
+        return result
+
+    def _build_project_context(self, context_needs: list = None) -> str:
+        """
+        分级构建项目上下文快照（Phase 2 PM A-1）。
+
+        Level 0（所有模式）: 项目名 + 文件数 + 技术栈 + 描述       ~200 chars
+        Level 1（Patch/Chat）: 文件树 + 骨架索引 + git log          ~600 chars
+        """
+        if context_needs is None:
+            context_needs = []
+
+        project_dir = self._get_project_dir()
+        if not os.path.isdir(project_dir):
+            return "项目: 新项目（尚无文件）"
+
+        file_info = self._scan_project_files(project_dir)
+        if file_info['total'] == 0:
+            return "项目: 空项目（尚无源代码）"
+
+        parts = []
+
+        # === L0: 基础元信息（所有模式）===
+        tech_stack = self._detect_tech_stack(file_info['files'])
+        description = self._extract_project_description(project_dir)
+        parts.append(f"项目: {self.project_id}")
+        parts.append(f"状态: 已有 {file_info['total']} 个文件")
+        if tech_stack:
+            parts.append(f"技术栈: {tech_stack}")
+        if description:
+            parts.append(f"描述: {description}")
+
+        # === L1: 文件树 + 骨架索引（Patch/Rollback/Chat）===
+        if any(n in context_needs for n in ("file_tree", "file_list", "skeleton")):
+            tree = self._build_file_tree(file_info['files'], project_dir)
+            if tree:
+                parts.append(f"\n📁 文件结构:\n{tree}")
+
+        if "skeleton" in context_needs:
+            skeleton = self._build_skeleton_index(file_info['files'], project_dir)
+            if skeleton:
+                parts.append(f"\n📄 关键文件骨架（↳ 标注了跨文件依赖关系）:\n{skeleton}")
+
+        if "git_log" in context_needs:
+            log = self._get_recent_git_log(project_dir, max_count=3)
+            if log:
+                parts.append(f"\n📝 最近修改:\n{log}")
+
+        return "\n".join(parts)
 
     # ============================================================
     # 辅助方法
@@ -816,8 +2142,8 @@ class PMAgent:
 
     def get_user_requirement(self) -> Optional[str]:
         """获取用户已确认的需求文本（供 Engine 使用）"""
-        if self.pending_req:
-            return self._structured_req_to_prompt(self.pending_req)
+        if self.pending_plan_md:
+            return self.pending_plan_md
         return None
 
     def _search_archive(self, query: str) -> Optional[str]:

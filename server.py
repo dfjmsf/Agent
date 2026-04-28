@@ -59,6 +59,10 @@ observer = Observer()
 _project_locks: Dict[str, threading.Lock] = {}
 _locks_guard = threading.Lock()
 
+# --- v3.0: 活跃 Engine 注册表（用于 abort 端点访问）---
+_active_engines: Dict[str, AstreaEngine] = {}
+_engines_guard = threading.Lock()
+
 
 def _get_project_lock(project_id: str) -> threading.Lock:
     """获取或创建指定项目的互斥锁"""
@@ -116,6 +120,24 @@ async def lifespan(app: FastAPI):
     from tools.sandbox import sandbox_env
     sandbox_env.venv_manager.cleanup_stale()
     logger.info("🧹 Sandbox 残留清理完成")
+
+    # Memory A-1: 首次启动时注入全局种子经验（幂等，已存在则跳过）
+    try:
+        from scripts.seed_memories import seed_global_memories
+        seed_count = seed_global_memories()
+        if seed_count > 0:
+            logger.info(f"🌱 全局种子经验注入完成: {seed_count} 条")
+    except Exception as e:
+        logger.warning(f"⚠️ 种子经验注入异常（不影响启动）: {e}")
+
+    # AMC 斩杀线：清除评分低于 0.3 的劣质记忆
+    try:
+        from core.database import purge_low_amc_memories
+        purged = purge_low_amc_memories()
+        if purged > 0:
+            logger.info(f"🗑️ AMC 斩杀: 清除 {purged} 条劣质记忆")
+    except Exception as e:
+        logger.warning(f"⚠️ AMC 斩杀异常（不影响启动）: {e}")
 
     projects_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "projects")
     if not os.path.exists(projects_dir):
@@ -193,20 +215,59 @@ def run_project_thread(prompt: str, out_dir: str, project_id: str, mode: str = "
     try:
         logger.info(f"后台线程：AstreaEngine 启动 (Project: {project_id}, mode={mode})...")
         engine = AstreaEngine(project_id=project_id)
+        # v3.0: 注册 Engine 实例
+        with _engines_guard:
+            _active_engines[project_id] = engine
+        # v4.0: 如果 PM 有 Phase 信息，传递给 Engine
+        pm_inst = _get_pm_instance(project_id)
+        # v5.0: 从 PM 取缓存的 TechLead diagnosis 注入 Engine（避免二次调查）
+        cached_diag = getattr(pm_inst, '_cached_tech_lead_diagnosis', None)
+        if cached_diag:
+            engine._pm_tech_lead_diagnosis = cached_diag
+            pm_inst._cached_tech_lead_diagnosis = None  # 一次性消费
+            logger.info("📦 [PM→Engine] TechLead diagnosis 已注入，Engine 将跳过二次调查")
+        phases = getattr(pm_inst, 'project_phases', None)
+        logger.info(f"🔍 Phase 诊断: project_id={project_id}, phases={bool(phases)}, count={len(phases) if phases else 0}")
+        if phases:
+            engine._phase_mode = True
+            pending = [p for p in phases if p["status"] == "pending"]
+            engine._is_final_phase = len(pending) <= 1
+            logger.info(f"🔍 Phase 模式已启用: pending={len(pending)}, is_final={engine._is_final_phase}")
         success, final_dir = engine.run(prompt, out_dir or None, mode=mode)
         if not success:
             logger.error(f"项目生成失败，输出目录: {final_dir}")
+
+        # v4.0: 回传执行结果给 PM（引导式交互的基础）
+        try:
+            pm = pm_inst  # v4.1: 复用已获取的 PM 实例（避免重命名后 id 不匹配）
+            # v5.1: 传入 group_id，确保 extend/continue 只报告本轮新增功能
+            last_group = getattr(engine, '_last_group_id', None)
+            summary = engine.blackboard.get_execution_summary(group_id=last_group)
+            pm.on_execution_complete(
+                success=success,
+                mode=mode,
+                round_id=engine.session_id,
+                summary=summary,
+            )
+        except Exception as cb_err:
+            import traceback
+            logger.warning(f"PM 回传失败: {cb_err}\n{traceback.format_exc()}")
     except Exception as e:
         global_broadcaster.emit_sync("System", "error", f"项目生成异常：{str(e)}")
     finally:
+        # v3.0: 注销 Engine 实例
+        with _engines_guard:
+            _active_engines.pop(project_id, None)
         lock.release()
 
 @app.post("/api/project/new")
 async def create_new_project(req: NewProjectReq):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_name = re.sub(r'[^\w\-\u4e00-\u9fa5]', '_', req.project_name)
-    if not safe_name.strip('_'):
-        safe_name = "新建项目"
+    # 目录名仅允许 ASCII（中文/特殊字符 → 下划线），避免 Windows subprocess 路径编码问题
+    safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', req.project_name)
+    safe_name = re.sub(r'_+', '_', safe_name).strip('_')  # 合并连续下划线
+    if not safe_name:
+        safe_name = "new_project"
     folder_name = f"{timestamp}_{safe_name}"
     
     projects_dir = os.path.join(os.path.dirname(__file__), "projects")
@@ -246,25 +307,14 @@ class ChatReq(BaseModel):
     message: str
     project_id: str = "default_project"
 
-class ActionReq(BaseModel):
-    action: str  # "confirm" | "reject" | "rollback_confirm" | "rollback_cancel"
-    project_id: str = "default_project"
-
 @app.post("/api/chat")
 async def chat_with_pm(req: ChatReq):
-    """PM Agent 对话入口"""
+    """PM Agent 对话入口（在线程中执行，保持 event loop 畅通以实时推送 WebSocket）"""
     pm = _get_pm_instance(req.project_id)
-    response = pm.chat(req.message)
-    return asdict(response)
+    response = await asyncio.to_thread(pm.chat, req.message)
 
-@app.post("/api/chat/action")
-async def chat_action(req: ActionReq):
-    """确定性按钮动作（confirm/reject，零 LLM 分类）"""
-    pm = _get_pm_instance(req.project_id)
-    response = pm.handle_action(req.action)
-
+    # v4.0: PM 通过自然语言确认后触发 Engine（接管旧版按钮的职责）
     if response.is_executing:
-        # 从 PM 获取已确认的需求文本 + 执行模式，启动 Engine
         user_req = getattr(pm, 'confirmed_requirement', None) or "用户确认执行"
         mode = getattr(pm, 'confirmed_mode', 'auto')
         t = threading.Thread(
@@ -273,7 +323,39 @@ async def chat_action(req: ActionReq):
         )
         t.start()
 
-    return asdict(response)
+    result = asdict(response)
+    logger.info(
+        "[/api/chat] 响应 → intent=%s, reply_len=%d, actions=%s, is_executing=%s, reply_preview=%s",
+        result.get("intent"), len(result.get("reply") or ""),
+        bool(result.get("actions")), result.get("is_executing"),
+        (result.get("reply") or "")[:120],
+    )
+    return result
+
+# [已删除] /api/chat/action — v4.0 取消按钮确认，Engine 通过 /api/chat 中的 is_executing 触发
+
+class AbortReq(BaseModel):
+    project_id: str = "default_project"
+
+@app.post("/api/abort")
+async def abort_execution(req: AbortReq):
+    """
+    v3.0: 一键中止当前执行并回滚到执行前状态。
+    前端点击"中止"按钮时调用。
+    """
+    with _engines_guard:
+        engine = _active_engines.get(req.project_id)
+
+    if not engine:
+        return {
+            "success": False,
+            "message": f"项目 {req.project_id} 当前没有正在执行的任务",
+            "rolled_back_to": None,
+        }
+
+    result = engine.abort_and_rollback()
+    logger.info(f"Abort 结果: {result}")
+    return result
 
 @app.get("/api/chat/history")
 async def chat_history(project_id: str, limit: int = 50):
@@ -584,9 +666,10 @@ async def scan_project_api(req: ScanReq):
         return {"error": f"扫描失败: {str(e)}"}
 
 
+
 # --- 模型配置 API ---
 
-_AGENT_ROLES = ["MODEL_PLANNER", "MODEL_CODER", "MODEL_REVIEWER", "MODEL_SYNTHESIZER", "MODEL_AUDITOR", "MODEL_PM", "MODEL_PLANNER_LITE", "MODEL_TECH_LEAD"]
+_AGENT_ROLES = ["MODEL_PLANNER", "MODEL_CODER", "MODEL_REVIEWER", "MODEL_SYNTHESIZER", "MODEL_AUDITOR", "MODEL_PM", "MODEL_PLANNER_LITE", "MODEL_TECH_LEAD", "MODEL_QA", "MODEL_QA_VISION"]
 _ROLE_LABELS = {
     "MODEL_PLANNER": "规划师 (Manager)",
     "MODEL_CODER": "编码器 (Coder)",
@@ -596,19 +679,73 @@ _ROLE_LABELS = {
     "MODEL_PM": "项目经理 (PM)",
     "MODEL_PLANNER_LITE": "规划组 (PlannerLite)",
     "MODEL_TECH_LEAD": "技术骨干 (TechLead)",
+    "MODEL_QA": "质检员 (QA)",
+    "MODEL_QA_VISION": "QA 视觉审查 (QA Vision)",
 }
+
+# Agent 角色 → 对应的 THINKING_* 环境变量名
+_THINKING_MAP = {
+    "MODEL_PLANNER": "THINKING_PLANNER",
+    "MODEL_CODER": "THINKING_CODER",
+    "MODEL_REVIEWER": "THINKING_REVIEWER",
+    "MODEL_SYNTHESIZER": "THINKING_SYNTHESIZER",
+    "MODEL_AUDITOR": "THINKING_AUDITOR",
+    "MODEL_PM": "THINKING_PM",
+    "MODEL_PLANNER_LITE": "THINKING_PLANNER_LITE",
+    "MODEL_TECH_LEAD": "THINKING_TECH_LEAD",
+    "MODEL_QA": "THINKING_QA",
+    "MODEL_QA_VISION": "THINKING_QA_VISION",
+}
+
+# custom_providers.json 路径
+_CUSTOM_PROVIDERS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config", "custom_providers.json")
+
+
+def _load_custom_providers_json() -> list:
+    """读取 custom_providers.json"""
+    if not os.path.isfile(_CUSTOM_PROVIDERS_PATH):
+        return []
+    try:
+        with open(_CUSTOM_PROVIDERS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def _save_custom_providers_json(data: list):
+    """写入 custom_providers.json"""
+    os.makedirs(os.path.dirname(_CUSTOM_PROVIDERS_PATH), exist_ok=True)
+    with open(_CUSTOM_PROVIDERS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _mask_key(key: str) -> str:
+    """API Key 脱敏: sk-mG9tiy...vafj → sk-mG9t********vafj"""
+    if len(key) <= 10:
+        return "****"
+    return key[:6] + "********" + key[-4:]
 
 
 @app.get("/api/config/models")
 async def get_model_config():
-    """获取当前模型配置和可用 Provider 列表"""
+    """获取当前模型配置和可用 Provider 列表（含思考模式开关）"""
     from core.llm_client import default_llm
 
-    # 当前各 Agent 的模型配置
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    current = {}
+    # 当前各 Agent 的模型配置 + 思考模式
+    agents = {}
     for role in _AGENT_ROLES:
-        current[role] = os.getenv(role, "未设置")
+        thinking_key = _THINKING_MAP.get(role, "")
+        thinking_val = os.getenv(thinking_key, "false").lower()
+        # 兼容旧值：true → high, false → false
+        if thinking_val == "true":
+            thinking_val = "high"
+        elif thinking_val not in ("high", "max"):
+            thinking_val = "false"
+        agents[role] = {
+            "label": _ROLE_LABELS[role],
+            "model": os.getenv(role, "未设置"),
+            "thinking": thinking_val,
+        }
 
     # 收集所有 Provider 和它们的模型
     providers = []
@@ -619,19 +756,20 @@ async def get_model_config():
         })
 
     return {
-        "agents": {role: {"label": _ROLE_LABELS[role], "model": current[role]} for role in _AGENT_ROLES},
+        "agents": agents,
         "providers": providers,
     }
 
 
 class ModelConfigUpdate(BaseModel):
-    """模型配置更新请求"""
-    config: Dict[str, str]  # e.g. {"MODEL_PLANNER": "qwen3-max", "MODEL_CODER": "deepseek-chat"}
+    """模型配置更新请求（支持模型选择 + 思考模式）"""
+    config: Dict[str, str]  # e.g. {"MODEL_PLANNER": "qwen3-max", "MODEL_CODER": "deepseek-v4-flash"}
+    thinking: Optional[Dict[str, str]] = None  # e.g. {"MODEL_PLANNER": "high", "MODEL_CODER": "false"}
 
 
 @app.put("/api/config/models")
 async def update_model_config(req: ModelConfigUpdate):
-    """更新 .env 中的模型配置并热重载"""
+    """更新 .env 中的模型配置和思考模式并热重载"""
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 
     # 读取现有 .env
@@ -641,20 +779,36 @@ async def update_model_config(req: ModelConfigUpdate):
     except FileNotFoundError:
         return {"error": ".env 文件不存在"}
 
+    # 合并要更新的 key-value
+    updates = {}
+    for key, value in req.config.items():
+        if key in _AGENT_ROLES:
+            updates[key] = value
+    if req.thinking:
+        for role, val in req.thinking.items():
+            thinking_key = _THINKING_MAP.get(role)
+            if thinking_key:
+                updates[thinking_key] = val  # "false" / "high" / "max"
+
     # 逐行更新
     updated_keys = set()
     new_lines = []
     for line in lines:
         stripped = line.strip()
         matched = False
-        for key, value in req.config.items():
-            if key in _AGENT_ROLES and stripped.startswith(f"{key}="):
+        for key, value in updates.items():
+            if stripped.startswith(f"{key}="):
                 new_lines.append(f"{key}={value}\n")
                 updated_keys.add(key)
                 matched = True
                 break
         if not matched:
             new_lines.append(line)
+
+    # 追加新的 key（如果 .env 中不存在）
+    for key, value in updates.items():
+        if key not in updated_keys:
+            new_lines.append(f"{key}={value}\n")
 
     # 写回
     try:
@@ -664,16 +818,90 @@ async def update_model_config(req: ModelConfigUpdate):
         return {"error": f"写入失败: {str(e)}"}
 
     # 热重载环境变量到当前进程
-    for key, value in req.config.items():
-        if key in _AGENT_ROLES:
-            os.environ[key] = value
+    for key, value in updates.items():
+        os.environ[key] = value
 
-    logger.info(f"✅ 模型配置已更新: {req.config}")
-    return {"status": "ok", "updated": dict(req.config),
+    for pm in _pm_instances.values():
+        if hasattr(pm, "refresh_runtime_config"):
+            pm.refresh_runtime_config()
+
+    logger.info(f"✅ 模型配置已更新: {updates}")
+    return {"status": "ok", "updated": updates,
             "note": "配置已写入.env并热载，新的项目生成将使用更新后的模型。"}
+
+
+# --- 自定义 Provider CRUD API ---
+
+class CustomProviderReq(BaseModel):
+    name: str
+    api_key: str
+    base_url: str
+    models: list  # ["gpt-5.4", "gpt-5.3-codex"]
+
+
+@app.get("/api/config/custom_providers")
+async def get_custom_providers():
+    """获取已保存的自定义 Provider（Key 脱敏）"""
+    data = _load_custom_providers_json()
+    masked = []
+    for entry in data:
+        masked.append({
+            "name": entry.get("name", ""),
+            "api_key_masked": _mask_key(entry.get("api_key", "")),
+            "base_url": entry.get("base_url", ""),
+            "models": entry.get("models", []),
+        })
+    return {"providers": masked}
+
+
+@app.post("/api/config/custom_providers")
+async def add_custom_provider(req: CustomProviderReq):
+    """添加或更新自定义 Provider（重名则覆盖）"""
+    from core.llm_client import default_llm
+
+    data = _load_custom_providers_json()
+
+    # 重名检测 → 覆盖
+    data = [p for p in data if p.get("name") != req.name]
+    data.append({
+        "name": req.name,
+        "api_key": req.api_key,
+        "base_url": req.base_url,
+        "models": req.models,
+    })
+
+    _save_custom_providers_json(data)
+
+    # 热重载 LLM Provider 列表
+    default_llm.reload_providers()
+
+    logger.info(f"✅ 自定义 Provider [{req.name}] 已保存并热重载 (模型: {req.models})")
+    return {"status": "ok", "provider": req.name, "models": req.models}
+
+
+@app.delete("/api/config/custom_providers/{name}")
+async def delete_custom_provider(name: str):
+    """删除指定的自定义 Provider"""
+    from core.llm_client import default_llm
+
+    data = _load_custom_providers_json()
+    before_count = len(data)
+    data = [p for p in data if p.get("name") != name]
+    
+    if len(data) == before_count:
+        return {"error": f"未找到名为 '{name}' 的 Provider"}
+
+    _save_custom_providers_json(data)
+
+    # 热重载
+    default_llm.reload_providers()
+
+    logger.info(f"🗑️ 自定义 Provider [{name}] 已删除并热重载")
+    return {"status": "ok", "deleted": name}
 
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False)
+
 

@@ -29,12 +29,20 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
       conn.commit()
   ```
 
-### 4. 获取返回结果（Dict 格式）
-原生 `sqlite3.Row` 默认像元组，需要转为字典以方便前端序列化或模板渲染：
+### 4. 🚨 row_factory 铁律（违反 = Jinja2 UndefinedError = 500 崩溃）
+> ⚠️ **致命铁律：每一个 `sqlite3.connect()` 调用之后，必须立刻设置 `conn.row_factory = sqlite3.Row`！**
+- 不设置 → `cursor.fetchall()` 返回 tuple 列表 → 模板 `{{ expense.amount }}` 报错 `'tuple' object has no attribute 'amount'` → 500！
+- **禁止**在任何函数中遗漏 `row_factory`，即使只查一行也必须设置！
+- **推荐**：封装 `get_db()` 工具函数，统一设置 `row_factory`，所有查询都通过它获取连接。
+
 ```python
-conn.row_factory = sqlite3.Row
-cursor = conn.cursor()
-cursor.execute('SELECT * FROM users')
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row  # 铁律！
+    return conn
+
+# 查询后返回给模板/API 时，转为标准字典：
 rows = cursor.fetchall()
-return [dict(row) for row in rows]  # 转为标准字典列表
+return [dict(row) for row in rows]
 ```
+

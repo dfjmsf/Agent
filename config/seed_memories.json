@@ -1,0 +1,107 @@
+[
+  {
+    "content": "Flask 应用必须在 if __name__ == '__main__' 块中使用 app.run(host='0.0.0.0', port=5001, debug=False)，严禁使用 debug=True（会触发 reloader 导致沙盒进程管理混乱），严禁省略 host 参数（默认 127.0.0.1 在容器/远程环境中不可访问）。",
+    "tech_stacks": ["flask"],
+    "exp_type": "anti_pattern",
+    "scenario": "Flask 服务启动配置",
+    "domain": "backend"
+  },
+  {
+    "content": "Flask 应用中使用 redirect() 后必须 return redirect(url_for(...))，否则后续代码仍会继续执行，导致逻辑混乱甚至数据重复写入。",
+    "tech_stacks": ["flask"],
+    "exp_type": "anti_pattern",
+    "scenario": "Flask 路由控制流",
+    "domain": "backend"
+  },
+  {
+    "content": "Flask 模板中使用 url_for('static', filename='style.css') 引用静态资源，严禁硬编码 /static/style.css，因为 Flask 的 static_url_path 可能被修改。同时确保 static/ 目录和 templates/ 目录与 app.py 同级。",
+    "tech_stacks": ["flask"],
+    "exp_type": "general",
+    "scenario": "Flask 静态资源与模板路径",
+    "domain": "backend"
+  },
+  {
+    "content": "Flask-WTF 的 CSRF 保护要求所有 POST 表单中必须包含 {{ form.hidden_tag() }} 或 <input type='hidden' name='csrf_token' value='{{ csrf_token() }}'/>。如果前端使用 fetch/axios 发送 JSON，则需在请求头中携带 X-CSRFToken。缺少此 token 将返回 400 Bad Request。",
+    "tech_stacks": ["flask"],
+    "exp_type": "anti_pattern",
+    "scenario": "Flask CSRF 防护与表单提交",
+    "domain": "backend"
+  },
+  {
+    "content": "错误写法：在 Flask 路由函数内部 from models import db 。正确写法：在文件顶部 from models import db。路由函数内部 import 会导致循环引用（models.py 可能反向依赖 app），且每次请求都重新执行 import 语句浪费性能。",
+    "tech_stacks": ["flask"],
+    "exp_type": "contrastive_pair",
+    "scenario": "Flask 循环引用防范",
+    "domain": "backend"
+  },
+  {
+    "content": "FastAPI 路由参数必须与函数签名的类型标注严格匹配。例如 @app.get('/items/{item_id}') 对应 async def get_item(item_id: int)。如果 URL 传入 'abc'，FastAPI 会自动返回 422 Unprocessable Entity 而非 500，这是正常行为。",
+    "tech_stacks": ["fastapi"],
+    "exp_type": "general",
+    "scenario": "FastAPI 路由参数类型校验",
+    "domain": "backend"
+  },
+  {
+    "content": "FastAPI 应用使用 uvicorn 启动时务必指定 host='0.0.0.0'：uvicorn.run(app, host='0.0.0.0', port=5001)。使用 reload=True 仅限开发环境，生产/沙盒环境必须设为 False。",
+    "tech_stacks": ["fastapi"],
+    "exp_type": "anti_pattern",
+    "scenario": "FastAPI/Uvicorn 启动配置",
+    "domain": "backend"
+  },
+  {
+    "content": "FastAPI 使用 Pydantic BaseModel 接收 JSON 请求体时，前端必须发送 Content-Type: application/json。如果前端误用 application/x-www-form-urlencoded，FastAPI 会返回 422。反之如果用 Form(...) 接收表单数据，则客户端必须用 form-urlencoded 格式。",
+    "tech_stacks": ["fastapi"],
+    "exp_type": "contrastive_pair",
+    "scenario": "FastAPI 请求体格式匹配",
+    "domain": "backend"
+  },
+  {
+    "content": "SQLAlchemy 中 session.add() 后必须 session.commit() 才能持久化。常见遗漏：在 try-except 中 commit 但忘记在 except 中 rollback，导致事务残留。推荐模式：try: session.add(obj); session.commit() except: session.rollback(); raise finally: session.close()。",
+    "tech_stacks": ["flask", "fastapi", "sqlalchemy"],
+    "exp_type": "general",
+    "scenario": "SQLAlchemy 事务管理",
+    "domain": "backend"
+  },
+  {
+    "content": "SQLite 数据库文件路径使用 os.path.join(os.path.dirname(__file__), 'data.db') 构造绝对路径，严禁使用相对路径 'data.db'，否则在不同工作目录启动时会创建多个数据库文件导致数据丢失。",
+    "tech_stacks": ["flask", "fastapi", "sqlite"],
+    "exp_type": "anti_pattern",
+    "scenario": "SQLite 数据库路径管理",
+    "domain": "backend"
+  },
+  {
+    "content": "前端 JavaScript 使用 fetch() 调用后端 API 时，URL 必须与后端路由定义完全一致（包括尾斜杠）。例如后端定义 @app.route('/api/items/')，前端必须 fetch('/api/items/')，缺少尾斜杠会导致 301 重定向，POST 请求重定向后变为 GET 导致数据丢失。",
+    "tech_stacks": ["flask", "javascript"],
+    "exp_type": "contrastive_pair",
+    "scenario": "前后端 URL 尾斜杠一致性",
+    "domain": "frontend"
+  },
+  {
+    "content": "HTML 表单的 action 属性应使用 Jinja2 的 url_for() 动态生成：<form action=\"{{ url_for('add_item') }}\" method=\"POST\">。严禁硬编码 action=\"/add\"，因为路由可能变更。",
+    "tech_stacks": ["flask", "jinja2"],
+    "exp_type": "general",
+    "scenario": "Jinja2 模板表单 action 最佳实践",
+    "domain": "frontend"
+  },
+  {
+    "content": "CSS 中使用 min-height: 100vh 设置页面最小高度，避免内容不足时页面底部出现空白。配合 display: flex; flex-direction: column 可实现 sticky footer 效果。",
+    "tech_stacks": ["css", "html"],
+    "exp_type": "general",
+    "scenario": "CSS 页面高度与布局",
+    "domain": "frontend"
+  },
+  {
+    "content": "Python 入口文件必须包含 if __name__ == '__main__': 守卫。所有启动逻辑（app.run / uvicorn.run / main()）必须放在此守卫内部，否则被 import 时会意外执行启动逻辑。",
+    "tech_stacks": ["flask", "fastapi", "python"],
+    "exp_type": "anti_pattern",
+    "scenario": "Python 入口文件守卫",
+    "domain": "backend"
+  },
+  {
+    "content": "requirements.txt 中严禁写 flask 不带版本号。推荐使用 flask>=3.0,<4.0 格式约束大版本。同时不遗漏间接依赖：flask 项目通常需要额外列出 flask-wtf、flask-sqlalchemy、gunicorn 等。",
+    "tech_stacks": ["flask", "python"],
+    "exp_type": "general",
+    "scenario": "Python 依赖管理",
+    "domain": "backend"
+  }
+]

@@ -17,6 +17,9 @@ __pycache__/
 venv/
 *.db
 *.sqlite3
+*.db-wal
+*.db-shm
+.astrea/
 .sandbox/
 node_modules/
 .idea/

@@ -1,16 +1,15 @@
 /**
- * PMChat — PM Agent 对话组件
+ * PMChat — PM Agent 对话组件 (v4.0 纯对话驱动)
  *
  * 核心功能：
  * - 消息气泡列表（左 PM / 右用户）
  * - plan.md Markdown 渲染
- * - confirm/reject 确定性按钮
  * - 加载状态指示
  */
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { chatWithPM, chatAction, fetchChatHistory } from '../services/api';
+import { chatWithPM, fetchChatHistory } from '../services/api';
 
-const WELCOME_MSG = { role: 'pm', content: '👋 你好！我是 ASTrea 项目经理。告诉我你想做什么项目，我来帮你规划。', plan_md: null, actions: null };
+const WELCOME_MSG = { role: 'pm', content: '👋 你好！我是 ASTrea 项目经理。告诉我你想做什么项目，我来帮你规划。', plan_md: null };
 
 // localStorage 持久化 key
 const getChatStorageKey = (projectId) => `astrea_pm_chat_${projectId}`;
@@ -87,10 +86,25 @@ export default function PMChat({ currentProjectId }) {
     }
   }, [messages]);
 
+
   // 自动滚动到底部
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  // v4.1: 监听 PM 执行完成的引导性回复（来自 WebSocket → App.jsx 自定义事件）
+  useEffect(() => {
+    const handler = (e) => {
+      setMessages(prev => [...prev, {
+        role: 'pm',
+        content: e.detail.content,
+        plan_md: null,
+      }]);
+    };
+    window.addEventListener('pm-guided-reply', handler);
+    return () => window.removeEventListener('pm-guided-reply', handler);
+  }, []);
+
 
   // 发送消息
   const handleSend = useCallback(async () => {
@@ -108,7 +122,6 @@ export default function PMChat({ currentProjectId }) {
         role: 'pm',
         content: res.reply,
         plan_md: res.plan_md || null,
-        actions: res.actions || null,
         intent: res.intent,
       }]);
     } catch (e) {
@@ -121,36 +134,6 @@ export default function PMChat({ currentProjectId }) {
     }
   }, [input, isLoading, currentProjectId]);
 
-  // 处理按钮点击
-  const handleAction = useCallback(async (actionId) => {
-    setIsLoading(true);
-    // 追加一个用户"点击"消息
-    const labelMap = {
-      confirm: '✅ 确认执行', reject: '❌ 修改需求',
-      patch_confirm: '✅ 确认修改', patch_cancel: '取消修改',
-      rollback_confirm: '✅ 确认回滚', rollback_cancel: '取消回滚',
-    };
-    const label = labelMap[actionId] || actionId;
-    setMessages(prev => [...prev, { role: 'user', content: label }]);
-
-    try {
-      const res = await chatAction(actionId, currentProjectId);
-      setMessages(prev => [...prev, {
-        role: 'pm',
-        content: res.reply,
-        plan_md: res.plan_md || null,
-        actions: res.actions || null,
-        intent: res.intent,
-      }]);
-    } catch (e) {
-      setMessages(prev => [...prev, {
-        role: 'pm',
-        content: `❌ 操作失败：${e.message}`,
-      }]);
-    } finally {
-      setIsLoading(false);
-    }
-  }, [currentProjectId]);
 
   // 回车发送
   const handleKeyDown = (e) => {
@@ -179,20 +162,7 @@ export default function PMChat({ currentProjectId }) {
                 </div>
               )}
 
-              {/* 确定性按钮 */}
-              {msg.actions && !isLoading && idx === messages.length - 1 && (
-                <div className="pm-actions">
-                  {msg.actions.map(action => (
-                    <button
-                      key={action.id}
-                      className={`pm-action-btn ${action.style === 'primary' ? 'pm-btn-primary' : 'pm-btn-secondary'}`}
-                      onClick={() => handleAction(action.id)}
-                    >
-                      {action.label}
-                    </button>
-                  ))}
-                </div>
-              )}
+
             </div>
           </div>
         ))}

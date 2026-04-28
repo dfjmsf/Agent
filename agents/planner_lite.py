@@ -22,6 +22,9 @@ class PlannerLiteAgent:
 
     def __init__(self):
         self.model = os.getenv("MODEL_PLANNER_LITE", "deepseek-chat")
+        _et, _re = default_llm.parse_thinking_config(os.getenv("THINKING_PLANNER_LITE", "false"))
+        self.enable_thinking = _et
+        self._reasoning_effort = _re
 
     def generate_plan(self, structured_req: dict, project_dir: str = None) -> str:
         """
@@ -46,6 +49,8 @@ class PlannerLiteAgent:
                     {"role": "user", "content": f"请根据以下结构化需求生成技术方案文档：\n\n{req_text}"}
                 ],
                 temperature=0.3,
+                enable_thinking=self.enable_thinking,
+                reasoning_effort=self._reasoning_effort,
             )
             plan_md = response.content.strip()
 

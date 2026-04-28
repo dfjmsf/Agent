@@ -28,6 +28,9 @@ class SynthesizerAgent:
 
     def __init__(self, project_id: str = "default_project"):
         self.model = os.getenv("MODEL_SYNTHESIZER", "qwen3-max")
+        _et, _re = default_llm.parse_thinking_config(os.getenv("THINKING_SYNTHESIZER", "false"))
+        self.enable_thinking = _et
+        self._reasoning_effort = _re
         self.project_id = project_id
 
     def _parse_json_response(self, raw_text: str) -> Optional[Dict[str, Any]]:
@@ -150,7 +153,13 @@ class SynthesizerAgent:
         ]
         
         try:
-            resp = default_llm.chat_completion(messages, model=self.model, temperature=0.3)
+            resp = default_llm.chat_completion(
+                messages,
+                model=self.model,
+                temperature=0.3,
+                enable_thinking=self.enable_thinking,
+                reasoning_effort=self._reasoning_effort,
+            )
             parsed = self._parse_json_response(resp.content)
             
             if parsed:
@@ -200,7 +209,13 @@ class SynthesizerAgent:
         ]
         
         try:
-            resp = default_llm.chat_completion(messages, model=self.model, temperature=0.3)
+            resp = default_llm.chat_completion(
+                messages,
+                model=self.model,
+                temperature=0.3,
+                enable_thinking=self.enable_thinking,
+                reasoning_effort=self._reasoning_effort,
+            )
             parsed = self._parse_json_response(resp.content)
             
             if parsed:

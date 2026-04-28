@@ -233,6 +233,26 @@ def append_event(
         ScopedSession.remove()
 
 
+def delete_events_by_type(project_id: str, event_type: str) -> int:
+    """删除指定项目的指定类型事件（用于 upsert 语义：先删旧再写新）。返回删除条数。"""
+    session = ScopedSession()
+    try:
+        count = session.query(SessionEvent).filter(
+            SessionEvent.project_id == project_id,
+            SessionEvent.event_type == event_type,
+        ).delete()
+        session.commit()
+        if count:
+            logger.info(f"🗑️ 删除 {count} 条 {event_type} 事件 (project={project_id})")
+        return count
+    except Exception as e:
+        session.rollback()
+        logger.error(f"删除事件失败: {e}")
+        return 0
+    finally:
+        ScopedSession.remove()
+
+
 def recall_project_experience(
     query: str,
     project_id: str,
@@ -547,6 +567,68 @@ def settle_memory_scores(used_ids: set, ignored_ids: set, global_round: int):
     except Exception as e:
         session.rollback()
         logger.error(f"AMC 结算失败: {e}")
+    finally:
+        ScopedSession.remove()
+
+
+AMC_KILL_THRESHOLD = 0.3  # 低于此分数的记忆将被永久删除
+
+
+def purge_low_amc_memories(threshold: float = AMC_KILL_THRESHOLD) -> int:
+    """
+    AMC 斩杀线 — 清除评分低于阈值的劣质记忆。
+
+    豁免规则：
+    - exp_type='seed' 的种子经验永不删除（出厂预装）
+    - usage_count=0 的未经使用记忆不删除（还没机会证明自己）
+
+    Returns:
+        被删除的记忆条数
+    """
+    global_r = get_global_round()
+
+    session = ScopedSession()
+    try:
+        # 拉取所有已被使用过的非种子记忆
+        candidates = session.query(Memory).filter(
+            Memory.usage_count > 0,
+            Memory.exp_type != "seed",
+        ).all()
+
+        if not candidates:
+            return 0
+
+        purge_ids = []
+        for mem in candidates:
+            s = mem.success_count or 0
+            u = mem.usage_count or 0
+            r_last = mem.last_used_round or 0
+            delta_r = global_r - r_last
+            score = amc_score(s, u, delta_r)
+
+            if score < threshold:
+                purge_ids.append(mem.id)
+                logger.info(
+                    f"🗑️ AMC 斩杀: id={mem.id} score={score:.3f} "
+                    f"(S={s}, U={u}, ΔR={delta_r}) content='{(mem.content or '')[:40]}...'"
+                )
+
+        if purge_ids:
+            from sqlalchemy import text as sql_text
+            session.execute(
+                sql_text("DELETE FROM memories WHERE id = ANY(:ids)"),
+                {"ids": purge_ids}
+            )
+            session.commit()
+            logger.info(f"🗑️ AMC 斩杀完成: 共删除 {len(purge_ids)} 条劣质记忆 (阈值={threshold})")
+        else:
+            logger.info(f"✅ AMC 斩杀扫描完成: 全部记忆评分健康，无需清理")
+
+        return len(purge_ids)
+    except Exception as e:
+        session.rollback()
+        logger.error(f"AMC 斩杀异常: {e}")
+        return 0
     finally:
         ScopedSession.remove()
 

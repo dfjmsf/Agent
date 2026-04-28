@@ -11,13 +11,24 @@ import re
 import ast
 import json
 import logging
-from typing import Dict, Any, Tuple, List
+from typing import Tuple
 
 from core.llm_client import default_llm
 from core.prompt import Prompts
+from core.route_topology import (
+    extract_contract_handlers,
+    extract_blueprint_registrations_from_code,
+    extract_blueprint_variables_from_code,
+    extract_expected_symbols_for_target,
+    extract_module_interface_handlers,
+    extract_route_bindings_from_code,
+    extract_top_level_function_names,
+    is_non_endpoint_helper,
+    looks_like_endpoint_function,
+)
 from tools.sandbox import sandbox_env
 from core.ws_broadcaster import global_broadcaster
-from core.database import get_recent_events, recall_reviewer_experience, infer_domain
+from core.database import get_recent_events, recall_reviewer_experience
 
 logger = logging.getLogger("ReviewerAgent")
 
@@ -30,6 +41,9 @@ class ReviewerAgent:
     """
     def __init__(self, project_id: str = "default_project"):
         self.model = os.getenv("MODEL_REVIEWER", "qwen3-max")
+        _et, _re = default_llm.parse_thinking_config(os.getenv("THINKING_REVIEWER", "false"))
+        self.enable_thinking = _et
+        self._reasoning_effort = _re
         self.project_id = project_id
 
     # ============================================================
@@ -37,29 +51,39 @@ class ReviewerAgent:
     # ============================================================
 
     def _l0_static_check(self, target_file: str, code_content: str,
-                         sandbox_dir: str, expected_symbols: list) -> Tuple[bool, str]:
+                         sandbox_dir: str, expected_symbols: list,
+                         project_spec: dict = None,
+                         allow_skeleton_placeholders: bool = False,
+                         is_continue_fix: bool = False) -> Tuple[bool, str]:
         """
-        L0 静态检查：
-          L0.1 语法检查 — ast.parse()
-          L0.2 结构检查 — AST 提取符号 vs 规划书期望
-          L0.3 导入检查 — 沙盒中 import（10s 超时）
+        L0 静态检查（HARD/SOFT 分级）：
+          HARD: 失败直接阻断（纯 AST 单文件，确定性 ~100%）
+          SOFT: 失败记录 warning 但不阻断（跨文件启发式，可能有假阳性）
 
         Returns: (passed, error_msg)
         """
-        is_python = target_file.endswith('.py')
-        is_js = target_file.endswith('.js')
+        ext = os.path.splitext(target_file)[1].lower()
+        is_python = ext == '.py'
+        is_js = ext == '.js'
+        is_vue = ext == '.vue'
+        soft_warnings = []  # 收集 SOFT 级别的 warning
 
-        # --- L0.0 骨架残留检测（Fill 阶段失败兜底）---
-        if is_python:
-            # 检测函数体是否仍然是 ... 占位（骨架未被填充）
+        # ═══ HARD 检查（失败 = 直接阻断）═══
+
+        # --- [HARD] L0.0 骨架残留检测 ---
+        if is_python and not allow_skeleton_placeholders:
             try:
                 tree_pre = ast.parse(code_content)
                 stub_funcs = []
                 for node in ast.walk(tree_pre):
                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        # 函数体只有一个 Expr(Constant(Ellipsis)) 或 Expr(Constant('...'))
-                        if len(node.body) == 1:
-                            stmt = node.body[0]
+                        body = node.body
+                        if (body and isinstance(body[0], ast.Expr)
+                                and isinstance(body[0].value, ast.Constant)
+                                and isinstance(body[0].value.value, str)):
+                            body = body[1:]
+                        if len(body) == 1:
+                            stmt = body[0]
                             if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
                                 if stmt.value.value is ...:
                                     stub_funcs.append(node.name)
@@ -70,9 +94,9 @@ class ReviewerAgent:
                     global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
                     return False, error
             except SyntaxError:
-                pass  # 语法错误由 L0.1 捕获
+                pass
 
-        # --- L0.1 语法检查（仅 Python）---
+        # --- [HARD] L0.1 语法检查 ---
         tree = None
         if is_python:
             try:
@@ -84,20 +108,24 @@ class ReviewerAgent:
                 global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
                 return False, error
         elif is_js:
-            # JS 文件：用 Node.js 做语法检查
             l01_pass, l01_error = self._l0_js_syntax_check(target_file, sandbox_dir)
             if not l01_pass:
                 return False, l01_error
             logger.info(f"✅ [L0.1] JS 语法检查通过: {target_file}")
         else:
-            # 其他前端文件（HTML/CSS）：只检查内容非空
             if not code_content or not code_content.strip():
                 error = f"[L0.1] {target_file} 内容为空"
                 logger.warning(f"❌ {error}")
                 return False, error
             logger.info(f"✅ [L0.1] 非 Python 文件，内容非空: {target_file}")
 
-        # --- L0.2 结构检查（仅 Python + 有期望符号）---
+        # --- [HARD] L0.VUE 单文件组件结构检查 ---
+        if is_vue:
+            vue_pass, vue_error = self._l0_vue_sfc_check(target_file, code_content)
+            if not vue_pass:
+                return False, vue_error
+
+        # --- [HARD] L0.2 结构检查 ---
         if is_python and expected_symbols and tree:
             defined = self._extract_defined_symbols(tree)
             missing = [s for s in expected_symbols if s not in defined]
@@ -108,53 +136,223 @@ class ReviewerAgent:
                 return False, error
             logger.info(f"✅ [L0.2] 结构检查通过: {len(expected_symbols)} 个符号全部存在")
 
-        # --- L0.3 导入检查（仅 Python 文件）---
+        if is_python and os.path.basename(target_file) == 'models.py':
+            l02_orm_pass, l02_orm_error = self._l0_sqlalchemy_association_check(
+                target_file, code_content, expected_symbols
+            )
+            if not l02_orm_pass:
+                return False, l02_orm_error
+
+        # --- [HARD] L0.3 导入检查 ---
         if is_python:
             l03_pass, l03_error = self._l0_import_check(target_file, sandbox_dir)
             if not l03_pass:
                 return False, l03_error
             logger.info(f"✅ [L0.3] 导入检查通过: {target_file}")
 
-        # --- L0.4 FastAPI POST/PUT 参数检查（所有 Python 文件，因为路由可能写在 main.py 中）---
+        if is_python:
+            l03a_pass, l03a_error = self._l0_architecture_contract_check(
+                target_file, code_content, project_spec
+            )
+            if not l03a_pass:
+                return False, l03a_error
+            logger.info(f"✅ [L0.3A] 架构一致性检查通过: {target_file}")
+
+        # --- [HARD] L0.4 FastAPI POST/PUT 参数检查 ---
         if is_python and tree:
             l04_pass, l04_error = self._l0_fastapi_param_check(tree, target_file, code_content)
             if not l04_pass:
                 return False, l04_error
 
-        # --- L0.5 路由装饰器检查（routes.py 必须有 @router.xxx 装饰器）---
+        # --- [HARD] L0.5 路由装饰器检查 ---
         if is_python and tree:
             l05_pass, l05_error = self._l0_route_decorator_check(tree, target_file, code_content)
             if not l05_pass:
                 return False, l05_error
 
-        # --- L0.6 跨文件字段一致性检查（Flask SSR 项目 + 表单字段）---
-        if sandbox_dir:
-            l06_pass, l06_error = self._l0_cross_file_check(
-                target_file, code_content, sandbox_dir)
-            if not l06_pass:
-                return False, l06_error
-
-        # --- L0.7 Flask template_folder 检查 ---
+        # --- [HARD] L0.7 Flask template_folder 检查 ---
         if sandbox_dir and target_file.endswith('.py'):
             l07_pass, l07_error = self._l0_template_folder_check(
                 target_file, code_content, sandbox_dir)
             if not l07_pass:
                 return False, l07_error
 
-        # --- L0.9 前后端 API 契约检查（fetch URL vs 后端路由返回类型）---
-        if sandbox_dir:
-            l09_pass, l09_error = self._l0_fetch_api_contract_check(
-                target_file, code_content, sandbox_dir)
-            if not l09_pass:
-                return False, l09_error
-
-        # --- L0.10 种子数据检查（init_db 中 CREATE TABLE 必须配 INSERT）---
+        # --- [HARD] L0.10 种子数据检查 ---
         if is_python and tree:
             l10_pass, l10_error = self._l0_seed_data_check(target_file, code_content)
             if not l10_pass:
                 return False, l10_error
 
+        # --- [HARD] L0.12 models.py tuple 返回检测 ---
+        if is_python and os.path.basename(target_file) == 'models.py':
+            l12_pass, l12_error = self._l0_tuple_return_check(target_file, code_content)
+            if not l12_pass:
+                return False, l12_error
+
+        # --- [SOFT/HARD] L0.15 命名空间覆盖检测 ---
+        # v4.1: 首次生成 → SOFT（与 L0.2 结构完整性存在乒乓矛盾）
+        # v4.3: Continue 修复模式 → HARD（修复阶段不触发 L0.2，可安全阻断）
+        if is_python and tree:
+            l15_pass, l15_error = self._l0_name_shadow_check(target_file, tree)
+            if not l15_pass:
+                if is_continue_fix:
+                    # Continue 模式：命名冲突是已确认的致命 bug，HARD 阻断
+                    logger.warning(f"❌ [HARD/Continue] {l15_error}")
+                    global_broadcaster.emit_sync("Reviewer", "l0_fail", l15_error)
+                    return False, l15_error
+                else:
+                    # 首次生成：保持 SOFT（避免与 L0.2 乒乓）
+                    logger.warning(f"⚠️ [SOFT] {l15_error}")
+                    soft_warnings.append(l15_error)
+
+        # ═══ SOFT 检查（失败 = 记录 warning，不阻断）═══
+
+        # --- [SOFT] L0.6 跨文件字段一致性检查 ---
+        if sandbox_dir:
+            l06_pass, l06_error = self._l0_cross_file_check(
+                target_file, code_content, sandbox_dir)
+            if not l06_pass:
+                logger.warning(f"⚠️ [SOFT] {l06_error}")
+                soft_warnings.append(l06_error)
+
+        # --- [SOFT] L0.9 前后端 API 契约检查 ---
+        if sandbox_dir:
+            l09_pass, l09_error = self._l0_fetch_api_contract_check(
+                target_file, code_content, sandbox_dir)
+            if not l09_pass:
+                logger.warning(f"⚠️ [SOFT] {l09_error}")
+                soft_warnings.append(l09_error)
+
+        # --- [SOFT] L0.11 前端 JS/TS AST 深度语义检查 ---
+        FRONTEND_EXTS = {'.js', '.jsx', '.ts', '.tsx', '.vue'}
+        if sandbox_dir and ext in FRONTEND_EXTS:
+            l11_pass, l11_error = self._l0_js_ast_semantic_check(
+                target_file, code_content, sandbox_dir)
+            if not l11_pass:
+                logger.warning(f"⚠️ [SOFT] {l11_error}")
+                soft_warnings.append(l11_error)
+
+        # --- [SOFT] L0.14 跨文件函数调用签名一致性检查 ---
+        if is_python and sandbox_dir and tree:
+            l14_pass, l14_error = self._l0_call_signature_check(
+                target_file, code_content, sandbox_dir, tree)
+            if not l14_pass:
+                logger.warning(f"⚠️ [SOFT] {l14_error}")
+                soft_warnings.append(l14_error)
+
+        # 将 SOFT warnings 广播（供 Coder 下轮参考）
+        if soft_warnings:
+            warning_text = " | ".join(soft_warnings)
+            logger.info(f"📋 [L0 SOFT] {target_file}: {len(soft_warnings)} 个 SOFT 警告（不阻断）")
+            global_broadcaster.emit_sync("Reviewer", "l0_soft_warning",
+                f"⚠️ L0 SOFT 警告 ({len(soft_warnings)}): {warning_text[:200]}")
+
         return True, ""
+
+    def _l0_vue_sfc_check(self, target_file: str, code_content: str) -> Tuple[bool, str]:
+        """Vue SFC 的确定性结构闸门，阻止只有 style 的坏文件通过。"""
+        has_template = bool(re.search(r"<template(?:\s|>)", code_content, re.IGNORECASE))
+        has_script = bool(re.search(r"<script(?:\s|>)", code_content, re.IGNORECASE))
+        has_style = bool(re.search(r"<style(?:\s|>)", code_content, re.IGNORECASE))
+
+        if not has_template and not has_script:
+            detail = "当前文件只包含 <style> 块" if has_style else "未找到 <template>/<script> 块"
+            error = (
+                f"[L0.VUE SFC结构缺失] {target_file}: {detail}。"
+                "Vue 单文件组件必须至少包含 <template> 或 <script>；"
+                "请补回组件模板或 <script setup>，不要只提交样式块。"
+            )
+            logger.warning(f"❌ {error}")
+            global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+            return False, error
+
+        for tag in ("template", "script", "style"):
+            open_count = len(re.findall(rf"<{tag}(?:\s[^>]*)?>", code_content, re.IGNORECASE))
+            close_count = len(re.findall(rf"</{tag}>", code_content, re.IGNORECASE))
+            if open_count != close_count:
+                error = (
+                    f"[L0.VUE 标签不闭合] {target_file}: <{tag}> 开启 {open_count} 次，"
+                    f"关闭 {close_count} 次。请修正 Vue SFC 顶层块。"
+                )
+                logger.warning(f"❌ {error}")
+                global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+                return False, error
+
+        style_blocks = re.finditer(
+            r"<style(?:\s[^>]*)?>(.*?)</style>",
+            code_content,
+            re.IGNORECASE | re.DOTALL,
+        )
+        for index, match in enumerate(style_blocks, start=1):
+            css = re.sub(r"/\*.*?\*/", "", match.group(1), flags=re.DOTALL)
+            balance = 0
+            for char in css:
+                if char == "{":
+                    balance += 1
+                elif char == "}":
+                    balance -= 1
+                    if balance < 0:
+                        error = (
+                            f"[L0.VUE CSS花括号错误] {target_file}: 第 {index} 个 <style> "
+                            "存在多余的 `}`，会触发 Vite/PostCSS 解析失败。"
+                        )
+                        logger.warning(f"❌ {error}")
+                        global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+                        return False, error
+            if balance != 0:
+                error = (
+                    f"[L0.VUE CSS花括号错误] {target_file}: 第 {index} 个 <style> "
+                    "存在未闭合的 `{`，会触发 Vite/PostCSS 解析失败。"
+                )
+                logger.warning(f"❌ {error}")
+                global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+                return False, error
+
+        logger.info(f"✅ [L0.VUE] SFC 结构检查通过: {target_file}")
+        return True, ""
+
+    def evaluate_skeleton(self, target_file: str, code_content: str = None,
+                          sandbox_dir: str = None,
+                          module_interfaces: dict = None,
+                          project_spec: dict = None) -> Tuple[bool, str]:
+        """
+        对 skeleton 进行轻量 L0 验收。
+        目标是阻止坏骨架进入真理区，不做 L1 合同审计，也允许函数体保留 ... 占位。
+        """
+        if not code_content:
+            return False, "没有找到 skeleton 代码内容"
+
+        logger.info(f"🧱 Reviewer 正在验收 skeleton: {target_file}")
+        global_broadcaster.emit_sync(
+            "Reviewer", "skeleton_review_start",
+            f"开始验收 skeleton {target_file}", {"target": target_file}
+        )
+
+        expected_symbols = self._extract_expected_symbols(target_file, module_interfaces, project_spec)
+        l0_pass, l0_error = self._l0_static_check(
+            target_file,
+            code_content,
+            sandbox_dir,
+            expected_symbols,
+            project_spec=project_spec,
+            allow_skeleton_placeholders=True,
+        )
+
+        if not l0_pass:
+            feedback = f"[SKELETON_REJECTED] {l0_error}"
+            logger.warning(f"❌ Reviewer skeleton 驳回: {feedback[:200]}")
+            global_broadcaster.emit_sync(
+                "Reviewer", "skeleton_review_fail",
+                "Skeleton L0 验收未通过", {"feedback": feedback}
+            )
+            return False, feedback
+
+        global_broadcaster.emit_sync(
+            "Reviewer", "skeleton_review_pass",
+            "✅ Skeleton L0 验收通过", {"feedback": "Skeleton L0 通过"}
+        )
+        logger.info(f"✅ Reviewer skeleton 验收通过: {target_file}")
+        return True, "Skeleton L0 通过"
 
     def _l0_js_syntax_check(self, target_file: str, sandbox_dir: str) -> Tuple[bool, str]:
         """L0.1 JS: 用 Node.js --check 验证 JS 语法"""
@@ -198,59 +396,107 @@ class ReviewerAgent:
         
         正确做法：用 Pydantic BaseModel 接收 JSON body。
         """
-        import re
+        def _extract_route_meta(decorator: ast.AST) -> Tuple[str, set]:
+            if not isinstance(decorator, ast.Call):
+                return "", set()
 
-        # 用正则找所有 @app.post / @router.post / @app.put / @router.put 装饰的函数
-        # 匹配模式：装饰器行 + 紧跟的 async def / def 行
-        pattern = re.compile(
-            r'@\w+\.(post|put)\s*\([^)]*\)\s*\n'       # 装饰器行
-            r'\s*(?:async\s+)?def\s+\w+\(([^)]*)\)',    # 函数签名（async def 或 def）
-            re.IGNORECASE
-        )
+            func = decorator.func
+            if not isinstance(func, ast.Attribute):
+                return "", set()
+
+            method = str(func.attr).lower()
+            if method not in ("post", "put"):
+                return "", set()
+
+            route_path = ""
+            if decorator.args:
+                first_arg = decorator.args[0]
+                if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
+                    route_path = first_arg.value
+
+            if not route_path:
+                for keyword in decorator.keywords or []:
+                    if keyword.arg == "path":
+                        value = keyword.value
+                        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                            route_path = value.value
+                            break
+
+            path_params = set(re.findall(r"{([^{}:]+)}", route_path))
+            path_params.update(re.findall(r"<(?:[^:>]+:)?([^>]+)>", route_path))
+            return method.upper(), {item.strip() for item in path_params if item.strip()}
+
+        def _iter_function_params(node: ast.AST):
+            args = getattr(node, "args", None)
+            if not args:
+                return
+
+            positional = list(getattr(args, "posonlyargs", [])) + list(args.args)
+            positional_defaults = [None] * (len(positional) - len(args.defaults)) + list(args.defaults)
+            for arg, default in zip(positional, positional_defaults):
+                yield arg.arg, arg.annotation, default
+
+            for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+                yield arg.arg, arg.annotation, default
+
+        def _has_explicit_fastapi_marker(default_node: ast.AST) -> bool:
+            if default_node is None:
+                return False
+            default_text = ast.unparse(default_node)
+            return any(
+                marker in default_text
+                for marker in ("Body(", "Depends(", "Form(", "File(", "Query(", "Path(", "Header(", "Cookie(", "Security(")
+            )
+
+        def _is_bare_fastapi_type(annotation: ast.AST) -> bool:
+            if annotation is None:
+                return True
+
+            text = ast.unparse(annotation).replace("typing.", "").replace(" ", "")
+            lowered = text.lower()
+
+            if lowered.startswith("annotated["):
+                return False
+
+            bare_types = {
+                "str", "int", "float", "bool", "dict", "list", "bytes",
+                "optional[str]", "optional[int]", "optional[float]", "optional[bool]",
+                "optional[dict]", "optional[list]", "optional[bytes]",
+                "str|none", "int|none", "float|none", "bool|none",
+                "dict|none", "list|none", "bytes|none",
+                "list[str]", "list[int]", "list[float]", "list[bool]",
+                "dict[str,any]", "dict[str,str]", "dict[str,int]",
+            }
+            return lowered in bare_types
 
         violations = []
-        for m in pattern.finditer(code_content):
-            method = m.group(1).upper()  # POST / PUT
-            params_str = m.group(2).strip()
-
-            if not params_str:
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
 
-            # 解析参数列表
-            params = [p.strip() for p in params_str.split(',')]
-            bare_params = []
-            for param in params:
-                # 跳过 self, request, req, db 等常见非业务参数
-                param_name = param.split(':')[0].split('=')[0].strip()
-                if param_name in ('self', 'request', 'req', 'db', 'session'):
-                    continue
-                # 跳过路径参数（在装饰器 URL 中出现的 {id} 类参数）
-                if param_name in ('id', 'memo_id', 'item_id', 'user_id'):
+            for decorator in node.decorator_list:
+                method, path_params = _extract_route_meta(decorator)
+                if not method:
                     continue
 
-                # 检测裸类型注解（无 Body/Depends 等注解的基础类型）
-                if ':' in param:
-                    type_and_default = param.split(':', 1)[1].strip()
-                    # 如果有 = Body(...) 或 = Depends(...) 注解，跳过
-                    if '=' in type_and_default:
-                        default_val = type_and_default.split('=', 1)[1].strip()
-                        if any(kw in default_val for kw in ('Body', 'Depends', 'Form', 'File')):
-                            continue
-                    type_hint = type_and_default.split('=')[0].strip()
-                    bare_types = ('str', 'int', 'float', 'bool', 'dict', 'list',
-                                  'List', 'Dict', 'Optional[str]', 'Optional[int]',
-                                  'Optional[dict]', 'Optional[list]')
-                    if type_hint in bare_types:
-                        bare_params.append(param.strip())
-                elif '=' not in param:
-                    # 无类型注解也无默认值的裸参数
-                    bare_params.append(param.strip())
+                bare_params = []
+                for param_name, annotation, default in _iter_function_params(node):
+                    if param_name in ('self', 'request', 'req', 'db', 'session'):
+                        continue
+                    if param_name in path_params:
+                        continue
+                    if _has_explicit_fastapi_marker(default):
+                        continue
+                    if _is_bare_fastapi_type(annotation):
+                        bare_params.append(
+                            f"{param_name}: {ast.unparse(annotation)}" if annotation is not None else param_name
+                        )
 
-            if bare_params:
-                violations.append(
-                    f"{method} 路由函数参数 [{', '.join(bare_params)}] "
-                    f"使用了裸类型，FastAPI 会解析为 query parameter 导致前端 JSON 请求 422"
-                )
+                if bare_params:
+                    violations.append(
+                        f"{method} 路由函数参数 [{', '.join(bare_params)}] "
+                        f"使用了裸类型，FastAPI 会解析为 query parameter 导致前端 JSON 请求 422"
+                    )
 
         if violations:
             fix_hint = ("修复方法：用 Pydantic BaseModel 类接收 JSON body，"
@@ -398,6 +644,12 @@ class ReviewerAgent:
             if not inherit_pass:
                 return False, inherit_error
 
+            # L0.13: url_for endpoint 一致性检查
+            ep_pass, ep_error = self._l0_url_for_endpoint_check(
+                target_file, code_content, sandbox_dir)
+            if not ep_pass:
+                return False, ep_error
+
             return True, ""
 
         # routes.py / views.py → 检查 form field 一致性
@@ -424,6 +676,7 @@ class ReviewerAgent:
             return True, ""
 
         # 2. 检查是否是 Flask SSR（需要有 render_template）
+        routes_content = ""  # 提升到方法作用域，供三跳链路使用
         routes_path = self._find_file_in_sandbox(sandbox_dir, 'routes.py')
         if routes_path:
             try:
@@ -436,13 +689,75 @@ class ReviewerAgent:
 
         # 3. 提取 to_dict() 返回的 key（按模型类分组）
         class_keys = self._extract_to_dict_keys(models_content)
+
+        # 3b. 若 models.py 用了 SELECT * 但没有 CREATE TABLE，
+        #     去 database.py / db.py / app.py 找 CREATE TABLE 补充字段
+        has_select_star = 'SELECT *' in models_content or 'SELECT * ' in models_content
+        has_table_keys = '_table' in class_keys
+        if has_select_star and not has_table_keys:
+            for db_file in ('database.py', 'db.py', 'app.py'):
+                db_path = self._find_file_in_sandbox(sandbox_dir, db_file)
+                if db_path:
+                    try:
+                        with open(db_path, 'r', encoding='utf-8') as f:
+                            db_content = f.read()
+                        extra_keys = self._extract_to_dict_keys(db_content)
+                        if '_table' in extra_keys:
+                            class_keys['_table'] = extra_keys['_table']
+                            logger.info(f"✅ [L0.6-A] 从 {db_file} 补充 CREATE TABLE 列: {sorted(extra_keys['_table'])}")
+                            break
+                    except Exception:
+                        pass
+
         if not class_keys:
             return True, ""  # 没有 to_dict / SQL 列，跳过
 
         # 合并所有 key 作为 fallback（无法匹配具体类时使用）
+        # 优先使用 _table 列名（CREATE TABLE 是最完整的字段集）
         all_keys = set()
-        for ks in class_keys.values():
-            all_keys |= ks
+        if '_table' in class_keys:
+            all_keys = class_keys['_table'].copy()
+        else:
+            for ks in class_keys.values():
+                all_keys |= ks
+
+        # 3c. 三跳追踪链：template for-var → routes.py render_template arg → models.py SQL 函数字段
+        #     解决 fallback _table 列名过于宽泛导致的误放行（如 stat.amount 通过但实际应是 stat.total）
+        #     链路: {% for stat in category_stats %} → render_template(category_stats=get_category_stats()) → _sql_get_category_stats={category, total}
+        for_loop_map = {}  # {loop_var: collection_var}  e.g. {"stat": "category_stats"}
+        for fl_m in re.finditer(r'\{%[-\s]*for\s+(\w+)\s+in\s+(\w+)', html_content):
+            for_loop_map[fl_m.group(1)] = fl_m.group(2)
+
+        rt_var_func_map = {}  # {template_var: func_name}  e.g. {"category_stats": "get_category_stats"}
+        if routes_content:
+            template_basename = os.path.basename(target_file)
+            # 找到包含 render_template('index.html', ...) 的函数体
+            for rt_m in re.finditer(
+                r'render_template\s*\(\s*["\']' + re.escape(template_basename) + r'["\']\s*,(.*?)\)',
+                routes_content, re.DOTALL
+            ):
+                args_str = rt_m.group(1)
+                # 模式 A：直接函数调用 → key=func(...)
+                for kv_m in re.finditer(r'(\w+)\s*=\s*(\w+)\s*\(', args_str):
+                    rt_var_func_map[kv_m.group(1)] = kv_m.group(2)
+                # 模式 B：局部变量赋值 → key=local_var
+                # 需要追溯 local_var = func(...) 的赋值
+                for kv_m in re.finditer(r'(\w+)\s*=\s*(\w+)\s*(?:,|\s*$)', args_str):
+                    tmpl_key = kv_m.group(1)
+                    local_var = kv_m.group(2)
+                    if tmpl_key in rt_var_func_map:
+                        continue  # 已被模式 A 命中
+                    # 在同一个路由函数体内查找 local_var = func(...)
+                    assign_pat = re.compile(
+                        re.escape(local_var) + r'\s*=\s*(\w+)\s*\(',
+                        re.MULTILINE
+                    )
+                    assign_m = assign_pat.search(routes_content)
+                    if assign_m:
+                        rt_var_func_map[tmpl_key] = assign_m.group(1)
+
+        if for_loop_map or rt_var_func_map:
+            logger.info(f"🔗 [L0.6-A] 三跳链路: for_loop={for_loop_map}, rt_var_func={rt_var_func_map}")
 
         # 4. 提取 Jinja {{ }} 块中的字段访问
         jinja_blocks = re.findall(r'\{\{(.*?)\}\}', html_content, re.DOTALL)
@@ -474,9 +789,27 @@ class ReviewerAgent:
                     if cls_name.lower() == var_name.lower():
                         matched_keys = ks
                         break
-                # fallback: 使用合并 key
+
+                # 三跳链路精确匹配：for-loop var → collection → SQL function fields
+                # 优先级高于 _table fallback，解决统计查询字段误放行
+                if matched_keys is None and var_name in for_loop_map:
+                    collection_var = for_loop_map[var_name]
+                    func_name = rt_var_func_map.get(collection_var)
+                    if func_name:
+                        sql_key = f"_sql_{func_name}"
+                        if sql_key in class_keys:
+                            matched_keys = class_keys[sql_key]
+                            logger.debug(f"🔗 [L0.6-A] 三跳命中: {var_name} → {collection_var} → {func_name} → {sorted(matched_keys)}")
+
+                # fallback: 使用合并 key（仅在三跳链路也未命中时）
                 if matched_keys is None:
                     matched_keys = all_keys
+                    # P1-b: 三跳链路降级时追加 WARNING（便于诊断误放行）
+                    if var_name in for_loop_map:
+                        logger.warning(
+                            f"⚠️ [L0.6-A] 三跳链路未命中，降级到 _table 兜底: "
+                            f"{var_name} → {for_loop_map[var_name]} → ???"
+                        )
 
                 if '.' in field_path:
                     # 嵌套访问：expense.category.name
@@ -632,11 +965,16 @@ class ReviewerAgent:
         for m in re.finditer(r'\{\{\s*(\w+)(?:\s*[|}]|\s*\}\})', html_content):
             template_vars.add(m.group(1))
 
-        # 过滤掉 Jinja 内置变量和 for 循环局部变量
+        # 过滤掉 Jinja 内置变量、关键字和 for 循环局部变量
         jinja_builtins = {
+            # Jinja2 内置变量/函数
             'loop', 'range', 'request', 'config', 'session', 'g',
             'url_for', 'get_flashed_messages', 'true', 'false', 'none',
             'self', 'caller', 'joiner', 'namespace',
+            # Jinja2 逻辑关键字（{% if not X %}, {% if X and Y %} 等）
+            'not', 'and', 'or', 'is', 'in', 'if', 'else', 'elif',
+            'for', 'endfor', 'endif', 'set', 'block', 'extends',
+            'include', 'import', 'macro', 'defined', 'undefined',
         }
         # 提取 for 循环的迭代变量（局部变量，不算顶层）
         loop_vars = set()
@@ -645,6 +983,12 @@ class ReviewerAgent:
 
         template_vars -= jinja_builtins
         template_vars -= loop_vars
+
+        # 过滤 {% set xxx = ... %} 定义的局部变量
+        set_vars = set()
+        for m in re.finditer(r'\{%[-\s]*set\s+(\w+)\s*=', html_content):
+            set_vars.add(m.group(1))
+        template_vars -= set_vars
 
         if not template_vars:
             return True, ""  # 模板中没有可检查的顶层变量
@@ -668,12 +1012,31 @@ class ReviewerAgent:
                         routes_tag = f"[CROSS_FILE:{os.path.relpath(rf_path, sandbox_dir)}] "
                         break
 
+                # 智能提示：检测是否是集合字段的误用（如 month vs monthly_summary）
+                field_hints = []
+                for var in sorted(confirmed_missing):
+                    for kwarg in render_kwargs:
+                        # 如果缺失变量名是某个已传入集合名的子串（如 month ⊂ monthly_summary）
+                        if var in kwarg and var != kwarg:
+                            field_hints.append(
+                                f"'{var}' 看起来是 '{kwarg}' 集合中的字段名。"
+                                f"禁止直接用 '{{% if {var} %}}' 或 '{{% for x in {var} %}}'！"
+                                f"应改为 '{{% for entry in {kwarg} %}}' + 'entry.{var}' 点号访问。"
+                            )
+                            break
+
+                hint_block = ""
+                if field_hints:
+                    hint_block = "\n💡 常见错误提示：\n" + "\n".join(f"  - {h}" for h in field_hints)
+
                 error = (
                     f"{routes_tag}[L0.6-C render_template 变量缺失] {target_file}: "
                     f"模板引用了 render_template() 未传入的顶层变量: {sorted(confirmed_missing)}。"
                     f"render_template('{html_basename}', ...) 实际传入的变量名: {sorted(render_kwargs)}。"
-                    f"修复方法：确保 render_template 的关键字参数名与模板中 "
-                    f"'{{% for x in YYY %}}' / '{{% if YYY %}}' 的 YYY 完全一致。"
+                    f"修复方法：模板中 '{{% for x in YYY %}}' / '{{% if YYY %}}' 的 YYY 只能使用 render_template 传入的变量名。"
+                    f"如果要访问集合内部字段，必须用 '{{% for entry in collection %}}' + 'entry.field' 点号语法，"
+                    f"禁止将集合字段名（如 month、category）直接当作顶层变量使用！"
+                    f"{hint_block}"
                 )
                 logger.warning(f"❌ {error}")
                 global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
@@ -825,8 +1188,24 @@ class ReviewerAgent:
             return True, ""
 
         # 检查当前文件是否有 {% extends %}
-        if _re.search(r'\{%[-\s]*extends\s', html_content):
-            return True, ""  # 有继承 → 通过
+        extends_match = _re.search(r'\{%[-\s]*extends\s+["\']([^"\']+)["\']', html_content)
+        if extends_match:
+            # v4.1: 反向校验 — extends 的目标文件必须存在
+            parent_template = extends_match.group(1)
+            parent_path = self._find_file_in_sandbox(sandbox_dir, parent_template)
+            if not parent_path:
+                # 在 templates 子目录中也查找
+                parent_path = self._find_file_in_sandbox(sandbox_dir, f"templates/{parent_template}")
+            if not parent_path:
+                error = (
+                    f"[L0.9 模板继承目标缺失] {target_file}: "
+                    f"使用了 {{% extends \"{parent_template}\" %}}，"
+                    f"但 {parent_template} 在项目中不存在。"
+                    f"修复方法：创建 {parent_template} 布局模板（含 {{% block content %}}），"
+                    f"或将当前文件改为独立页面（移除 extends，自己包含完整 HTML 结构）。"
+                )
+                return False, error
+            return True, ""  # 有继承且目标存在 → 通过
 
         # 没有继承 → 报错
         base_rel = os.path.relpath(base_path, sandbox_dir).replace('\\', '/')
@@ -1110,6 +1489,118 @@ class ReviewerAgent:
 
         return True, ""
 
+    def _l0_js_ast_semantic_check(self, target_file: str, code_content: str, sandbox_dir: str) -> Tuple[bool, str]:
+        """
+        L0.11: 跨文件 JS/TS 语义检查 (Tree-sitter)
+        检查 1: JS 调用的所有 API URL 是否在后端路由表中。
+        检查 2: JS 读取的所有属性变量（如 data.userName）是否严重偏离后端 models.py/Schema 的字段名。
+        """
+        FRONTEND_EXTS = {'.js', '.jsx', '.ts', '.tsx', '.vue'}
+        ext = os.path.splitext(target_file)[1].lower()
+        if ext not in FRONTEND_EXTS:
+            return True, ""
+
+        try:
+            from core.js_ast_parser import JSAstParser
+            parser = JSAstParser()
+            semantic = parser.extract_semantic_info(code_content, ext)
+        except Exception as e:
+            logger.warning(f"JS AST 解析跳过: {e}")
+            return True, ""
+
+        api_urls = semantic.get("api_urls", set())
+        props = semantic.get("property_access", set())
+
+        if not api_urls and not props:
+            return True, ""
+
+        # --- 检查 1: API 路由幻影检查 ---
+        if api_urls:
+            registered_routes = set()
+            try:
+                from tools.observer import Observer
+                obs = Observer(sandbox_dir)
+                for root, dirs, files in os.walk(sandbox_dir):
+                    dirs[:] = [d for d in dirs if d not in {'.git', '__pycache__', 'node_modules', '.sandbox', 'venv', '.venv'}]
+                    for f in files:
+                        if f.endswith('.py'):
+                            rel = os.path.relpath(os.path.join(root, f), sandbox_dir).replace('\\', '/')
+                            for r in obs.extract_routes(rel):
+                                registered_routes.add(r['path'])
+            except Exception:
+                pass
+            
+            if registered_routes:
+                phantom_urls = set()
+                for url in api_urls:
+                    if not url.startswith('/'):
+                        continue # 我们只查全路径
+                    matched = False
+                    url_normalized = url.rstrip('/')
+                    for route in registered_routes:
+                        route_pattern = re.sub(r'<[^>]+>', '[^/]+', route)
+                        route_pattern = re.sub(r'\{[^}]+\}', '[^/]+', route_pattern)
+                        if re.fullmatch(route_pattern, url) or re.fullmatch(route_pattern, url_normalized):
+                            matched = True
+                            break
+                        route_segments = route.rstrip('/').split('/')
+                        if len(route_segments) > 1:
+                            route_prefix = '/'.join(route_segments[:-1])
+                            if route_prefix and (url == route_prefix or url_normalized == route_prefix):
+                                matched = True
+                                break
+                    if not matched:
+                        phantom_urls.add(url)
+                
+                if phantom_urls:
+                    error = (f"[L0.11 JS API 不存在] {target_file}: "
+                             f"前端请求了不存在的后端路由: {sorted(phantom_urls)}。"
+                             f"后端已注册路由: {sorted(registered_routes)}。"
+                             f"请修正 fetch/axios 参数以对接真实路由。")
+                    logger.warning(f"❌ {error}")
+                    global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+                    return False, error
+
+        # --- 检查 2: JSON 字段悬空提取检查 (防御性提示为主) ---
+        if props:
+            # 读取后端 models.py 或 schemas.py
+            class_keys = {}
+            for fname in ('models.py', 'schemas.py', 'routes.py'):
+                fpath = self._find_file_in_sandbox(sandbox_dir, fname)
+                if fpath:
+                    try:
+                        with open(fpath, 'r', encoding='utf-8') as f:
+                            ks = self._extract_to_dict_keys(f.read())
+                            class_keys.update(ks)
+                    except Exception:
+                        pass
+            
+            all_be_keys = set()
+            for ks in class_keys.values():
+                all_be_keys |= ks
+                
+            if all_be_keys:
+                # 排除通用字和常见前端自带字段
+                commons = {'data', 'length', 'map', 'filter', 'push', 'json', 'log', 'target', 'value', 'status', 'error', 'message', 'msg'}
+                suspicious = []
+                for p in props:
+                    if len(p) > 2 and p not in commons and p not in all_be_keys:
+                        # 检测后端有没有对应的蛇形命名，比如 userName vs user_name
+                        snake_v = re.sub(r'(?<!^)(?=[A-Z])', '_', p).lower()
+                        if snake_v in all_be_keys and snake_v != p:
+                            suspicious.append(f"使用了 '{p}'，但后端可能返回的是 '{snake_v}'")
+                
+                if suspicious:
+                    error = (f"[L0.11 JS 字段驼峰错位] {target_file}: "
+                             f"我们在前端提取到了极有可能的字段名错误：\n" + 
+                             "\n".join([f" - {x}" for x in suspicious]) + 
+                             "\n请立即确认 Python 接口返回 JSON 是驼峰还是蛇形，并对齐前端代码。")
+                    logger.warning(f"❌ {error}")
+                    global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+                    return False, error
+
+        return True, ""
+
     def _l0_fetch_api_contract_check(self, target_file: str, code_content: str,
                                       sandbox_dir: str) -> Tuple[bool, str]:
         """
@@ -1329,7 +1820,7 @@ except Exception as e:
 
             # 超时（可能是 uvicorn.run 泄露到顶层等情况）→ 跳过，交给 L2
             if result.get("returncode") == -1 and "timed out" in stderr.lower():
-                logger.warning(f"⚠️ [L0.3] import 超时（可能有阻塞代码），跳过导入检查")
+                logger.warning("⚠️ [L0.3] import 超时（可能有阻塞代码），跳过导入检查")
                 return True, ""
 
             # 错误信息可能在 stdout（IMPORT_FAIL）或 stderr
@@ -1339,11 +1830,34 @@ except Exception as e:
             elif stderr:
                 fail_detail = stderr[:500]
 
+            failure_type, missing_symbol, import_module = self._parse_import_failure_detail(fail_detail)
+            local_module_path = self._resolve_local_module_path(
+                target_file, sandbox_dir, import_module
+            ) if import_module else ""
+
+            if failure_type == "cannot_import_name" and local_module_path:
+                cross_file_prefix = (
+                    f"[CROSS_FILE:{local_module_path}] "
+                    f"[IMPORTER_FILE:{target_file}] "
+                    f"[MISSING_SYMBOL:{missing_symbol}] "
+                )
+                error = (
+                    cross_file_prefix
+                    + f"[L0.3 本地导入缺符号] {target_file}: "
+                    f"从本地模块 {import_module} ({local_module_path}) "
+                    f"导入缺失符号 `{missing_symbol}`。原始错误: {fail_detail}"
+                )
+                logger.warning(f"❌ {error}")
+                global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+                return False, error
+            if failure_type == "cannot_import_name":
+                logger.warning(f"⚠️ [L0.3] 第三方导入缺符号（保守跳过）: {fail_detail[:200]}")
+                return True, ""
+
             # 已知良性错误：L0.3 的单文件 import 无法模拟完整包环境，跳过交给 L2
             benign_patterns = [
                 "relative import",        # from .models import X（包内相对导入）
                 "No module named",         # 兄弟模块还没写好 / 第三方未装
-                "cannot import name",      # 兄弟模块接口未就绪
                 "Invalid args for response field",  # FastAPI Pydantic 模型校验
                 "is not a valid Pydantic field",    # FastAPI 响应模型类型错误
                 "ValidationError",                   # Pydantic 校验错误
@@ -1361,6 +1875,64 @@ except Exception as e:
         except Exception as e:
             logger.warning(f"⚠️ [L0.3] 导入检查异常: {e}，跳过")
             return True, ""
+
+    @staticmethod
+    def _parse_import_failure_detail(fail_detail: str) -> Tuple[str, str, str]:
+        """解析 import 失败信息，提取错误类型、缺失符号和来源模块。"""
+        cannot_import = re.search(
+            r"cannot import name ['\"]?([^'\"]+)['\"]? from ['\"]?([^'\"]+)['\"]?",
+            fail_detail,
+        )
+        if cannot_import:
+            return (
+                "cannot_import_name",
+                cannot_import.group(1).strip(),
+                cannot_import.group(2).strip(),
+            )
+
+        no_module = re.search(
+            r"No module named ['\"]?([^'\"]+)['\"]?",
+            fail_detail,
+        )
+        if no_module:
+            return ("no_module_named", "", no_module.group(1).strip())
+
+        return ("", "", "")
+
+    @staticmethod
+    def _resolve_local_module_path(target_file: str, sandbox_dir: str, module_name: str) -> str:
+        """判断导入失败是否来自项目内本地模块，并返回匹配到的相对路径。"""
+        if not sandbox_dir or not module_name:
+            return ""
+
+        module_name = module_name.strip().lstrip(".")
+        if not module_name:
+            return ""
+
+        target_dir = os.path.dirname(target_file).replace("\\", "/").strip("/")
+        module_rel = module_name.replace(".", "/").strip("/")
+
+        candidates = [
+            f"{module_rel}.py",
+            f"{module_rel}/__init__.py",
+        ]
+        if target_dir:
+            candidates.extend([
+                f"{target_dir}/{module_rel}.py",
+                f"{target_dir}/{module_rel}/__init__.py",
+            ])
+
+        seen = set()
+        for candidate in candidates:
+            normalized = os.path.normpath(candidate).replace("\\", "/")
+            if normalized in seen or normalized.startswith("../"):
+                continue
+            seen.add(normalized)
+            abs_path = os.path.join(sandbox_dir, *normalized.split("/"))
+            if os.path.isfile(abs_path):
+                return normalized
+
+        return ""
 
     @staticmethod
     def _extract_defined_symbols(tree: ast.AST) -> set:
@@ -1383,8 +1955,17 @@ except Exception as e:
 
     @staticmethod
     def _extract_expected_symbols(target_file: str,
-                                  module_interfaces: dict) -> list:
-        """从规划书的 module_interfaces 中提取期望的函数/类名"""
+                                  module_interfaces: dict,
+                                  project_spec: dict = None) -> list:
+        """提取当前文件的验收符号；路由文件优先使用 route_contracts。"""
+        symbols = extract_expected_symbols_for_target(
+            project_spec or {},
+            target_file,
+            module_interfaces or {},
+        )
+        if symbols:
+            return symbols
+
         if not module_interfaces:
             return []
 
@@ -1405,6 +1986,150 @@ except Exception as e:
         for match in re.finditer(r'(\b[A-Z_][A-Z_0-9]*)\s*=', str(iface_str)):
             symbols.append(match.group(1))
         return symbols
+
+    @staticmethod
+    def _l0_architecture_contract_check(target_file: str, code_content: str,
+                                        project_spec: dict) -> Tuple[bool, str]:
+        """L0.3A: 检查单文件是否偏离已编译的 architecture_contract。"""
+        if not target_file.endswith('.py') or not isinstance(project_spec, dict):
+            return True, ""
+
+        contract = project_spec.get("architecture_contract", {}) or {}
+        if not isinstance(contract, dict) or not contract:
+            return True, ""
+
+        signals = ((project_spec.get("compiler_metadata") or {}).get("architecture_signals") or {})
+        local_module_names = [
+            str(item).strip()
+            for item in (signals.get("local_module_names") or [])
+            if str(item).strip()
+        ]
+        code = str(code_content or "")
+        lowered = code.lower()
+
+        backend_framework = str(contract.get("backend_framework") or "unknown").lower()
+        orm_mode = str(contract.get("orm_mode") or "unknown").lower()
+        auth_mode = str(contract.get("auth_mode") or "unknown").lower()
+        router_mode = str(contract.get("router_mode") or "unknown").lower()
+        package_layout = str(contract.get("package_layout") or "unknown").lower()
+        import_style = str(contract.get("import_style") or "unknown").lower()
+
+        violations = []
+
+        def _contains_any(tokens: tuple[str, ...]) -> bool:
+            return any(token in lowered for token in tokens)
+
+        if backend_framework == "fastapi" and _contains_any((
+            "from flask import",
+            "import flask",
+            "blueprint(",
+            "register_blueprint",
+            "from flask_login",
+            "loginmanager",
+            "from flask_sqlalchemy",
+            "flask_sqlalchemy",
+        )):
+            violations.append("当前文件出现了 Flask / Blueprint / Flask-Login / Flask-SQLAlchemy 语义，但项目架构要求 FastAPI")
+
+        if backend_framework == "flask" and _contains_any((
+            "from fastapi import",
+            "import fastapi",
+            "fastapi(",
+            "apirouter",
+            "include_router",
+            "depends(",
+        )):
+            violations.append("当前文件出现了 FastAPI / APIRouter / Depends 语义，但项目架构要求 Flask")
+
+        if orm_mode == "sqlalchemy_session" and _contains_any((
+            "from flask_sqlalchemy",
+            "flask_sqlalchemy",
+            "db = sqlalchemy(",
+            "db.model",
+            "db.session",
+        )):
+            violations.append(
+                "当前文件使用了 Flask-SQLAlchemy 语义（db.Model/db.session），"
+                "但项目架构要求 sqlalchemy session。"
+                "【修复方法】使用 `from sqlalchemy import create_engine; from sqlalchemy.orm import sessionmaker, declarative_base` + "
+                "`Base = declarative_base()` + `engine = create_engine(...)` + `SessionLocal = sessionmaker(bind=engine)`，"
+                "禁止使用 flask_sqlalchemy"
+            )
+
+        if orm_mode == "flask_sqlalchemy" and _contains_any((
+            "declarative_base",
+            "sessionmaker",
+            "sessionlocal",
+            "create_engine(",
+        )):
+            violations.append(
+                "当前文件使用了 sqlalchemy session 语义（declarative_base/sessionmaker/create_engine），"
+                "但项目架构要求 Flask-SQLAlchemy。"
+                "【修复方法】使用 `from flask_sqlalchemy import SQLAlchemy; db = SQLAlchemy()` + "
+                "`db.Model` 基类 + `db.Column(...)` 定义字段，"
+                "禁止使用 declarative_base / sessionmaker / create_engine"
+            )
+
+        if auth_mode == "jwt_header" and _contains_any((
+            "from flask_login",
+            "loginmanager",
+            "login_user",
+            "logout_user",
+            "current_user",
+            "@login_required",
+        )):
+            violations.append("当前文件使用了 Flask-Login session 语义，但项目架构要求 JWT header 认证")
+
+        if auth_mode == "flask_login_session" and _contains_any((
+            "oauth2passwordbearer",
+            "create_access_token",
+            "from jose import jwt",
+            "import jwt",
+            "bearer ",
+        )):
+            violations.append("当前文件使用了 JWT / OAuth2 bearer 语义，但项目架构要求 Flask-Login session")
+
+        if router_mode == "fastapi_apirouter" and _contains_any((
+            "blueprint(",
+            "register_blueprint",
+            ".route(",
+        )):
+            violations.append("当前文件使用了 Blueprint 路由语义，但项目架构要求 APIRouter")
+
+        if router_mode == "flask_blueprint" and _contains_any((
+            "apirouter",
+            "include_router",
+            "@router.",
+            "@api_router.",
+            "@app.get(",
+            "@app.post(",
+            "@app.put(",
+            "@app.delete(",
+            "@app.patch(",
+        )):
+            violations.append("当前文件使用了 FastAPI 路由语义，但项目架构要求 Flask Blueprint")
+
+        if package_layout == "flat_modules" and import_style == "sibling_import":
+            if re.search(r"\bfrom\s+(?:src|backend\.src)\.[A-Za-z_][A-Za-z0-9_\.]*\s+import\b", code):
+                violations.append("当前文件使用了 `from src...` 包式导入，但项目是 flat_modules + sibling_import")
+            if re.search(r"\bfrom\s+\.[A-Za-z_][A-Za-z0-9_\.]*\s+import\b", code):
+                violations.append("当前文件使用了相对包导入，但项目是 flat_modules + sibling_import")
+
+        if package_layout == "package_src" and import_style == "package_import":
+            for module_name in local_module_names:
+                if re.search(rf"\bfrom\s+{re.escape(module_name)}\s+import\b", code):
+                    violations.append(
+                        f"当前文件使用了 sibling_import (`from {module_name} import ...`)，但项目要求 package_import"
+                    )
+                    break
+
+        if violations:
+            error = f"[L0.3A 架构契约违规] {target_file}: " + "；".join(violations)
+            logger.warning(f"❌ {error}")
+            global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+            return False, error
+
+        return True, ""
 
     # ============================================================
     # L1: 合约审计（轻量 LLM，只读不执行）
@@ -1444,7 +2169,9 @@ except Exception as e:
             response_msg = default_llm.chat_completion(
                 messages=messages,
                 model=self.model,
-                temperature=0.1
+                temperature=0.1,
+                enable_thinking=self.enable_thinking,
+                reasoning_effort=self._reasoning_effort,
             )
 
             raw = response_msg.content.strip()
@@ -1453,7 +2180,7 @@ except Exception as e:
 
         except Exception as e:
             logger.warning(f"⚠️ [L1] LLM 调用异常: {e}，放行")
-            return True, "审查通过（LLM 异常，跳过）"
+            return True, "[SOFT_PASS] 审查通过（LLM 异常，跳过）"
 
     @staticmethod
     def _parse_audit_result(raw: str) -> Tuple[bool, str]:
@@ -1479,8 +2206,8 @@ except Exception as e:
             elif "FAIL" in raw.upper():
                 return False, f"[L1 合约审计] {raw[:500]}"
             else:
-                # 无法解析，默认放行
-                return True, f"合约审计通过（LLM 输出格式异常，已放行）"
+                # 无法解析，默认放行（带 SOFT_PASS 标记）
+                return True, "[SOFT_PASS] 合约审计通过（LLM 输出格式异常，已放行）"
 
     # ============================================================
     # 上下文构建（保留自 v2）
@@ -1528,43 +2255,62 @@ except Exception as e:
             return True, ""
 
         page_routes = project_spec.get("page_routes", [])
+        effective_route_manifest = project_spec.get("effective_route_manifest", [])
+        app_registration_contracts = project_spec.get("app_registration_contracts", [])
         template_contracts = project_spec.get("template_contracts", {})
+        module_interfaces = project_spec.get("module_interfaces", {}) or {}
 
-        if not page_routes and not template_contracts:
+        if not page_routes and not template_contracts and not effective_route_manifest and not module_interfaces:
             return True, ""  # 无契约 → 跳过
 
-        # C1: 后端路由函数 vs 契约路径一致性（Python 路由文件）
-        if target_file.endswith('.py') and page_routes:
-            c1_pass, c1_error = self._l0_contract_c1_route_check(
-                target_file, code_content, page_routes)
-            if not c1_pass:
-                return False, c1_error
+        contract_warnings = []
 
-        # C2: HTML form action / href vs 契约路径一致性（HTML 文件）
+        # [SOFT] C1: 后端路由函数 vs 契约路径一致性（跨文件启发式）
+        if target_file.endswith('.py') and (
+            page_routes or effective_route_manifest or app_registration_contracts or module_interfaces.get(target_file)
+        ):
+            c1_pass, c1_error = self._l0_contract_c1_route_check(
+                target_file, code_content, project_spec, sandbox_dir)
+            if not c1_pass:
+                logger.warning(f"⚠️ [SOFT-C1] {c1_error}")
+                contract_warnings.append(c1_error)
+
+        # [SOFT] C2: HTML form action / href vs 契约路径一致性（跨文件启发式）
         if target_file.endswith('.html') and page_routes:
             c2_pass, c2_error = self._l0_contract_c2_html_url_check(
                 target_file, code_content, page_routes)
             if not c2_pass:
-                return False, c2_error
+                logger.warning(f"⚠️ [SOFT-C2] {c2_error}")
+                contract_warnings.append(c2_error)
 
-        # C3: template_folder 路径 vs 实际目录结构一致性（Flask app 文件）
+        # [SOFT] C3: template_folder 路径 vs 实际目录结构一致性（跨文件启发式）
         if target_file.endswith('.py') and sandbox_dir:
             c3_pass, c3_error = self._l0_contract_c3_template_folder_check(
                 target_file, code_content, sandbox_dir)
             if not c3_pass:
-                return False, c3_error
+                logger.warning(f"⚠️ [SOFT-C3] {c3_error}")
+                contract_warnings.append(c3_error)
+
+        if contract_warnings:
+            warning_text = " | ".join(contract_warnings)
+            logger.info(f"📋 [L0-Contract SOFT] {target_file}: {len(contract_warnings)} 个契约警告（不阻断）")
+            global_broadcaster.emit_sync("Reviewer", "l0_contract_soft_warning",
+                f"⚠️ L0-Contract SOFT 警告 ({len(contract_warnings)}): {warning_text[:200]}")
 
         return True, ""
 
     def _l0_contract_c1_route_check(self, target_file: str, code_content: str,
-                                    page_routes: list) -> Tuple[bool, str]:
+                                    project_spec: dict,
+                                    sandbox_dir: str = "") -> Tuple[bool, str]:
         """L0.C1: 检查 Python 路由文件中注册的路径是否与 page_routes 契约一致。
         仅对包含路由注册的文件生效（routes.py / app.py 等）。"""
         import re as _re
 
         # 只检查包含路由注册的文件
         has_route_registration = (
+            'Blueprint(' in code_content or
             'add_url_rule' in code_content or
+            'register_blueprint' in code_content or
             '@app.' in code_content or
             '@router.' in code_content or
             '@bp.' in code_content or
@@ -1572,6 +2318,93 @@ except Exception as e:
         )
         if not has_route_registration:
             return True, ""
+
+        effective_manifest = project_spec.get("effective_route_manifest", []) or []
+        app_registration_contracts = project_spec.get("app_registration_contracts", []) or []
+
+        topology_pass, topology_error = self._l0_route_topology_check(
+            target_file, code_content, project_spec, sandbox_dir
+        )
+        if not topology_pass:
+            return False, topology_error
+
+        # 优先使用编译后的闭环契约
+        if 'register_blueprint' in code_content and app_registration_contracts:
+            code_registrations = set()
+            for m in _re.finditer(
+                r"register_blueprint\s*\(\s*(\w+)(?:\s*,\s*url_prefix\s*=\s*['\"]([^'\"]*)['\"])?",
+                code_content
+            ):
+                blueprint = m.group(1)
+                url_prefix = self._normalize_contract_path(m.group(2) or "")
+                code_registrations.add((blueprint, url_prefix))
+
+            expected_registrations = set()
+            for item in app_registration_contracts:
+                if not isinstance(item, dict):
+                    continue
+                app_module = item.get("app_module")
+                if app_module and app_module != target_file:
+                    continue
+                expected_registrations.add((
+                    item.get("blueprint"),
+                    self._normalize_contract_path(item.get("url_prefix", "")),
+                ))
+
+            missing_regs = expected_registrations - code_registrations
+            if missing_regs:
+                error = (
+                    f"[L0.C1 路由契约违规] {target_file}: "
+                    f"app 注册契约要求以下 blueprint/url_prefix，但代码中未找到: {sorted(missing_regs)}。"
+                    f"代码中已注册: {sorted(code_registrations)}。"
+                )
+                logger.warning(f"❌ {error}")
+                global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+                return False, error
+
+            if expected_registrations:
+                logger.info(f"✅ [L0.C1] app 注册契约校验通过: {target_file}")
+                return True, ""
+
+        manifest_for_file = [
+            item for item in effective_manifest
+            if isinstance(item, dict)
+            and item.get("module") == target_file
+            and item.get("local_path") is not None
+        ]
+        if manifest_for_file:
+            code_routes = set()
+            for m in _re.finditer(
+                r'@(?P<blueprint>\w+)\.(?:route|get|post|put|delete|patch)\s*\(\s*["\'](?P<path>/[^"\']*)["\']',
+                code_content
+            ):
+                code_routes.add((
+                    m.group("blueprint"),
+                    self._normalize_contract_path(m.group("path")),
+                ))
+
+            expected_routes = {
+                (
+                    item.get("blueprint"),
+                    self._normalize_contract_path(item.get("local_path", "")),
+                )
+                for item in manifest_for_file
+            }
+            missing_in_code = expected_routes - code_routes
+            if missing_in_code:
+                error = (
+                    f"[L0.C1 路由契约违规] {target_file}: "
+                    f"编译后契约要求以下 blueprint/local_path，但代码中未找到: {sorted(missing_in_code)}。"
+                    f"代码中已注册: {sorted(code_routes)}。"
+                )
+                logger.warning(f"❌ {error}")
+                global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+                return False, error
+
+            logger.info(f"✅ [L0.C1] 局部路由契约校验通过: {target_file}")
+            return True, ""
+
+        page_routes = project_spec.get("page_routes", []) or []
 
         # 从代码中提取所有注册路径
         code_routes = set()
@@ -1605,6 +2438,147 @@ except Exception as e:
 
         logger.info(f"✅ [L0.C1] 路由契约校验通过: {target_file}")
         return True, ""
+
+    def _l0_route_topology_check(self, target_file: str, code_content: str,
+                                 project_spec: dict, sandbox_dir: str = "") -> Tuple[bool, str]:
+        """补充校验：
+        1. blueprint 已挂 url_prefix 时，局部路由不得重复写前缀
+        2. 规划中声明的 handler 存在但未注册为端点时，直接驳回
+        """
+        blueprint_vars = set(extract_blueprint_variables_from_code(code_content))
+        route_bindings = extract_route_bindings_from_code(code_content)
+
+        if not blueprint_vars and not route_bindings:
+            return True, ""
+
+        prefix_by_blueprint = {}
+        for item in (project_spec.get("app_registration_contracts", []) or []):
+            if not isinstance(item, dict) or not item.get("blueprint"):
+                continue
+            prefix_by_blueprint[item["blueprint"]] = self._normalize_contract_path(
+                item.get("url_prefix", "")
+            )
+
+        if sandbox_dir:
+            for app_name in ("app.py", "main.py", "__init__.py"):
+                app_path = self._find_file_in_sandbox(sandbox_dir, app_name)
+                if not app_path:
+                    continue
+                try:
+                    with open(app_path, "r", encoding="utf-8") as fh:
+                        app_code = fh.read()
+                except Exception:
+                    continue
+                for item in extract_blueprint_registrations_from_code(app_code):
+                    prefix_by_blueprint[item["blueprint"]] = self._normalize_contract_path(
+                        item.get("url_prefix", "")
+                    )
+
+        double_prefixed = []
+        for binding in route_bindings:
+            blueprint = binding.get("blueprint", "")
+            local_path = self._normalize_contract_path(binding.get("local_path", ""))
+            url_prefix = prefix_by_blueprint.get(blueprint, "")
+            if not blueprint or not local_path or not url_prefix:
+                continue
+            if local_path == url_prefix or local_path.startswith(url_prefix + "/"):
+                double_prefixed.append(
+                    f"{blueprint}:{binding.get('handler') or '<anonymous>'} -> {local_path} (url_prefix={url_prefix})"
+                )
+
+        if double_prefixed:
+            error = (
+                f"[L0.C1 路由拓扑错误] {target_file}: 检测到 blueprint 局部路由重复写入 app url_prefix，"
+                f"会导致双重前缀和 404。问题项: {double_prefixed}。"
+                f"修复方法：route 文件内只保留 blueprint 相对路径，例如把 '/api/auth/login' 改成 '/login'。"
+            )
+            logger.warning(f"❌ {error}")
+            global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+            return False, error
+
+        module_contracts = project_spec.get("route_module_contracts", {}) or {}
+        module_contract = module_contracts.get(target_file, {}) if isinstance(module_contracts, dict) else {}
+
+        # init_function 模式：路由通过 init_xxx_routes(app) 内部的 add_url_rule 注册，
+        # handler 函数本身没有 @bp.route 装饰器，extract_route_bindings 无法可靠提取。
+        # 跳过"路由未注册"检查，防止持续误报消耗重试预算。
+        contract_mode = str(module_contract.get("mode") or "").strip().lower()
+        if contract_mode == "init_function":
+            logger.info(f"✅ [L0.C1] {target_file}: init_function 模式，跳过路由未注册检查")
+            return True, ""
+
+        helper_names = {
+            name for name in (module_contract.get("helper_functions", []) or [])
+            if isinstance(name, str)
+        }
+        expected_handlers = [
+            name for name in extract_module_interface_handlers(
+                project_spec.get("module_interfaces", {}) or {},
+                target_file,
+            )
+            if name and not is_non_endpoint_helper(name) and name not in helper_names
+        ]
+        contract_handlers = [
+            name for name in extract_contract_handlers(project_spec).get(target_file, [])
+            if name and not is_non_endpoint_helper(name) and name not in helper_names
+        ]
+        expected_handlers = sorted(dict.fromkeys(expected_handlers + contract_handlers))
+        if not expected_handlers:
+            expected_handlers = [
+                name for name in extract_top_level_function_names(code_content)
+                if looks_like_endpoint_function(name) and name not in helper_names
+            ]
+
+        if expected_handlers:
+            registered_handlers = {
+                binding.get("handler")
+                for binding in route_bindings
+                if binding.get("handler")
+            }
+            missing_handlers = []
+            for handler in expected_handlers:
+                if not handler or handler in registered_handlers:
+                    continue
+                # GET/POST 拆分 或 命名空间冲突变体：
+                # edit_expense → edit_expense_get / edit_expense_post
+                # delete_expense → delete_expense_handler（因 from models import delete_expense 同名）
+                has_variant = any(
+                    f"{handler}_{suffix}" in registered_handlers
+                    for suffix in ("get", "post", "page", "view", "form",
+                                   "submit", "handler", "route", "action",
+                                   "endpoint", "api")
+                )
+                if has_variant:
+                    continue
+                # 反向检查：registered 中是否有以 handler 为前缀的函数
+                has_prefix_match = any(
+                    rh.startswith(handler + "_") for rh in registered_handlers
+                )
+                if has_prefix_match:
+                    continue
+                missing_handlers.append(handler)
+
+            if missing_handlers and blueprint_vars:
+                error = (
+                    f"[L0.C1 路由未注册] {target_file}: 发现已声明但未注册为 HTTP 端点的 handler: "
+                    f"{missing_handlers}。"
+                    f"修复方法：为这些函数补齐 @{sorted(blueprint_vars)[0]}.route(...) 或 add_url_rule(...)。"
+                )
+                logger.warning(f"❌ {error}")
+                global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+                return False, error
+
+        return True, ""
+
+    @staticmethod
+    def _normalize_contract_path(path: str) -> str:
+        path = (path or "").strip()
+        if not path or path == "/":
+            return ""
+        if not path.startswith("/"):
+            path = "/" + path
+        path = path.rstrip("/")
+        return path or ""
 
     def _l0_contract_c2_html_url_check(self, target_file: str, html_content: str,
                                        page_routes: list) -> Tuple[bool, str]:
@@ -1711,7 +2685,7 @@ except Exception as e:
         suggestion = ""
         if correct_tf:
             if correct_tf == 'templates':
-                suggestion = f"正确值应为 template_folder='templates'，或直接删除此参数（Flask 默认就是 templates/）。"
+                suggestion = "正确值应为 template_folder='templates'，或直接删除此参数（Flask 默认就是 templates/）。"
             else:
                 suggestion = f"正确值应为 template_folder='{correct_tf}'。"
         else:
@@ -1733,7 +2707,8 @@ except Exception as e:
     def evaluate_draft(self, target_file: str, description: str,
                        code_content: str = None, sandbox_dir: str = None,
                        module_interfaces: dict = None,
-                       project_spec: dict = None) -> Tuple[bool, str]:
+                       project_spec: dict = None,
+                       task_id: str = "") -> Tuple[bool, str]:
         """
         评估文件草稿（v3 L0+L0C+L1 管线）
 
@@ -1744,6 +2719,7 @@ except Exception as e:
             sandbox_dir: 沙盒工作目录
             module_interfaces: 跨文件接口契约（来自 Manager 规划书）
             project_spec: 完整项目规划书（含 page_routes / template_contracts）
+            task_id: 任务 ID（用于判断 Continue 修复模式）
 
         返回:
             is_pass (bool): 是否审查通过
@@ -1752,19 +2728,21 @@ except Exception as e:
         if not code_content:
             return False, "没有找到该文件的代码内容（Engine 未传入 code_content）"
 
-        logger.info(f"🛡️ Reviewer 正在审查文件: {target_file}")
+        is_continue_fix = str(task_id).startswith("continue_")
+        logger.info(f"🛡️ Reviewer 正在审查文件: {target_file}" + (" [Continue 修复模式]" if is_continue_fix else ""))
         global_broadcaster.emit_sync("Reviewer", "review_start",
             f"开始审查目标文件: {target_file}", {"target": target_file})
 
         # === Step 1: L0 静态检查 (0 LLM) ===
-        expected_symbols = self._extract_expected_symbols(target_file, module_interfaces)
+        expected_symbols = self._extract_expected_symbols(target_file, module_interfaces, project_spec)
         l0_pass, l0_error = self._l0_static_check(
-            target_file, code_content, sandbox_dir, expected_symbols)
+            target_file, code_content, sandbox_dir, expected_symbols,
+            project_spec=project_spec, is_continue_fix=is_continue_fix)
 
         if not l0_pass:
             logger.warning(f"❌ Reviewer L0 驳回: {l0_error[:200]}")
             global_broadcaster.emit_sync("Reviewer", "review_fail",
-                f"L0 静态检查未通过", {"feedback": l0_error})
+                "L0 静态检查未通过", {"feedback": l0_error})
             return False, l0_error
 
         global_broadcaster.emit_sync("Reviewer", "l0_pass", "✅ L0 静态检查通过")
@@ -1775,7 +2753,7 @@ except Exception as e:
         if not lc_pass:
             logger.warning(f"❌ Reviewer L0-Contract 驳回: {lc_error[:200]}")
             global_broadcaster.emit_sync("Reviewer", "review_fail",
-                f"L0-Contract 契约校验未通过", {"feedback": lc_error})
+                "L0-Contract 契约校验未通过", {"feedback": lc_error})
             return False, lc_error
 
         # === Step 2: L1 合约审计 (~800 tokens) ===
@@ -1800,3 +2778,416 @@ except Exception as e:
                 "审查未通过！", {"feedback": l1_feedback})
 
         return l1_pass, l1_feedback
+
+    # ============================================================
+    # L0.13: url_for endpoint 一致性检查
+    # ============================================================
+
+    def _l0_url_for_endpoint_check(self, target_file: str, html_content: str,
+                                    sandbox_dir: str) -> Tuple[bool, str]:
+        """
+        L0.13: 检查 HTML 模板中 url_for('endpoint') 的 endpoint 名是否已注册。
+
+        链路：
+        1. 从 HTML 中提取所有 url_for('xxx') / url_for('bp.func') 的 endpoint 名
+        2. 从 sandbox 中的所有 .py 文件提取 Blueprint 注册和路由函数名
+        3. 组合 bp_name.func_name 格式的合法 endpoint
+        4. 对比：HTML 引用了未注册的 endpoint → FAIL
+        """
+        if not sandbox_dir:
+            return True, ""
+
+        # 1. 从 HTML 中提取 url_for('xxx') 的 endpoint 名（支持带点号的 bp.func 格式）
+        html_endpoints = set()
+        for m in re.finditer(r"url_for\s*\(\s*['\"]([a-zA-Z0-9_.]+)['\"]", html_content):
+            html_endpoints.add(m.group(1))
+
+        if not html_endpoints:
+            return True, ""  # 没有 url_for 调用
+
+        # 仅跳过 Jinja 内置 endpoint（static 是 Flask 硬注册的）
+        # 注意：'index' 不是内置 endpoint，在 Blueprint 场景中裸 'index' 通常是 bug
+        builtin_endpoints = {'static'}
+
+        # 2. 收集所有已注册的 endpoint
+        registered_endpoints = set()
+        # blueprint_name → set(func_name)  用于生成 bp.func 格式 endpoint
+        blueprint_functions: dict = {}
+        # blueprint 变量名 → Blueprint('name', ...) 中的 name
+        blueprint_var_to_name: dict = {}
+
+        # 2a. 动态扫描 sandbox 中所有 .py 文件
+        py_files = []
+        for root, dirs, files in os.walk(sandbox_dir):
+            dirs[:] = [d for d in dirs if d not in {
+                '__pycache__', '.git', '.venv', 'venv', 'node_modules',
+                '.sandbox', '.astrea', 'dist', 'build',
+            }]
+            depth = root.replace(sandbox_dir, "").count(os.sep)
+            if depth > 2:
+                dirs.clear()
+                continue
+            for fname in files:
+                if fname.endswith('.py'):
+                    py_files.append(os.path.join(root, fname))
+
+        for py_path in py_files:
+            try:
+                with open(py_path, 'r', encoding='utf-8') as f:
+                    py_content = f.read()
+                tree = ast.parse(py_content)
+            except Exception:
+                continue
+
+            # 提取 Blueprint 变量名和注册名
+            # bp = Blueprint('expense_routes', __name__)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and isinstance(node.value, ast.Call):
+                            func = node.value.func
+                            is_blueprint = False
+                            if isinstance(func, ast.Name) and func.id == 'Blueprint':
+                                is_blueprint = True
+                            elif isinstance(func, ast.Attribute) and func.attr == 'Blueprint':
+                                is_blueprint = True
+                            if is_blueprint and node.value.args:
+                                first_arg = node.value.args[0]
+                                if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
+                                    bp_var = target.id
+                                    bp_name = first_arg.value
+                                    blueprint_var_to_name[bp_var] = bp_name
+                                    if bp_name not in blueprint_functions:
+                                        blueprint_functions[bp_name] = set()
+
+            # 提取 @bp.route / @app.route 装饰的函数
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for dec in node.decorator_list:
+                        if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Attribute):
+                            if dec.func.attr in ('route', 'get', 'post', 'put', 'delete', 'patch'):
+                                bp_var = dec.func.value.id if isinstance(dec.func.value, ast.Name) else ""
+                                bp_name = blueprint_var_to_name.get(bp_var, "")
+                                if bp_name:
+                                    # Blueprint 场景：Flask 只注册 bp_name.func_name 格式
+                                    # 裸 func_name 不是合法 endpoint
+                                    blueprint_functions.setdefault(bp_name, set()).add(node.name)
+                                    registered_endpoints.add(f"{bp_name}.{node.name}")
+                                else:
+                                    # 非 Blueprint（直接 @app.route）：裸函数名是合法 endpoint
+                                    registered_endpoints.add(node.name)
+
+            # 提取 add_url_rule 注册的 endpoint
+            for m in re.finditer(
+                r"add_url_rule\s*\(\s*['\"][^'\"]*['\"]\s*,\s*['\"](\w+)['\"]",
+                py_content
+            ):
+                registered_endpoints.add(m.group(1))
+
+        if not registered_endpoints:
+            return True, ""  # 没找到任何注册的 endpoint，跳过
+
+        # 3. 对比
+        unregistered = html_endpoints - registered_endpoints - builtin_endpoints
+        if unregistered:
+            # 构造修复建议
+            suggestions = []
+            for ep in sorted(unregistered):
+                # 尝试推荐正确的 bp.func 格式
+                found = False
+                for bp_name, funcs in blueprint_functions.items():
+                    if ep in funcs:
+                        suggestions.append(f"url_for('{ep}') → url_for('{bp_name}.{ep}')")
+                        found = True
+                        break
+                if not found:
+                    suggestions.append(f"url_for('{ep}') 未找到匹配的注册 endpoint")
+
+            error = (
+                f"[L0.13 url_for endpoint 不一致] {target_file}: "
+                f"模板中 url_for() 引用了未注册的 endpoint: {sorted(unregistered)}。"
+                f"已注册的 endpoint: {sorted(registered_endpoints)}。"
+                f"修复建议: {'; '.join(suggestions)}。"
+                f"在 Blueprint 架构中，url_for 必须使用 'blueprint_name.function_name' 格式。"
+            )
+            logger.warning(f"❌ {error}")
+            global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+            return False, error
+
+        logger.info(f"✅ [L0.13] url_for endpoint 校验通过: {target_file}")
+        return True, ""
+
+    @staticmethod
+    def _l0_sqlalchemy_association_check(target_file: str, code_content: str,
+                                          expected_symbols: list) -> Tuple[bool, str]:
+        """
+        L0.2-ORM: 约束 SQLAlchemy 中间表建模只能二选一：
+        1. 显式 ORM 实体类，例如 class TaskTag
+        2. 裸 association table，例如 task_tags = db.Table(...)
+
+        若规划书已经明确要求 class TaskTag，则禁止同时再定义同名裸关联表。
+        """
+        expected_set = set(expected_symbols or [])
+        if "TaskTag" not in expected_set:
+            return True, ""
+
+        has_task_tag_class = bool(re.search(r"^\s*class\s+TaskTag\b", code_content, re.MULTILINE))
+        has_task_tags_table = bool(
+            re.search(r"(?:\b\w+\s*=\s*)?(?:db\.)?Table\s*\(\s*['\"]task_tags['\"]", code_content)
+        )
+
+        if has_task_tags_table and not has_task_tag_class:
+            error = (
+                f"[L0.2 ORM 建模冲突] {target_file}: 规划书明确要求 `class TaskTag`，"
+                f"当前代码却只定义了裸关联表 `task_tags = Table(...)`。"
+                f"修复方法：把 TaskTag 实现为显式 ORM 模型类，不要只写裸关联表。"
+            )
+            logger.warning(f"❌ {error}")
+            global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+            return False, error
+
+        if has_task_tags_table and has_task_tag_class:
+            error = (
+                f"[L0.2 ORM 重复定义] {target_file}: 同时检测到 `class TaskTag` 和 "
+                f"`task_tags = Table(...)`。这会让 SQLAlchemy 对同一张表重复注册。"
+                f"修复方法：二选一；当前项目按规划书应保留 `class TaskTag`，删除裸 `task_tags` 关联表。"
+            )
+            logger.warning(f"❌ {error}")
+            global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+            return False, error
+
+        return True, ""
+
+    # ============================================================
+    # L0.12: models.py tuple 返回检测
+    # ============================================================
+
+    @staticmethod
+    def _l0_tuple_return_check(target_file: str, code_content: str) -> Tuple[bool, str]:
+        """
+        L0.12: 检测 models.py 是否将 sqlite3.Row 转成 tuple 返回。
+
+        典型 anti-pattern:
+            conn.row_factory = sqlite3.Row  # 设了 row_factory
+            rows = cursor.fetchall()
+            return [tuple(row) for row in rows]  # ← 又手动转成 tuple！
+
+        后果: Jinja 模板 {{ expense.amount }} 报错 'tuple has no attribute'
+        正确修复方向: 删掉 tuple() 转换，直接返回 Row 或 dict(row)
+        """
+        import re as _re
+
+        # 匹配危险模式: tuple(row) / list(tuple(...)) / (row[0], row[1]...)
+        dangerous_patterns = [
+            (_re.compile(r'return\s+\[tuple\(', _re.MULTILINE),
+             "return [tuple(row) for row in rows]"),
+            (_re.compile(r'return\s+tuple\(', _re.MULTILINE),
+             "return tuple(row)"),
+            (_re.compile(r'->\s*(?:List\[Tuple|Tuple\[)', _re.MULTILINE),
+             "返回类型标注为 List[Tuple] 或 Tuple"),
+        ]
+
+        violations = []
+        for pattern, desc in dangerous_patterns:
+            for m in pattern.finditer(code_content):
+                # 找到违规行号
+                line_no = code_content[:m.start()].count('\n') + 1
+                violations.append(f"L{line_no}: {desc}")
+
+        if violations:
+            error = (
+                f"[L0.12 tuple 返回反模式] {target_file}: "
+                f"检测到 {len(violations)} 处将 sqlite3.Row 转为 tuple 的危险代码：\n"
+                + "\n".join(f"  - {v}" for v in violations[:5])
+                + "\n\n【正确修复方向（必须遵守！）】\n"
+                "1. 确保每个函数中 conn.row_factory = sqlite3.Row（或使用统一的 get_db()）\n"
+                "2. 删掉所有 tuple(row) 转换，直接 return rows 或 return [dict(row) for row in rows]\n"
+                "3. 返回类型标注改为 List[dict] 或 List[sqlite3.Row]，禁止 List[Tuple]\n"
+                "4. 禁止修改模板为索引访问（如 expense[0]），那是治标不治本！"
+            )
+            logger.warning(f"❌ {error}")
+            global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+            return False, error
+
+        return True, ""
+
+    @staticmethod
+    def _find_file_in_sandbox(sandbox_dir: str, rel_path: str) -> str:
+        """在 sandbox 目录中查找文件，返回绝对路径或空字符串。"""
+        if not sandbox_dir or not rel_path:
+            return ""
+        # 直接拼接
+        candidate = os.path.join(sandbox_dir, rel_path)
+        if os.path.isfile(candidate):
+            return candidate
+        # 尝试只用 basename（models.py 可能直接在根目录）
+        basename = os.path.basename(rel_path)
+        candidate2 = os.path.join(sandbox_dir, basename)
+        if os.path.isfile(candidate2):
+            return candidate2
+        # 递归搜索（最多 2 层）
+        for root, dirs, files in os.walk(sandbox_dir):
+            depth = root.replace(sandbox_dir, "").count(os.sep)
+            if depth > 2:
+                dirs.clear()
+                continue
+            if basename in files:
+                return os.path.join(root, basename)
+        return ""
+
+    def _l0_call_signature_check(self, target_file: str, code_content: str,
+                                  sandbox_dir: str, tree: 'ast.AST') -> 'Tuple[bool, str]':
+        """
+        L0.14: Cross-file function call signature consistency check.
+        Catches: routes.py calls update_expense(id) but models.py defines
+        def update_expense(id, amount, category, description, date) -> TypeError at runtime.
+        """
+        import ast as _ast
+
+        # 1. Extract from xxx import yyy statements
+        local_imports = {}
+        for node in _ast.walk(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ''
+                if module.startswith(('os', 'sys', 'json', 're', 'datetime',
+                                      'typing', 'flask', 'fastapi', 'sqlalchemy',
+                                      'pydantic', 'werkzeug', 'jinja2', 'sqlite3',
+                                      'collections', 'functools', 'pathlib',
+                                      'urllib', 'hashlib', 'uuid', 'math')):
+                    continue
+                for alias in (node.names or []):
+                    name = alias.asname or alias.name
+                    if name != '*':
+                        local_imports[name] = module
+
+        if not local_imports:
+            return True, ''
+
+        # 2. Parse imported module function signatures
+        func_signatures = {}
+        for func_name, module_name in local_imports.items():
+            module_file = module_name.replace('.', '/') + '.py'
+            module_path = self._find_file_in_sandbox(sandbox_dir, module_file)
+            if not module_path:
+                module_path = self._find_file_in_sandbox(
+                    sandbox_dir, module_name.split('.')[-1] + '.py')
+            if not module_path:
+                continue
+            try:
+                with open(module_path, 'r', encoding='utf-8') as f:
+                    mod_tree = _ast.parse(f.read())
+            except Exception:
+                continue
+            for mod_node in _ast.walk(mod_tree):
+                if isinstance(mod_node, _ast.FunctionDef) and mod_node.name == func_name:
+                    args = mod_node.args
+                    all_positional = list(getattr(args, 'posonlyargs', [])) + list(args.args)
+                    param_names = [a.arg for a in all_positional]
+                    if param_names and param_names[0] in ('self', 'cls'):
+                        all_positional = all_positional[1:]
+                    n_total = len(all_positional) + len(args.kwonlyargs)
+                    n_defaults = len(args.defaults) + len(args.kw_defaults)
+                    n_min = n_total - n_defaults
+                    n_max = n_total
+                    if args.vararg or args.kwarg:
+                        n_max = 999
+                    func_signatures[func_name] = (n_min, n_max)
+                    break
+
+        if not func_signatures:
+            return True, ''
+
+        # 3. Check calls in current file
+        violations = []
+        for node in _ast.walk(tree):
+            if not isinstance(node, _ast.Call):
+                continue
+            call_name = ''
+            if isinstance(node.func, _ast.Name):
+                call_name = node.func.id
+            elif isinstance(node.func, _ast.Attribute):
+                continue
+            if call_name not in func_signatures:
+                continue
+            n_min, n_max = func_signatures[call_name]
+            n_actual_with_kw = len(node.args) + len(node.keywords)
+            has_star_expand = any(
+                isinstance(a, _ast.Starred) for a in node.args
+            ) or any(kw.arg is None for kw in node.keywords)
+            if has_star_expand:
+                continue
+            if n_actual_with_kw < n_min:
+                violations.append(
+                    f'`{call_name}()` 调用传了 {n_actual_with_kw} 个参数，'
+                    f'但定义需要至少 {n_min} 个'
+                )
+            elif n_actual_with_kw > n_max:
+                violations.append(
+                    f'`{call_name}()` 调用传了 {n_actual_with_kw} 个参数，'
+                    f'但定义最多接受 {n_max} 个'
+                )
+
+        if violations:
+            cross_modules = sorted(set(local_imports.values()))
+            cross_tag = f'[CROSS_FILE:{",".join(cross_modules)}] ' if cross_modules else ''
+            error = (
+                f'{cross_tag}[L0.14 函数调用签名不匹配] {target_file}: '
+                + '; '.join(violations[:3])
+                + '。修复方法：检查被调用函数的定义，确保传入参数数量正确。'
+            )
+            logger.warning(f'❌ {error}')
+            global_broadcaster.emit_sync('Reviewer', 'l0_fail', error)
+            return False, error
+
+        return True, ''
+
+    @staticmethod
+    def _l0_name_shadow_check(target_file: str, tree: 'ast.AST') -> 'Tuple[bool, str]':
+        """
+        L0.15: 检测函数定义名与 from xxx import 的名字冲突。
+        典型场景：routes.py 中 from models import update_expense，
+        然后又 def update_expense(expense_id) → Python 覆盖，调用变递归。
+        """
+        import ast as _ast
+
+        # 收集所有 from xxx import name 的 name（排除标准库）
+        imported_names = set()
+        for node in _ast.iter_child_nodes(tree):
+            if isinstance(node, _ast.ImportFrom):
+                module = node.module or ''
+                if module.startswith(('os', 'sys', 'json', 're', 'datetime',
+                                      'typing', 'flask', 'fastapi', 'sqlalchemy',
+                                      'pydantic', 'werkzeug', 'jinja2', 'sqlite3',
+                                      'collections', 'functools', 'pathlib',
+                                      'urllib', 'hashlib', 'uuid', 'math',
+                                      'logging', 'io', 'abc', 'enum',
+                                      'dataclasses', 'contextlib')):
+                    continue
+                for alias in (node.names or []):
+                    real_name = alias.asname or alias.name
+                    if real_name != '*':
+                        imported_names.add(real_name)
+
+        if not imported_names:
+            return True, ''
+
+        # 收集所有顶层函数定义名
+        shadows = []
+        for node in _ast.iter_child_nodes(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                if node.name in imported_names:
+                    shadows.append(node.name)
+
+        if shadows:
+            error = (
+                f"[L0.15 命名空间覆盖] {target_file}: "
+                f"以下函数定义名与 import 导入名冲突: {shadows}。"
+                f"Python 会用后定义覆盖导入，导致调用时变递归或参数不匹配。"
+                f"修复方法：将 handler 函数重命名（如加 _handler / _view 后缀），"
+                f"或将 import 改为 import models 然后用 models.xxx() 调用。"
+            )
+            logger.warning(f'❌ {error}')
+            global_broadcaster.emit_sync('Reviewer', 'l0_fail', error)
+            return False, error
+
+        return True, ''

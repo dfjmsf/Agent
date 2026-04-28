@@ -1,21 +1,25 @@
-# 日志文件
-logs/
-*.log
+# ========================================
+# ASTrea Agent — .gitignore
+# ========================================
 
-# 环境变量隔离
+# ---------- 环境变量与密钥 ----------
 .env
+config/custom_providers.json
 
-# 虚拟环境
+# ---------- Python 运行时 ----------
+__pycache__/
+*.py[cod]
+*$py.class
 .venv/
 venv/
 env/
 
-# Python 缓存文件
-__pycache__/
-*.py[cod]
-*$py.class
+# ---------- 日志 ----------
+logs/
+*.log
+logs.txt
 
-# 临时执行沙盒脚本 (绝对禁止被 Git 追踪，防止污染仓库记录)
+# ---------- 临时执行沙盒脚本 ----------
 _run_*.py
 _test_*.py
 _check_*.py
@@ -25,30 +29,60 @@ _verify_*.py
 test.py
 workspace/_run_*.py
 
-# Agent 自动生成的产出项目 (防无限 Git 套娃)
+# ---------- 临时调试 / 一次性脚本目录 ----------
+scratch/
+
+# ---------- Agent 自动生成的产出项目 (防无限 Git 套娃) ----------
 output_project/
 projects/
 
-# Sandbox venv 隔离环境 (每项目独立，不追踪)
+# ---------- Sandbox venv 隔离环境 (每项目独立) ----------
 sandboxes/
 
-# 上下文文件上传隔离沙盒
+# ---------- 上下文文件上传沙盒 ----------
 uploads/
 
-# 数据目录 (可能含数据库文件)
+# ---------- 数据目录 ----------
 data/
 
-# Node.js 与前端构建产物
+# ---------- Playwright 浏览器缓存 ----------
+# playwright install 后的 Chromium 内核不应提交
+ms-playwright/
+
+# ---------- Node.js 与前端构建产物 ----------
 frontend/node_modules/
 frontend/dist/
 frontend/.eslintcache
 
-# 操作系统自动生成文件
+# ---------- IDE / 编辑器配置 ----------
+.idea/
+.vscode/
+
+# ---------- 数据库二进制文件 ----------
+*.db
+*.sqlite3
+
+# ---------- Docker（含明文密码，禁止提交）----------
+docker-compose.yml
+docker-compose.override.yml
+
+# ---------- 运行时产物 / 调试残留 ----------
+failed_code.json
+
+# ---------- 根目录一次性测试 / 重构脚本 ----------
+refactor_engine.py
+test_*.py
+phase1_analysis.md
+
+# ---------- 内部文档（架构设计/分析报告，禁止公开）----------
+docs/
+
+# ---------- 操作系统自动生成文件 ----------
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# 个人开发与临时文件
+# ---------- 个人笔记 (禁止泄露) ----------
 规划.txt
 思路.txt
 流程.txt
-logs.txt

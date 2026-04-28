@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import copy
 import time
 import logging
 import threading
@@ -10,9 +11,13 @@ from core.prompt import Prompts
 from core.ws_broadcaster import global_broadcaster
 from agents.coder import CoderAgent
 from agents.reviewer import ReviewerAgent
+from core.spec_compiler import compile_spec
+from core.spec_validator import (
+    normalize_spec, validate_spec, format_warnings_for_llm, has_blocking_warnings
+)
 from core.database import (
     append_event, get_recent_events, rename_project_events,
-    recall, upsert_file_tree,
+    recall, upsert_file_tree, delete_events_by_type,
     create_project_meta, update_project_status, rename_project_meta,
     insert_trajectory, finalize_trajectory,
     get_recalled_memory_union, settle_memory_scores,
@@ -32,10 +37,61 @@ class ManagerAgent:
     """
     def __init__(self, project_id: str = "default_project"):
         self.model = os.getenv("MODEL_PLANNER", "qwen3-max")
+        _et, _re = default_llm.parse_thinking_config(os.getenv("THINKING_PLANNER", "false"))
+        self.enable_thinking = _et
+        self._reasoning_effort = _re
         self.llm_client = default_llm
         self.project_id = project_id
         self.coder = CoderAgent(project_id)
         self.reviewer = ReviewerAgent(project_id)
+        self.last_raw_spec: Optional[dict] = None
+        self.last_compiled_spec: Optional[dict] = None
+        self.last_spec_warnings: List[Any] = []
+        self.last_spec_parse_error: Optional[str] = None
+        self.last_spec_raw_response: str = ""
+
+    def _reset_spec_generation_state(self):
+        self.last_raw_spec = None
+        self.last_compiled_spec = None
+        self.last_spec_warnings = []
+        self.last_spec_parse_error = None
+        self.last_spec_raw_response = ""
+
+    def has_spec_parse_failure(self) -> bool:
+        return bool(self.last_spec_parse_error)
+
+    @staticmethod
+    def _route_module_contract_prompt() -> str:
+        return (
+            "\n\n【路由模块实现契约】\n"
+            "对每个 routes.py / routes/*.py 模块，必须显式规划一种实现范式：\n"
+            "1. `direct_blueprint`: 顶层直接声明 blueprint 与 `@bp.route(...)` handler。\n"
+            "2. `init_function`: 文件内存在 `init_*_routes(...)` / `register_*_routes(...)` 作为挂载 helper。\n"
+            "禁止混用两种范式。\n"
+            "如果 app 侧会通过 `url_prefix` 挂载 blueprint，则 route 文件中的 local path 必须是相对路径，"
+            "禁止重复写完整 `/api/...` 前缀。\n"
+            "允许额外输出 `route_module_contracts` 字段，按模块声明 `mode/blueprints/helper_functions/url_prefix_hint`。\n"
+            "不允许只输出 `init_*_routes(...)` 而不提供对应的实际 route_contracts。\n"
+        )
+
+    @staticmethod
+    def _architecture_contract_prompt() -> str:
+        return (
+            "\n\n銆愬悗绔崟涓€鏋舵瀯濂戠害銆慭n"
+            "蹇呴』鏄惧紡杈撳嚭 `architecture_contract` 瀛楁锛屽苟鍙兘閫夋嫨涓€濂楀悗绔寖寮忥紝"
+            "绂佹娣风敤 FastAPI / Flask 鍙婂叾瀵瑰簲鐨?db / auth / router 璇箟銆俓n"
+            "`architecture_contract` 至少包含锛歕n"
+            "1. `backend_framework`: `fastapi` 鎴?`flask`\n"
+            "2. `orm_mode`: `sqlalchemy_session` 鎴?`flask_sqlalchemy`\n"
+            "3. `auth_mode`: `jwt_header` / `flask_login_session` / `none`\n"
+            "4. `router_mode`: `fastapi_apirouter` 鎴?`flask_blueprint`\n"
+            "5. `entrypoint_mode`: `uvicorn_app` 鎴?`flask_app_factory`\n"
+            "6. `package_layout`: `flat_modules` 鎴?`package_src`\n"
+            "7. `import_style`: `sibling_import` 鎴?`package_import`\n"
+            "濡傛灉閫夋嫨 `fastapi`锛屽垯涓嶅緱鍑虹幇 `Blueprint`銆乣Flask-Login`銆乣Flask-SQLAlchemy` 绛夋绱犮€俓n"
+            "濡傛灉閫夋嫨 `flask`锛屽垯涓嶅緱鍑虹幇 `APIRouter`銆乣Depends(get_db)`銆乣FastAPI` 绛夋绱犮€俓n"
+            "濡傛灉 `package_layout=flat_modules`锛屽垯涓嶅緱浣跨敤 `from src.xxx import ...` 杩欑被鍖呭紡瀵煎叆銆俓n"
+        )
 
     def _generate_project_spec(self, user_requirement: str, plan_md: str = None,
                                playbook_hint: str = "") -> dict:
@@ -47,6 +103,7 @@ class ManagerAgent:
         - playbook_hint: Playbook 铁律摘要，防止规划出被禁止的技术栈
         """
         logger.info("📋 Manager 正在生成/更新项目规划书...")
+        self._reset_spec_generation_state()
         
         # 检查是否已有规划书
         existing_spec_events = get_recent_events(
@@ -89,9 +146,13 @@ class ManagerAgent:
         
         user_prompt = f"主人的开发需求：\n{user_requirement}\n请输出项目规划书 JSON。"
         
+        system_prompt += self._route_module_contract_prompt()
+        system_prompt += self._architecture_contract_prompt()
+
         try:
             raw_response = self.llm_client.chat_completion(
-                enable_thinking=False,
+                enable_thinking=self.enable_thinking,
+                reasoning_effort=self._reasoning_effort,
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -99,26 +160,22 @@ class ManagerAgent:
                 ]
             )
             json_str = raw_response.content
+            self.last_spec_raw_response = json_str
             if "```json" in json_str:
                 json_str = json_str.split("```json")[1].split("```")[0].strip()
             elif "```" in json_str:
                 json_str = json_str.split("```")[1].split("```")[0].strip()
             
             spec = json.loads(json_str)
+            self.last_raw_spec = copy.deepcopy(spec)
+
+            # ===== M-1e: 合同自检 =====
+            spec = self._validate_and_fix_spec(spec, system_prompt)
+
             spec_text = json.dumps(spec, ensure_ascii=False, indent=2)
             
-            # upsert 语义：删旧写新
-            from sqlalchemy import text as sql_text
-            from core.database import ScopedSession, SessionEvent
-            session = ScopedSession()
-            try:
-                session.query(SessionEvent).filter(
-                    SessionEvent.project_id == self.project_id,
-                    SessionEvent.event_type == "project_spec"
-                ).delete()
-                session.commit()
-            finally:
-                ScopedSession.remove()
+            # upsert 语义：删旧写新（通过 database API，不直接操作 ORM）
+            delete_events_by_type(self.project_id, "project_spec")
             
             append_event("manager", "project_spec", spec_text, project_id=self.project_id)
             
@@ -129,9 +186,12 @@ class ManagerAgent:
             
         except json.JSONDecodeError as e:
             logger.error(f"规划书 JSON 解析失败: {e}")
+            self.last_spec_parse_error = str(e)
             return {}
         except Exception as e:
-            logger.error(f"规划书生成异常: {e}")
+            import traceback
+            logger.error(f"规划书生成异常: {e}\n{traceback.format_exc()}")
+            self.last_spec_parse_error = str(e)
             return {}
 
     def _generate_spec_from_scan(self, scan_result: dict) -> dict:
@@ -140,6 +200,7 @@ class ManagerAgent:
         LLM 只负责填空 10%：module_graph, naming_conventions, key_decisions。
         """
         logger.info("📋 Manager 正在从扫描结果合成项目规划书...")
+        self._reset_spec_generation_state()
         global_broadcaster.emit_sync("Manager", "spec_from_scan_start",
             "🔍 正在从扫描结果合成项目规划书...")
 
@@ -198,11 +259,14 @@ class ManagerAgent:
             scan_summary=scan_summary,
             key_files_code=key_files_text,
         )
+        system_prompt += self._route_module_contract_prompt()
+        system_prompt += self._architecture_contract_prompt()
         user_prompt = "请根据扫描结果生成项目规划书 JSON。"
 
         try:
             raw_response = self.llm_client.chat_completion(
-                enable_thinking=False,
+                enable_thinking=self.enable_thinking,
+                reasoning_effort=self._reasoning_effort,
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -210,12 +274,18 @@ class ManagerAgent:
                 ]
             )
             json_str = raw_response.content
+            self.last_spec_raw_response = json_str
             if "```json" in json_str:
                 json_str = json_str.split("```json")[1].split("```")[0].strip()
             elif "```" in json_str:
                 json_str = json_str.split("```")[1].split("```")[0].strip()
 
             spec = json.loads(json_str)
+            self.last_raw_spec = copy.deepcopy(spec)
+
+            # ===== M-1e: 合同自检（逆向规划书同样校验） =====
+            spec = self._validate_and_fix_spec(spec, system_prompt)
+
             logger.info(f"✅ 逆向规划书合成完毕: {spec.get('project_name', '?')}")
             global_broadcaster.emit_sync("Manager", "spec_from_scan_done",
                 f"✅ 逆向规划书合成完毕: {spec.get('project_name', '?')}", {"spec": spec})
@@ -223,10 +293,54 @@ class ManagerAgent:
 
         except json.JSONDecodeError as e:
             logger.error(f"逆向规划书 JSON 解析失败: {e}")
+            self.last_spec_parse_error = str(e)
             return {}
         except Exception as e:
             logger.error(f"逆向规划书合成异常: {e}")
+            self.last_spec_parse_error = str(e)
             return {}
+
+    def _validate_and_fix_spec(self, spec: dict, original_system_prompt: str = "") -> dict:
+        """
+        M-1e: 合同自检 + 可选的单轮 LLM 修正。
+
+        流程：
+        1. 运行确定性校验器 validate_spec()
+        2. 如果有 warning/error → 通知前端 → LLM 尝试修正一轮
+        3. 如果无问题 → 直接返回原 spec
+        """
+        try:
+            spec = normalize_spec(spec)
+            spec = compile_spec(spec)
+        except Exception as e:
+            import traceback
+            logger.error(f"⚠️ compile_spec 异常（降级跳过编译）: {e}\n{traceback.format_exc()}")
+            # 降级：跳过编译，使用原始 spec 继续
+
+        try:
+            warnings = validate_spec(spec)
+        except Exception as e:
+            import traceback
+            logger.error(f"⚠️ validate_spec 异常（降级跳过校验）: {e}\n{traceback.format_exc()}")
+            warnings = []
+
+        self.last_compiled_spec = copy.deepcopy(spec)
+        self.last_spec_warnings = list(warnings)
+
+        if not warnings:
+            global_broadcaster.emit_sync("Manager", "spec_validated",
+                "✅ 规划书合同自检通过，零矛盾")
+            return spec
+
+        # 通知前端有矛盾
+        logger.warning(f"⚠️ [SpecValidator] 检出 {len(warnings)} 条合同矛盾，已记录供后续规避（跳过 LLM 修正）")
+        global_broadcaster.emit_sync("Manager", "spec_validation_warning",
+            f"⚠️ 规划书检出 {len(warnings)} 条合同矛盾，已记录供后续规避",
+            {"warnings": [repr(w) for w in warnings]})
+
+        return spec
+    def has_blocking_spec_validation(self) -> bool:
+        return has_blocking_warnings(self.last_spec_warnings)
 
     def plan_tasks(self, user_requirement: str, project_spec: dict = None,
                    manager_playbook: str = "", complex_files_hint: str = "",
@@ -249,7 +363,7 @@ class ManagerAgent:
         experience_str = "\n".join([e["content"] for e in past_experience]) if past_experience else "无相关历史经验。"
 
         # 3. 构造环境变量声明
-        is_new_project = "新建项目" in self.project_id or self.project_id == "default_project"
+        is_new_project = "新建项目" in self.project_id or "new_project" in self.project_id or self.project_id == "default_project"
         if is_new_project:
             env_context = "【项目环境】\n这是全新项目。项目名称已在规划书中确定。请专注于拆解任务列表，JSON 中的 `project_name` 使用规划书中的名称即可。"
         else:
@@ -306,7 +420,8 @@ class ManagerAgent:
         try:
             # Planner 不使用任何工具，只输出纯文本 JSON
             raw_response = self.llm_client.chat_completion(
-                enable_thinking=False,
+                enable_thinking=self.enable_thinking,
+                reasoning_effort=self._reasoning_effort,
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -377,7 +492,8 @@ class ManagerAgent:
 
         try:
             raw_response = self.llm_client.chat_completion(
-                enable_thinking=False,
+                enable_thinking=self.enable_thinking,
+                reasoning_effort=self._reasoning_effort,
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -428,6 +544,8 @@ class ManagerAgent:
             + f"\n\n═══ P1 — 项目契约 ═══\n{spec_str}"
             + f"\n\n【当前模块组信息 — 你只需要规划这个模块组内的文件】\n{group_str}"
             + f"\n\n⚠️ 重要：你只需要为以下文件创建 tasks: {group_files}"
+            + "\n⚠️ dependencies 字段只允许引用当前模块组内的 task_id 或 target_file。"
+            + "\n禁止在 task.dependencies 中写入 group_1/group_2 等模块组 ID，跨组顺序由 module_group.dependencies 表达。"
             + f"\n不要为其他模块组的文件创建 task！"
         )
         user_prompt = (
@@ -437,7 +555,8 @@ class ManagerAgent:
 
         try:
             raw_response = self.llm_client.chat_completion(
-                enable_thinking=False,
+                enable_thinking=self.enable_thinking,
+                reasoning_effort=self._reasoning_effort,
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -469,8 +588,147 @@ class ManagerAgent:
             logger.error(f"❌ [两阶段] Stage 2 [{group_id}] 失败: {e}")
             return []
 
+    def _normalize_patch_target_file(self, base_dir: str, raw_file: Any,
+                                     existing_files: set) -> str:
+        """将 TechLead verdict 中的文件路径归一化为项目内相对路径。"""
+        if not raw_file:
+            return ""
+
+        text = str(raw_file).strip().strip("`\"'")
+        if not text:
+            return ""
+
+        base_abs = os.path.abspath(base_dir)
+        text = text.replace("\\", "/")
+
+        if os.path.isabs(text):
+            abs_path = os.path.abspath(text)
+            try:
+                if os.path.commonpath([base_abs, abs_path]) != base_abs:
+                    return ""
+            except ValueError:
+                return ""
+            rel = os.path.relpath(abs_path, base_abs).replace("\\", "/")
+        else:
+            rel = text.lstrip("./")
+            marker = f"/projects/{self.project_id}/"
+            if marker in rel:
+                rel = rel.split(marker, 1)[1]
+            prefix = f"{self.project_id}/"
+            if rel.startswith(prefix):
+                rel = rel[len(prefix):]
+
+            abs_path = os.path.abspath(os.path.join(base_abs, rel))
+            try:
+                if os.path.commonpath([base_abs, abs_path]) != base_abs:
+                    return ""
+            except ValueError:
+                return ""
+
+        rel = rel.replace("\\", "/")
+        if rel.startswith("../") or rel == "..":
+            return ""
+        if existing_files and rel not in existing_files:
+            lower_map = {path.lower(): path for path in existing_files}
+            rel = lower_map.get(rel.lower(), "")
+        elif not existing_files and not os.path.isfile(os.path.join(base_abs, rel)):
+            return ""
+        return rel
+
+    def _build_tech_lead_patch_plan(self, user_requirement: str,
+                                    tech_lead_diagnosis: dict,
+                                    base_dir: str,
+                                    existing_files: List[str]) -> Optional[dict]:
+        """把 TechLead 结构化 verdict 直接适配成 Patch task，跳过二次 LLM 规划。"""
+        if not tech_lead_diagnosis or not tech_lead_diagnosis.get("fix_instruction"):
+            return None
+
+        existing_set = set(existing_files or [])
+        root_cause = str(tech_lead_diagnosis.get("root_cause", "")).strip()
+        fix_instruction = str(tech_lead_diagnosis.get("fix_instruction", "")).strip()
+        guilty_file = tech_lead_diagnosis.get("guilty_file", "")
+        confidence = tech_lead_diagnosis.get("confidence", 0.0)
+        recommended = tech_lead_diagnosis.get("recommended_target_files", []) or []
+
+        # TechLead 已给出有罪文件时，Patch 快车道只生成一个写任务。
+        # recommended_target_files 只能作为只读上下文，避免把单点修复扩散到无关组件。
+        if guilty_file:
+            raw_targets = [guilty_file]
+        elif isinstance(recommended, str):
+            raw_targets = [recommended]
+        else:
+            raw_targets = list(recommended)
+
+        targets = []
+        seen = set()
+        for raw_target in raw_targets:
+            target = self._normalize_patch_target_file(base_dir, raw_target, existing_set)
+            if target and target not in seen:
+                seen.add(target)
+                targets.append(target)
+
+        if not targets:
+            logger.warning(
+                "[Patch Mode] TechLead 快车道未找到有效目标文件: guilty=%s recommended=%s",
+                guilty_file, recommended,
+            )
+            return None
+
+        tasks = []
+        for idx, target_file in enumerate(targets, start=1):
+            readonly_context = ""
+            if guilty_file and recommended:
+                if isinstance(recommended, str):
+                    recommended_list = [recommended]
+                else:
+                    recommended_list = list(recommended)
+                context_files = [
+                    item for item in recommended_list
+                    if item and self._normalize_patch_target_file(base_dir, item, existing_set) != target_file
+                ]
+                if context_files:
+                    readonly_context = (
+                        "\n\n【只读参考文件】\n"
+                        f"{', '.join(context_files)}\n"
+                        "这些文件不得作为本轮写目标。"
+                    )
+            description = (
+                "【Patch Mode TechLead 快车道】\n"
+                f"用户需求:\n{user_requirement}\n\n"
+                f"TechLead 置信度: {confidence:.0%}\n"
+                f"有罪文件: {guilty_file}\n\n"
+                f"【根因】\n{root_cause}\n\n"
+                f"【精确修复指令】\n{fix_instruction}\n\n"
+                f"{readonly_context}"
+                f"只允许修改 `{target_file}`。必须优先使用 Editor 的 "
+                "`start_line/end_line` 行号定位完成局部修复；禁止全量重建项目。"
+            )
+            tasks.append({
+                "task_id": f"patch_tl_{idx}",
+                "target_file": target_file,
+                "description": description,
+                "dependencies": [],
+                "task_type": "weld",
+                "draft_action": "modify",
+                "write_targets": [target_file],
+            })
+
+        plan = {
+            "project_name": self.project_id,
+            "architecture_summary": "TechLead 白盒诊断定向修复",
+            "tasks": tasks,
+            "patch_context": {
+                "source": "tech_lead_fast_lane",
+                "confidence": confidence,
+                "guilty_file": guilty_file,
+            },
+        }
+        logger.info("[Patch Mode] TechLead 快车道生成 %d 个任务: %s", len(tasks), targets)
+        return plan
+
     def plan_patch(self, user_requirement: str, project_spec: str = "",
-                   playbook_hint: str = "") -> dict:
+                   playbook_hint: str = "", pm_analysis: str = "",
+                   tech_lead_diagnosis: dict = None) -> dict:
         """
         Patch Mode 精简规划：读取项目文件树 + Observer 骨架，
         只规划需要修改的文件（跳过 Spec 生成）。
@@ -479,9 +737,14 @@ class ManagerAgent:
             user_requirement: 修改需求描述
             project_spec: 项目规划书文本（可选，提供架构上下文）
             playbook_hint: Playbook 核心铁律摘要（可选，防止修复方案与 Reviewer 冲突）
+            pm_analysis: PM 的详细影响分析（可选，包含精确的文件/行号/修改映射）
+            tech_lead_diagnosis: TechLead 前置调查结果（可选，来自 Engine）
         """
-        logger.info("⚡ [Patch Mode] Manager 精简规划启动...")
-        global_broadcaster.emit_sync("Manager", "patch_plan_start", "Patch Mode: 分析需修改的文件...")
+        has_tech_lead = bool(tech_lead_diagnosis and tech_lead_diagnosis.get("fix_instruction"))
+        diag_source = "TechLead 白盒调查" if has_tech_lead else "PM 分析"
+        logger.info(f"⚡ [Patch Mode] Manager 精简规划启动... (诊断源: {diag_source})")
+        global_broadcaster.emit_sync("Manager", "patch_plan_start",
+            f"Patch Mode: 分析需修改的文件...（{diag_source}）")
 
         # 1. 读取项目文件树
         base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "projects", self.project_id))
@@ -494,6 +757,22 @@ class ManagerAgent:
                     rel = os.path.relpath(os.path.join(root, f), base_dir).replace("\\", "/")
                     existing_files.append(rel)
         file_tree = "\n".join([f"- {f}" for f in existing_files]) if existing_files else "目录暂空。"
+
+        if has_tech_lead:
+            fast_plan = self._build_tech_lead_patch_plan(
+                user_requirement=user_requirement,
+                tech_lead_diagnosis=tech_lead_diagnosis,
+                base_dir=base_dir,
+                existing_files=existing_files,
+            )
+            if fast_plan:
+                global_broadcaster.emit_sync(
+                    "Manager",
+                    "patch_plan_ready",
+                    f"Patch Mode: TechLead 快车道生成 {len(fast_plan['tasks'])} 个文件任务",
+                    {"plan": fast_plan},
+                )
+                return fast_plan
 
         # 2. 提取所有源文件的 Observer 骨架
         skeleton_parts = []
@@ -525,17 +804,56 @@ class ManagerAgent:
         if playbook_hint:
             system_prompt += f"\n\n【编码铁律（Reviewer 审查依据，修复方案不得违反）】\n{playbook_hint}"
 
+        # Phase 2.7: 注入 PM 影响分析作为 P0 约束
+        if pm_analysis:
+            system_prompt += (
+                f"\n\n═══ P0 — PM 影响分析（最高优先级，必须严格采纳！）═══\n"
+                f"以下是 PM 经过多次 tool-use 读取源代码后给出的精确修改指令。\n"
+                f"你必须将这些精确修改指令**逐条写入每个 task 的 description 中**，\n"
+                f"让 Coder 明确知道具体改哪一行、改什么值。禁止用模糊描述（如'改为深色主题'）！\n\n"
+                f"{pm_analysis[:4000]}"
+            )
+            logger.info(f"📋 [Patch Mode] PM 影响分析已注入 ({len(pm_analysis)} 字符)")
+
+        # v4.4: TechLead 白盒调查结果（最高优先级，覆盖 PM 分析）
+        if has_tech_lead:
+            tl_fix = tech_lead_diagnosis.get("fix_instruction", "")
+            tl_root_cause = tech_lead_diagnosis.get("root_cause", "")
+            tl_guilty = tech_lead_diagnosis.get("guilty_file", "")
+            tl_confidence = tech_lead_diagnosis.get("confidence", 0.0)
+            tl_recommended = tech_lead_diagnosis.get("recommended_target_files", [])
+            system_prompt += (
+                f"\n\n═══ P0+ — TechLead 白盒调查结果（最高优先级，必须采纳！）═══\n"
+                f"TechLead 已通过 read_file/grep_project 实际读取代码，输出以下行级精确诊断：\n"
+                f"【置信度】{tl_confidence:.0%}\n"
+                f"【根因】{tl_root_cause}\n"
+                f"【修复指令】{tl_fix}\n"
+                f"【有罪文件】{tl_guilty}\n"
+            )
+            if tl_recommended:
+                system_prompt += f"【建议修改文件】{', '.join(tl_recommended)}\n"
+            system_prompt += (
+                "\n你必须将以上 TechLead 的精确修复指令原文写入对应 task 的 description 中，"
+                "让 Coder 能够直接按行号修改。"
+            )
+            logger.info(
+                "📋 [Patch Mode] TechLead 诊断已注入: guilty=%s, confidence=%.2f",
+                tl_guilty, tl_confidence,
+            )
+
         user_prompt = f"主人的修改需求：\n{user_requirement}\n请严格按照 JSON Schema 输出。"
 
-        # 4. 调用 LLM
+        # 4. 调用 LLM（max_tokens 保底，防止 system prompt 过长时输出被截断）
         try:
             raw_response = self.llm_client.chat_completion(
-                enable_thinking=False,
+                enable_thinking=self.enable_thinking,
+                reasoning_effort=self._reasoning_effort,
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
-                ]
+                ],
+                max_tokens=4096,
             )
 
             json_str = raw_response.content
@@ -544,7 +862,18 @@ class ManagerAgent:
             elif "```" in json_str:
                 json_str = json_str.split("```")[1].split("```")[0].strip()
 
-            plan = json.loads(json_str)
+            try:
+                plan = json.loads(json_str)
+            except json.JSONDecodeError:
+                # v4.4: 截断 JSON 自动修复 — 补齐缺失的闭合括号
+                logger.warning("[Patch Mode] JSON 解析失败，尝试截断修复...")
+                repaired = self._repair_truncated_json(json_str)
+                if repaired:
+                    plan = repaired
+                    logger.info("[Patch Mode] 截断 JSON 修复成功")
+                else:
+                    logger.error(f"[Patch Mode] Manager 返回非 JSON: {raw_response.content[:300]}")
+                    return {"project_name": self.project_id, "tasks": []}
 
             plan["project_name"] = self.project_id  # 强制锁定
             if "tasks" not in plan:
@@ -566,11 +895,644 @@ class ManagerAgent:
             return plan
 
         except json.JSONDecodeError:
-            logger.error(f"[Patch Mode] Manager 返回非 JSON: {raw_response.content[:200]}")
+            logger.error(f"[Patch Mode] Manager 返回非 JSON: {raw_response.content[:300]}")
             return {"project_name": self.project_id, "tasks": []}
         except Exception as e:
             logger.error(f"[Patch Mode] Manager 规划异常: {e}")
             return {"project_name": self.project_id, "tasks": []}
+
+    @staticmethod
+    def _repair_truncated_json(json_str: str) -> dict | None:
+        """
+        v4.4: 尝试修复被截断的 JSON（LLM 因 max_tokens 截断时常见）。
+        策略：回退到最后一个有效的值边界，然后按 bracket 栈补齐闭合括号。
+        """
+        if not json_str or not json_str.strip():
+            return None
+
+        s = json_str.strip()
+
+        # 确保以 { 开头
+        brace_idx = s.find("{")
+        if brace_idx < 0:
+            return None
+        s = s[brace_idx:]
+
+        # 策略 1: 回退到最后一个完整属性边界
+        # 找最后一个不在未闭合字符串内的 ", }, ], 数字
+        # 如果字符串被截断（奇数个引号），回退到上一个完整的键值对
+        quote_count = s.count('"')
+        if quote_count % 2 != 0:
+            # 奇数引号 = 字符串被截断，回退到最后一个完整的键值对
+            last_complete = -1
+            for marker in ['",', '"}', '"]', '": "', '": [', '": {']:
+                # 找最后一个这样的 marker 之后，如果还有完整的值
+                pass
+            # 简单策略：回退到最后一个 `",` 或 `"}` 或 `"]`
+            for cut in ['",' , '"}', '"]']:
+                idx = s.rfind(cut)
+                if idx > 0:
+                    candidate = s[:idx + len(cut)]
+                    if candidate.count('"') % 2 == 0:
+                        s = candidate
+                        break
+            else:
+                # 彻底截断：去掉最后一个未闭合的键值对
+                last_comma = s.rfind(',')
+                if last_comma > 0:
+                    s = s[:last_comma]
+
+        # 回退尾部非有效 JSON 字符
+        while s and s[-1] not in ('"', '}', ']', '0', '1', '2', '3', '4', '5',
+                                   '6', '7', '8', '9', 'e', 'l', 'u'):
+            s = s[:-1]
+
+        if not s:
+            return None
+
+        # 按 bracket 栈补齐闭合
+        stack = []
+        in_string = False
+        escape = False
+        for ch in s:
+            if escape:
+                escape = False
+                continue
+            if ch == '\\':
+                escape = True
+                continue
+            if ch == '"' and not escape:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch in ('{', '['):
+                stack.append(ch)
+            elif ch == '}':
+                if stack and stack[-1] == '{':
+                    stack.pop()
+            elif ch == ']':
+                if stack and stack[-1] == '[':
+                    stack.pop()
+
+        # 补齐
+        closing = []
+        for bracket in reversed(stack):
+            if bracket == '{':
+                closing.append('}')
+            elif bracket == '[':
+                closing.append(']')
+
+        repaired_str = s + ''.join(closing)
+
+        try:
+            return json.loads(repaired_str)
+        except json.JSONDecodeError:
+            # 二次尝试：截断到最后一个完整的对象/数组元素
+            # 找最后一个 }, 或 ], 然后重新补齐
+            for cut_marker in ['},', '],', '}', ']']:
+                last_idx = repaired_str.rfind(cut_marker)
+                if last_idx > 0:
+                    truncated = repaired_str[:last_idx + len(cut_marker)]
+                    # 重新计算 bracket 栈
+                    stack2 = []
+                    in_str2 = False
+                    esc2 = False
+                    for ch in truncated:
+                        if esc2:
+                            esc2 = False
+                            continue
+                        if ch == '\\':
+                            esc2 = True
+                            continue
+                        if ch == '"' and not esc2:
+                            in_str2 = not in_str2
+                            continue
+                        if in_str2:
+                            continue
+                        if ch in ('{', '['):
+                            stack2.append(ch)
+                        elif ch == '}' and stack2 and stack2[-1] == '{':
+                            stack2.pop()
+                        elif ch == ']' and stack2 and stack2[-1] == '[':
+                            stack2.pop()
+                    closing2 = []
+                    for b in reversed(stack2):
+                        closing2.append('}' if b == '{' else ']')
+                    try:
+                        return json.loads(truncated + ''.join(closing2))
+                    except json.JSONDecodeError:
+                        continue
+            return None
+
+    def plan_continue(self, failure_context: Dict[str, Any], open_issues_text: str = "",
+                       tech_lead_diagnosis: dict = None) -> dict:
+        """
+        Continue Mode：基于上一轮 QA 失败上下文做定向修复。
+
+        v4.4: TechLead 前置调查 — 当 TechLead 已通过 ReAct 工具调用完成白盒
+        排障时，直接消费其行级精确修复指令，跳过 Manager 自己的 LLM 诊断。
+        TechLead 调查失败时降级为 v4.3 LLM 诊断。
+
+        Args:
+            failure_context: 上一轮 QA 失败上下文
+            open_issues_text: Phase 5.5 烂账账本的格式化文本（含回归检测标记）
+            tech_lead_diagnosis: TechLead 前置调查结果（可选，来自 Engine）
+        """
+        has_tech_lead = bool(tech_lead_diagnosis and tech_lead_diagnosis.get("fix_instruction"))
+        diag_source = "TechLead 白盒调查" if has_tech_lead else "LLM 诊断"
+        logger.info(f"[Continue Mode] Manager 定向修复规划启动（v4.4 {diag_source}）")
+        global_broadcaster.emit_sync(
+            "Manager",
+            "continue_plan_start",
+            f"Continue Mode: 正在读取代码并诊断 bug 根因...（{diag_source}）",
+        )
+
+        if not failure_context:
+            return {"project_name": self.project_id, "architecture_summary": "缺少失败上下文", "tasks": []}
+
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "projects", self.project_id))
+        existing_files = set()
+        if os.path.isdir(base_dir):
+            ignore = {'.sandbox', '.git', '__pycache__', '.venv', 'node_modules', '.idea', '.astrea'}
+            for root, dirs, files in os.walk(base_dir):
+                dirs[:] = [d for d in dirs if d not in ignore]
+                for name in files:
+                    rel = os.path.relpath(os.path.join(root, name), base_dir).replace("\\", "/")
+                    existing_files.add(rel)
+
+        def _as_files(value: Any) -> List[str]:
+            files: List[str] = []
+            if isinstance(value, str):
+                files.append(value)
+            elif isinstance(value, dict):
+                for key in ("target_file", "file", "path", "provider_file", "importer_file"):
+                    if value.get(key):
+                        files.append(str(value[key]))
+            elif isinstance(value, list):
+                for item in value:
+                    files.extend(_as_files(item))
+            return files
+
+        raw_files: List[str] = []
+        raw_files.extend(_as_files(failure_context.get("repair_scope")))
+        raw_files.extend(_as_files(failure_context.get("failed_files")))
+
+        allowed_files: List[str] = []
+        seen = set()
+        for file_path in raw_files:
+            rel = file_path.replace("\\", "/").lstrip("/")
+            if not rel or rel in seen:
+                continue
+            if existing_files and rel not in existing_files:
+                continue
+            seen.add(rel)
+            allowed_files.append(rel)
+
+        # 提取失败/通过端点
+        endpoint_results = failure_context.get("endpoint_results") or []
+        failed_endpoints = [
+            ep for ep in endpoint_results
+            if isinstance(ep, dict) and not ep.get("ok")
+        ]
+        passed_endpoints = [
+            ep for ep in endpoint_results
+            if isinstance(ep, dict) and ep.get("ok")
+        ]
+        endpoint_summary = "; ".join(
+            f"{ep.get('method', '?')} {ep.get('url', '?')} -> {ep.get('status_code', '?')} {ep.get('detail', '')}".strip()
+            for ep in failed_endpoints[:6]
+        ) or "上一轮 QA 未提供具体失败端点"
+        passed_summary = "\n".join(
+            f"  ✅ {ep.get('method', '?')} {ep.get('url', '?')} -> {ep.get('status_code', '?')}"
+            for ep in passed_endpoints[:8]
+        )
+        feedback = str(failure_context.get("feedback") or failure_context.get("error_message") or "")[:1500]
+        error_type = str(failure_context.get("error_type") or "integration_failure")
+
+        # 读取修复范围内的文件源码
+        file_codes: Dict[str, str] = {}
+        for target_file in allowed_files:
+            fpath = os.path.join(base_dir, target_file)
+            if os.path.isfile(fpath):
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        file_codes[target_file] = f.read()[:4000]
+                except Exception:
+                    pass
+
+        # ============================================================
+        # v4.4: 诊断阶段 — TechLead 优先，降级为 LLM
+        # ============================================================
+        diagnosis_results: Dict[str, str] = {}  # file -> 诊断结果
+
+        if has_tech_lead:
+            # === TechLead 已完成白盒调查，直接消费其精确修复指令 ===
+            tl_fix = tech_lead_diagnosis.get("fix_instruction", "")
+            tl_root_cause = tech_lead_diagnosis.get("root_cause", "")
+            tl_guilty = tech_lead_diagnosis.get("guilty_file", "")
+            tl_confidence = tech_lead_diagnosis.get("confidence", 0.0)
+            tl_recommended = tech_lead_diagnosis.get("recommended_target_files", [])
+
+            # 将 TechLead 诊断结果映射到 diagnosis_results
+            # guilty_file 优先，其次 recommended_target_files，最后 allowed_files
+            target_files_for_diag = []
+            if tl_guilty:
+                target_files_for_diag.append(tl_guilty)
+            for rf in tl_recommended:
+                if rf and rf not in target_files_for_diag:
+                    target_files_for_diag.append(rf)
+            # 确保 allowed_files 中的文件也能获得诊断
+            for af in allowed_files:
+                if af not in target_files_for_diag:
+                    target_files_for_diag.append(af)
+
+            for fname in target_files_for_diag:
+                if fname in allowed_files or fname == tl_guilty:
+                    diagnosis_results[fname] = (
+                        f"【TechLead 白盒调查结果 (置信度: {tl_confidence:.0%})】\n"
+                        f"【根因】{tl_root_cause}\n"
+                        f"【修复指令】{tl_fix}\n"
+                        f"【有罪文件】{tl_guilty}"
+                    )
+
+            logger.info(
+                "[Continue Mode] 使用 TechLead 诊断: guilty=%s, confidence=%.2f, targets=%s",
+                tl_guilty, tl_confidence, list(diagnosis_results.keys()),
+            )
+
+        elif file_codes and failed_endpoints:
+            # === 降级: Manager LLM 单次诊断（v4.3 原有逻辑） ===
+            code_sections = "\n\n".join(
+                f"=== {fname} ===\n```\n{code}\n```"
+                for fname, code in file_codes.items()
+            )
+            diag_prompt = (
+                "你是一个顶级 Debug 专家。以下代码存在导致 QA 测试失败的 bug，请诊断根因。\n\n"
+                f"【失败端点】\n{endpoint_summary}\n\n"
+                f"【QA 反馈】\n{feedback}\n\n"
+                f"【相关源码】\n{code_sections}\n\n"
+            )
+            if passed_summary:
+                diag_prompt += f"【已通过端点 — 修复时不得破坏】\n{passed_summary}\n\n"
+            if open_issues_text:
+                diag_prompt += f"【历史问题台账】\n{open_issues_text}\n\n"
+
+            diag_prompt += (
+                "请对每个失败端点逐一分析根因，并为每个需要修复的文件输出精确的修复指令。\n"
+                "输出格式（严格 JSON，不要 Markdown）：\n"
+                "{\n"
+                '  "diagnosis": [\n'
+                '    {\n'
+                '      "file": "routes.py",\n'
+                '      "root_cause": "第 109 行 delete_expense 视图函数名与第 7 行从 models 导入的 delete_expense 同名，导致第 123 行递归调用自身而非 models.delete_expense",\n'
+                '      "fix_instruction": "将视图函数 delete_expense 重命名为 handle_delete_expense，或在第 123 行改为 from models import delete_expense as model_delete_expense 并调用 model_delete_expense",\n'
+                '      "affected_endpoints": ["POST /delete/<id>"]\n'
+                '    }\n'
+                '  ]\n'
+                "}\n"
+            )
+
+            try:
+                logger.info("[Continue Mode] TechLead 未提供诊断，降级为 Manager LLM 诊断...")
+                global_broadcaster.emit_sync("Manager", "diagnosing",
+                    "🔍 Manager 正在分析代码，诊断 bug 根因...（降级模式）")
+                diag_response = self.llm_client.chat_completion(
+                    enable_thinking=self.enable_thinking,
+                    reasoning_effort=self._reasoning_effort,
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": "你是顶级 Debug 专家。只输出 JSON 诊断结果，不要解释。"},
+                        {"role": "user", "content": diag_prompt},
+                    ],
+                )
+                diag_text = diag_response.content
+                # 清洗 JSON
+                if "```json" in diag_text:
+                    diag_text = diag_text.split("```json")[1].split("```")[0].strip()
+                elif "```" in diag_text:
+                    diag_text = diag_text.split("```")[1].split("```")[0].strip()
+
+                diag_data = json.loads(diag_text)
+                for item in diag_data.get("diagnosis", []):
+                    fname = item.get("file", "")
+                    root_cause = item.get("root_cause", "")
+                    fix_instruction = item.get("fix_instruction", "")
+                    affected = ", ".join(item.get("affected_endpoints", []))
+                    if fname:
+                        diagnosis_results[fname] = (
+                            f"【根因诊断】{root_cause}\n"
+                            f"【修复指令】{fix_instruction}\n"
+                            f"【影响端点】{affected}"
+                        )
+                logger.info("[Continue Mode] LLM 诊断完成: %d 个文件有诊断结果", len(diagnosis_results))
+                for fname, diag in diagnosis_results.items():
+                    logger.info("  📋 %s: %s", fname, diag[:120])
+
+            except json.JSONDecodeError as e:
+                logger.warning(f"[Continue Mode] LLM 诊断结果 JSON 解析失败: {e}，降级为无诊断模式")
+            except Exception as e:
+                logger.warning(f"[Continue Mode] LLM 诊断调用异常: {e}，降级为无诊断模式")
+
+        # 烂账账本
+        issues_hint = ""
+        if open_issues_text:
+            issues_hint = f"\n\n【历史问题台账】\n{open_issues_text}"
+            logger.info("[Continue Mode] 烂账账本已注入任务描述 (%d 字符)", len(open_issues_text))
+
+        # 构建任务
+        tasks = []
+        for idx, target_file in enumerate(allowed_files, start=1):
+            desc_parts = [
+                f"【修复任务】修复 {target_file} 中导致 QA 测试失败的 bug。",
+                f"\n错误类型: {error_type}",
+                f"\n失败端点: {endpoint_summary}",
+            ]
+
+            # v4.4: 注入诊断结果（TechLead 白盒调查 或 LLM 诊断）
+            diag = diagnosis_results.get(target_file, "")
+            if diag:
+                diag_label = "TechLead 白盒调查" if has_tech_lead else "Manager 诊断"
+                desc_parts.append(f"\n\n═══ {diag_label}结果（必须严格按照此指令修复！）═══\n{diag}")
+
+            # 注入 QA 反馈
+            if feedback:
+                desc_parts.append(f"\n\n【QA 错误反馈】\n{feedback}")
+
+            # 注入当前源码
+            code = file_codes.get(target_file, "")
+            if code:
+                desc_parts.append(f"\n\n【{target_file} 当前源码】\n```\n{code}\n```")
+
+            # 已通过端点保护
+            if passed_summary:
+                desc_parts.append(f"\n\n【已通过端点 — 修复时不得破坏】\n{passed_summary}")
+
+            desc_parts.append(f"\n\n本任务只允许修改 {target_file}，禁止扩展到 repair_scope/failed_files 之外。")
+
+            if issues_hint:
+                desc_parts.append(issues_hint)
+
+            tasks.append({
+                "task_id": f"continue_fix_{idx}",
+                "target_file": target_file,
+                "description": "".join(desc_parts),
+                "dependencies": [],
+                "write_targets": [target_file],
+            })
+
+        plan = {
+            "project_name": self.project_id,
+            "architecture_summary": "Continue Mode 定向修复（LLM 诊断）",
+            "tasks": tasks,
+            "continue_context": {
+                "error_type": error_type,
+                "failed_count": failure_context.get("failed_count", len(failed_endpoints)),
+                "allowed_files": allowed_files,
+                "has_diagnosis": bool(diagnosis_results),
+                "diagnosis_source": "tech_lead" if has_tech_lead else "llm",
+            },
+        }
+        logger.info("[Continue Mode] 定向规划完成: %s 个任务, files=%s, 诊断=%s",
+                     len(tasks), allowed_files, bool(diagnosis_results))
+        global_broadcaster.emit_sync(
+            "Manager",
+            "continue_plan_ready",
+            f"Continue Mode: {len(tasks)} 个定向修复任务（已完成 LLM 诊断）",
+            {"plan": plan},
+        )
+        return plan
+
+
+
+    def plan_extend(
+        self,
+        new_module_requirement: str,
+        existing_context: dict,
+        manager_playbook: str = "",
+        replan_feedback: dict | None = None,
+        open_issues_text: str = "",
+    ) -> dict:
+        """
+        Extend Mode：在已有项目基础上规划新增模块。
+        代码层负责再次归一化 LLM 输出，强制落成 new_file / weld 的物理约束。
+
+        Args:
+            open_issues_text: Phase 5.5 烂账账本（含回归标记），注入 Prompt 防止新模块踩旧坑
+        """
+        logger.info("[Extend Mode] Manager 增量规划启动")
+        global_broadcaster.emit_sync(
+            "Manager",
+            "extend_plan_start",
+            "Extend Mode: 正在基于已有项目上下文规划新增模块...",
+        )
+
+        existing_context = existing_context or {}
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "projects", self.project_id))
+        file_tree = [
+            str(path).replace("\\", "/").lstrip("/")
+            for path in (existing_context.get("file_tree") or [])
+            if path
+        ]
+        existing_files = set(file_tree)
+        route_blacklist = sorted({
+            str(item.get("path", "")).strip()
+            for item in (existing_context.get("existing_routes") or [])
+            if isinstance(item, dict) and str(item.get("path", "")).strip()
+        })
+
+        skeleton_targets: List[str] = []
+        entrypoint_file = str(
+            (existing_context.get("architecture_contract") or {}).get("entrypoint_file") or ""
+        ).replace("\\", "/").lstrip("/")
+        if entrypoint_file:
+            skeleton_targets.append(entrypoint_file)
+        for item in (existing_context.get("existing_routes") or []) + (existing_context.get("existing_models") or []):
+            if isinstance(item, dict) and item.get("file"):
+                skeleton_targets.append(str(item["file"]).replace("\\", "/").lstrip("/"))
+        for path in file_tree:
+            if any(token in path.lower() for token in ("route", "model", "app.py", "main.py", "server.py", "template")):
+                skeleton_targets.append(path)
+
+        deduped_targets: List[str] = []
+        seen_targets = set()
+        for path in skeleton_targets:
+            if not path or path in seen_targets or path not in existing_files:
+                continue
+            seen_targets.add(path)
+            deduped_targets.append(path)
+            if len(deduped_targets) >= 10:
+                break
+
+        file_skeletons = []
+        if os.path.isdir(base_dir):
+            from tools.observer import Observer
+
+            observer = Observer(base_dir)
+            for path in deduped_targets:
+                try:
+                    skeleton = observer.get_skeleton(path)
+                except Exception:
+                    skeleton = ""
+                if skeleton:
+                    file_skeletons.append(f"## {path}\n{skeleton[:2500]}")
+
+        file_tree_text = "\n".join(file_tree[:200])
+        if len(file_tree) > 200:
+            file_tree_text += f"\n... 其余 {len(file_tree) - 200} 个文件省略"
+
+        system_prompt = Prompts.MANAGER_EXTEND_SYSTEM.format(
+            project_id=self.project_id,
+            architecture_contract=json.dumps(
+                existing_context.get("architecture_contract") or {},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            file_tree=file_tree_text or "无",
+            file_skeletons="\n\n".join(file_skeletons) or "无",
+            route_blacklist=json.dumps(route_blacklist, ensure_ascii=False, indent=2),
+            existing_routes=json.dumps(
+                (existing_context.get("existing_routes") or [])[:60],
+                ensure_ascii=False,
+                indent=2,
+            ),
+            existing_models=json.dumps(
+                (existing_context.get("existing_models") or [])[:60],
+                ensure_ascii=False,
+                indent=2,
+            ),
+            entrypoint_imports="\n".join(existing_context.get("entrypoint_imports") or []) or "无",
+            manager_playbook=manager_playbook or "无",
+            replan_feedback=json.dumps(replan_feedback or {}, ensure_ascii=False, indent=2),
+        )
+        # Phase 5.5: 注入烂账账本（回归 + 历史问题）
+        if open_issues_text:
+            system_prompt += (
+                f"\n\n═══ 历史问题台账（烂账账本）═══\n"
+                f"以下是此项目历史轮次中尚未闭环的问题，规划新模块时必须避开这些已知坑点：\n"
+                f"{open_issues_text}\n"
+            )
+            logger.info("[Extend Mode] 烂账账本已注入 Prompt (%d 字符)", len(open_issues_text))
+
+        user_prompt = (
+            f"主人的新增需求：\n{new_module_requirement}\n"
+            "请严格按 JSON Schema 输出，不要 Markdown。"
+        )
+
+        try:
+            raw_response = self.llm_client.chat_completion(
+                enable_thinking=self.enable_thinking,
+                reasoning_effort=self._reasoning_effort,
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+
+            json_str = raw_response.content
+            if "```json" in json_str:
+                json_str = json_str.split("```json")[1].split("```")[0].strip()
+            elif "```" in json_str:
+                json_str = json_str.split("```")[1].split("```")[0].strip()
+
+            plan = json.loads(json_str)
+        except json.JSONDecodeError:
+            logger.error(f"[Extend Mode] Manager 返回非 JSON: {getattr(raw_response, 'content', '')[:200]}")
+            return {"project_name": self.project_id, "architecture_summary": "新增模块规划失败", "tasks": []}
+        except Exception as e:
+            logger.error(f"[Extend Mode] Manager 规划异常: {e}")
+            return {"project_name": self.project_id, "architecture_summary": "新增模块规划失败", "tasks": []}
+
+        plan["project_name"] = self.project_id
+        extend_context = dict(plan.get("extend_context") or {})
+        extend_context["route_blacklist"] = route_blacklist
+
+        raw_tasks = plan.get("tasks") or []
+        normalized_tasks: List[Dict[str, Any]] = []
+        new_files: List[str] = []
+        weld_targets: List[str] = []
+        new_task_ids: List[str] = []
+        seen_task_targets = set()
+
+        for idx, task in enumerate(raw_tasks, start=1):
+            if not isinstance(task, dict):
+                continue
+            target_file = str(task.get("target_file", "")).replace("\\", "/").lstrip("/")
+            if not target_file or target_file in seen_task_targets:
+                continue
+
+            seen_task_targets.add(target_file)
+            item = dict(task)
+            item["task_id"] = str(item.get("task_id") or f"ext_{idx}")
+            item["target_file"] = target_file
+            item["dependencies"] = [str(dep) for dep in (item.get("dependencies") or []) if dep]
+
+            if target_file in existing_files:
+                item["task_type"] = "weld"
+                item["draft_action"] = "modify"
+                item["write_targets"] = [target_file]
+                if target_file not in weld_targets:
+                    weld_targets.append(target_file)
+            else:
+                item["task_type"] = "new_file"
+                item.pop("draft_action", None)
+                item["write_targets"] = [target_file]
+                if target_file not in new_files:
+                    new_files.append(target_file)
+                new_task_ids.append(item["task_id"])
+
+            normalized_tasks.append(item)
+
+        if new_task_ids:
+            for item in normalized_tasks:
+                if item.get("task_type") != "weld":
+                    continue
+                deps = []
+                for dep in list(item.get("dependencies") or []) + new_task_ids:
+                    if dep and dep not in deps:
+                        deps.append(dep)
+                item["dependencies"] = deps
+
+        normalized_routes: List[Dict[str, str]] = []
+        seen_routes = set()
+        for item in extend_context.get("new_routes") or []:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path", "")).strip()
+            if not path:
+                continue
+            method = str(item.get("method", "GET") or "GET").upper()
+            route_file = str(item.get("file", "") or "").replace("\\", "/").lstrip("/")
+            route_key = (method, path, route_file)
+            if route_key in seen_routes:
+                continue
+            seen_routes.add(route_key)
+            normalized_routes.append({
+                "method": method,
+                "path": path,
+                "file": route_file,
+            })
+
+        extend_context["new_files"] = new_files
+        extend_context["weld_targets"] = weld_targets
+        extend_context["new_routes"] = normalized_routes
+        plan["extend_context"] = extend_context
+        plan["tasks"] = normalized_tasks
+
+        logger.info(
+            "[Extend Mode] 规划完成: %s 个任务, new_files=%s, weld_targets=%s",
+            len(normalized_tasks),
+            new_files,
+            weld_targets,
+        )
+        global_broadcaster.emit_sync(
+            "Manager",
+            "extend_plan_ready",
+            f"Extend Mode: {len(normalized_tasks)} 个任务",
+            {"plan": plan},
+        )
+        return plan
 
     def execute_tdd_loop(self, task: Dict[str, Any], final_dir: str = None, task_meta: dict = None) -> Tuple[bool, Dict[str, str]]:
         """
@@ -626,7 +1588,22 @@ class ManagerAgent:
             if current_retry > 0:
                 logger.info(f"🔄 第 {current_retry} 次重试修复 [{task_id}]...")
                 global_broadcaster.emit_sync("Manager", "task_retry", f"子任务 {task_id} 正在进行第 {current_retry} 次重试", {"attempt": current_retry})
-            
+
+            # 🔧 关键修复：每次循环更新 existing_code，确保修复模式能看到真正的代码
+            #   否则 CODER_FIX_SYSTEM prompt 中 current_code 为空，LLM 凭记忆编 search → 永远不匹配
+            latest_code = vfs.get_draft(target_file) or ""
+            if not latest_code and final_dir:
+                disk_path = os.path.join(final_dir, target_file)
+                if os.path.isfile(disk_path):
+                    try:
+                        with open(disk_path, "r", encoding="utf-8") as f:
+                            latest_code = f.read()
+                    except Exception:
+                        pass
+            if task_meta is not None:
+                task_meta["existing_code"] = latest_code
+                task_meta["retry_count"] = current_retry
+
             self.coder.generate_code(target_file, description, feedback, task_meta=task_meta)
             recalled_ids = getattr(self.coder, '_last_recalled_ids', [])
             global_broadcaster.emit_sync("Manager", "vfs_update", f"VFS 文件树更新暂存目标: {target_file}", {"vfs": vfs.get_all_vfs()})
@@ -743,7 +1720,7 @@ class ManagerAgent:
         # 4. 解析输出目录并执行动态重命名
         project_name = plan.get('project_name', 'Unnamed_Project').replace(" ", "_")
         
-        if "新建项目" in self.project_id or "default_project" == self.project_id:
+        if "新建项目" in self.project_id or "new_project" in self.project_id or "default_project" == self.project_id:
             old_project_id = self.project_id
             parts = old_project_id.split("_", 2)
             timestamp = f"{parts[0]}_{parts[1]}" if len(parts) >= 2 else time.strftime("%Y%m%d_%H%M%S")

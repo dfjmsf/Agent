@@ -14,7 +14,7 @@ export default function ProjectSelector({
 }) {
   const handleNewProject = async () => {
     try {
-      const data = await createNewProject("新建项目");
+      const data = await createNewProject("new_project");
       const newId = data.project_id;
       onProjectCreated(newId);
       onLog("System", "success", `成功开辟新宇宙: ${newId}`);

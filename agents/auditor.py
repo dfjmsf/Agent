@@ -17,6 +17,9 @@ class AuditorAgent:
     """
     def __init__(self):
         self.model = os.getenv("MODEL_AUDITOR", "qwen3-max")
+        _et, _re = default_llm.parse_thinking_config(os.getenv("THINKING_AUDITOR", "false"))
+        self.enable_thinking = _et
+        self._reasoning_effort = _re
 
     def audit(self, final_code: str, memories: List[Dict]) -> Dict:
         """
@@ -51,7 +54,13 @@ class AuditorAgent:
         
         try:
             logger.info(f"📋 Auditor 正在审计 {len(memories)} 条记忆的归因...")
-            resp = default_llm.chat_completion(messages, model=self.model, temperature=0.1)
+            resp = default_llm.chat_completion(
+                messages,
+                model=self.model,
+                temperature=0.1,
+                enable_thinking=self.enable_thinking,
+                reasoning_effort=self._reasoning_effort,
+            )
             parsed = self._parse_response(resp.content, memories)
             
             adopted_count = sum(1 for r in parsed["results"] if r["adopted"])

@@ -14,7 +14,9 @@ QA Agent — 持 Skill 下场的集成测试专家
 import os
 import json
 import logging
-from typing import Dict, Optional
+import re
+import ast
+from typing import Dict, Optional, Any, List
 
 from core.llm_client import default_llm
 from core.skill_runner import SkillRunner
@@ -22,7 +24,7 @@ from core.ws_broadcaster import global_broadcaster
 
 logger = logging.getLogger("QAAgent")
 
-MAX_STEPS = 12       # ReAct 循环最大步数（12 步足够完成完整测试流程）
+MAX_STEPS = 16       # ReAct 循环最大步数（per-endpoint 模式需要更多步数）
 FUSE_THRESHOLD = 3   # 连续相同错误 N 次 → 熔断
 
 
@@ -32,24 +34,32 @@ class QAAgent:
     def __init__(self, project_id: str):
         self.project_id = project_id
         self.model = os.getenv("MODEL_QA", "deepseek-chat")
+        _et, _re = default_llm.parse_thinking_config(os.getenv("THINKING_QA", "false"))
+        self.enable_thinking = _et
+        self._reasoning_effort = _re
 
     def run_qa(self, project_spec: str, all_code: Dict[str, str],
-               sandbox_dir: str, venv_python: str = "") -> dict:
+               sandbox_dir: str, venv_python: str = "",
+               focus_endpoints: list = None) -> dict:
         """
         执行 QA 验收测试。
+
+        v4.4: 按需测试 — 有 focus_endpoints 时只测受影响端点 + 回归冒烟。
 
         Args:
             project_spec: Manager 规划书文本
             all_code: {文件名: 代码内容} 字典
             sandbox_dir: 沙盒目录路径
             venv_python: sandbox venv 的 python 路径
+            focus_endpoints: 按需测试的端点列表（如 ["GET /stats", "POST /delete/1"]）
 
         Returns:
             {"passed": bool, "feedback": str, "failed_files": list, "warning": bool}
         """
-        logger.info(f"🧪 [QA Agent] 启动 ReAct 测试循环 ({len(all_code)} 个文件)")
+        mode_hint = f"按需测试 {len(focus_endpoints)} 个端点" if focus_endpoints else "全量测试"
+        logger.info(f"🧪 [QA Agent] 启动 ReAct 测试循环 ({len(all_code)} 个文件, {mode_hint})")
         global_broadcaster.emit_sync("QAAgent", "start",
-            f"🧪 QA Agent 启动: ReAct 模式验证 {len(all_code)} 个文件")
+            f"🧪 QA Agent 启动: {mode_hint}")
 
         # 初始化 SkillRunner
         skill_runner = SkillRunner(
@@ -59,16 +69,19 @@ class QAAgent:
         )
 
         try:
-            return self._react_loop(project_spec, all_code, skill_runner)
+            return self._react_loop(project_spec, all_code, skill_runner,
+                                    focus_endpoints=focus_endpoints)
         finally:
             skill_runner.cleanup()
 
     def _react_loop(self, project_spec: str, all_code: Dict[str, str],
-                    skill_runner: SkillRunner) -> dict:
+                    skill_runner: SkillRunner,
+                    focus_endpoints: list = None) -> dict:
         """ReAct 主循环"""
 
         # 构建初始消息
-        system_prompt = self._build_system_prompt(project_spec, all_code)
+        system_prompt = self._build_system_prompt(project_spec, all_code,
+                                                  focus_endpoints=focus_endpoints)
         user_prompt = self._build_user_prompt(all_code)
 
         messages = [
@@ -103,6 +116,8 @@ class QAAgent:
                     tools=tool_schemas,
                     tool_choice="auto",
                     temperature=0.1,
+                    enable_thinking=self.enable_thinking,
+                    reasoning_effort=self._reasoning_effort,
                 )
             except Exception as e:
                 logger.error(f"❌ [QA Agent] LLM 调用失败: {e}")
@@ -156,7 +171,17 @@ class QAAgent:
                     global_broadcaster.emit_sync("QAAgent",
                         "passed" if passed else "failed",
                         f"{'✅' if passed else '❌'} QA 判定: {feedback[:80]}")
-                    return self._make_result(passed, feedback, failed_files)
+                    return self._make_result(
+                        passed,
+                        feedback,
+                        failed_files,
+                        error_type=arguments.get("error_type", ""),
+                        importer_file=arguments.get("importer_file", ""),
+                        provider_file=arguments.get("provider_file", ""),
+                        missing_symbols=arguments.get("missing_symbols", []),
+                        repair_scope=arguments.get("repair_scope", []),
+                        endpoint_results=arguments.get("endpoint_results", []),
+                    )
 
                 # 执行 Skill
                 result_text = skill_runner.execute(func_name, arguments)
@@ -169,19 +194,32 @@ class QAAgent:
                     "content": result_text[:800],  # 严格限制避免 context 雪球
                 })
 
-                # 连续错误检测
-                if "错误" in result_text or "失败" in result_text:
-                    last_errors.append(result_text[:100])
-                    if len(last_errors) >= FUSE_THRESHOLD:
-                        recent = last_errors[-FUSE_THRESHOLD:]
-                        if len(set(recent)) == 1:
-                            logger.warning(f"🔥 [QA Agent] 连续 {FUSE_THRESHOLD} 次相同错误，熔断!")
-                            return self._make_result(
-                                False,
-                                f"QA Agent 熔断: 连续 {FUSE_THRESHOLD} 次相同错误\n{recent[0]}",
-                            )
-                else:
-                    last_errors.clear()
+                startup_failure_result = self._handle_startup_failure(
+                    func_name=func_name,
+                    arguments=arguments,
+                    result_text=result_text,
+                    all_code=all_code,
+                    messages=messages,
+                    skill_runner=skill_runner,
+                )
+                if startup_failure_result is not None:
+                    return startup_failure_result
+
+                # 连续错误检测（仅对 http_request / run_terminal 等执行型 Skill 计数）
+                # read_file / check_port 是调查行为，不应累积"相同错误"计数
+                if func_name in ("http_request", "run_terminal"):
+                    if "错误" in result_text or "失败" in result_text or "500" in result_text:
+                        last_errors.append(result_text[:100])
+                        if len(last_errors) >= FUSE_THRESHOLD:
+                            recent = last_errors[-FUSE_THRESHOLD:]
+                            if len(set(recent)) == 1:
+                                logger.warning(f"🔥 [QA Agent] 连续 {FUSE_THRESHOLD} 次相同错误，熔断!")
+                                return self._make_result(
+                                    False,
+                                    f"QA Agent 熔断: 连续 {FUSE_THRESHOLD} 次相同错误\n{recent[0]}",
+                                )
+                    else:
+                        last_errors.clear()
 
         # 超过 MAX_STEPS — 做最后一次尝试从历史中提取判定
         logger.warning(f"🔥 [QA Agent] 达到最大步数 {MAX_STEPS}，尝试提取判定...")
@@ -210,8 +248,9 @@ class QAAgent:
     # Prompt 构建
     # ============================================================
 
-    def _build_system_prompt(self, project_spec: str, all_code: Dict[str, str]) -> str:
-        """构建 QA Agent 的 System Prompt"""
+    def _build_system_prompt(self, project_spec: str, all_code: Dict[str, str],
+                             focus_endpoints: list = None) -> str:
+        """构建 QA Agent 的 System Prompt（v4.4: 按需测试模式支持）"""
         file_list = "\n".join(f"  - {f}" for f in sorted(all_code.keys()))
 
         # 检测入口文件
@@ -220,49 +259,74 @@ class QAAgent:
         # 检测端口
         port = self._detect_port(all_code.get(entry_file, ""), project_spec)
 
+        # v4.4: 动态测试策略
+        if focus_endpoints:
+            focus_list = "\n".join(f"  - {ep}" for ep in focus_endpoints)
+            test_strategy = (
+                f"【⚠️ 按需测试模式 — 本次仅修改了以下功能】\n"
+                f"优先测试（必须逐个验证）:\n{focus_list}\n\n"
+                f"回归冒烟: 从其他端点中任选 1-2 个做快速验证（如 GET / 测首页可达），确认修复未破坏已有功能。\n"
+                f"测完以上端点后直接 report_result，不需要全量测试所有端点。\n"
+                f"步数预算：启动服务 + check_port + 重点端点 + 1-2 个冒烟 + report_result ≈ {len(focus_endpoints) + 5} 步内完成。"
+            )
+        else:
+            test_strategy = (
+                "对项目的核心功能端点逐个发 http_request 测试\n"
+                "（如 POST /add, GET /edit/1, POST /update/1, POST /delete/1 等）"
+            )
+
         return f"""你是 QA 验收工程师 (QA Agent)。你的唯一任务是验证项目代码能否正常运行。
 
 【你的能力】
-你拥有 5 个工具。每一步必须调用工具，禁止只说话不行动。
+你拥有 6 个工具。每一步必须调用工具，禁止只说话不行动。
 1. run_terminal — 在项目目录执行终端命令
 2. read_file — 读取项目文件（仅在遇到错误需要诊断时使用！不要预防性阅读）
 3. http_request — 对 localhost 发 HTTP 请求
 4. check_port — 检查端口是否在监听
-5. report_result — 提交最终判定（必须调用此工具结束测试）
+5. check_ui_visuals — 利用多模态大模型判定目标页面的 UI 是否美观且无溢出
+6. report_result — 提交最终判定（必须调用此工具结束测试）
 
-【⚠️ 步数预算：你最多只有 {MAX_STEPS} 步！标准流程只需 6 步！】
+【⚠️ 步数预算：你最多只有 {MAX_STEPS} 步！】
 
-严格按以下顺序执行，一步一个操作，不要跳步也不要加步：
+严格按以下顺序执行：
   Step 1: run_terminal(command="python {entry_file}", background=true) 启动服务
   Step 2: check_port(port={port}) 确认服务就绪
   Step 3: http_request(method="GET", url="http://127.0.0.1:{port}/") 测试首页
-  Step 4: http_request(method="POST", ...) 提交一条测试数据
-  Step 5: http_request(method="GET", url="http://127.0.0.1:{port}/edit/1") 测试编辑页
-  Step 6: report_result(...) 提交判定
+  Step 4: check_ui_visuals(url="http://127.0.0.1:{port}/", query="请详细审查主页排版、文字边界以及美观度，是否存在溢出等视觉缺陷") [⚠️ 如果该项目带有 Web 页面（如包含 HTML/React/Vue），必须执行此步检查！如果是纯 API 项目请跳过]
+  Step 5+: {test_strategy}
+  (⚠️ 提交表单时必须带 headers={{"Content-Type": "application/x-www-form-urlencoded"}})
+  最后一步: report_result(...) 提交判定
 
 【效率铁律】
 - 不要在测试前 read_file！你已经有代码预览了
 - 不要重复测试同一个端点
-- 首页返回 200 + POST 能提交 + 编辑页不 500 → 直接 PASS
-- 遇到任何 500 错误 → 最多 read_file 1 次诊断原因 → 立刻 report_result(passed=false)
+- 若 Step 1 启动即失败（ImportError / SyntaxError / cannot import name）：
+  - 允许额外 read_file 1-2 次诊断
+  - 立即 report_result(passed=false)，填 error_type / importer_file / provider_file / missing_symbols
 
+【⚠️ 核心规则：测完所有端点再汇总！】
+- 遇到某个端点返回 400/404/500 时，**记录下来但继续测试下一个端点**
+- 只有服务完全无法启动时，才允许立即 report_result(passed=false)
+- 所有端点测完后（或步数快用完时），一次性调用 report_result 汇总
 
-【判定标准 — 严格！】
-- PASS: 服务能启动 + 所有被测端点都返回 2xx
+【report_result 填写规则】
+- passed: 所有被测端点都返回 2xx 且 UI 无严重崩塌 → true；否则 → false
+- feedback: 简要总结（如 "5/7 端点通过, POST /add 返回 500, POST /update/1 返回 500"）
+- **endpoint_results 必须填写！** 列出每个已测端点的逐条结果：
+  - method: HTTP 方法
+  - url: 完整 URL
+  - status_code: 响应状态码
+  - ok: 是否通过 (2xx = true)
+  - detail: 失败时的简要原因（如 "TypeError: update_expense() takes 1 argument"）
+- failed_files: 根据失败端点推断需修复的文件列表
+- feedback 只写事实，**严禁写"问题分析"或"修复建议"！你是测试员不是修理工！**
+
+【判定标准】
+- PASS: 服务能启动 + 所有被测端点都返回 2xx + UI 无严重视觉崩塌
 - FAIL（任一即判 FAIL）:
   · 服务无法启动
-  · 任何端点返回 400（如 CSRF token missing）
-  · 任何端点返回 404（路由未注册）
-  · 任何端点返回 500（服务器内部错误）
-  · 任何非 2xx 响应码
-
-【遇到非 2xx 响应时 — 快速失败！】
-- 看到 400/404/500 → 立刻 report_result(passed=false)
-- feedback 只写事实："POST http://127.0.0.1:5001/add 返回 400, 响应体: The CSRF token is missing"
-- **严禁在 feedback 中写"问题分析"或"修复建议"！你是测试员不是修理工！**
-- **严禁建议添加/修改任何代码！**只报告"什么 URL + 什么 HTTP 方法 + 什么状态码 + 响应体摘要"
-- 不要再 read_file 去诊断原因！
-- 不要继续测试其他端点！一个失败 = 整体失败
+  · 任何端点返回非 2xx
+  · UI 严重样式崩塌（白屏、代码暴露、完全错位）
 
 【铁律】
 - 你只测试，绝对不修改任何源代码文件
@@ -355,11 +419,224 @@ class QAAgent:
 
     @staticmethod
     def _make_result(passed: bool, feedback: str,
-                     failed_files: list = None, warning: bool = False) -> dict:
+                     failed_files: list = None, warning: bool = False,
+                     **extra_fields: Any) -> dict:
         """构造标准返回结构（兼容 IntegrationTester 接口）"""
-        return {
+        result = {
             "passed": passed,
             "feedback": feedback,
             "failed_files": failed_files or [],
             "warning": warning,
         }
+        for key, value in extra_fields.items():
+            if value not in (None, "", [], {}):
+                result[key] = value
+        return result
+
+    def _handle_startup_failure(
+        self,
+        func_name: str,
+        arguments: Dict[str, Any],
+        result_text: str,
+        all_code: Dict[str, str],
+        messages: List[Dict[str, Any]],
+        skill_runner: SkillRunner,
+    ) -> Optional[dict]:
+        """启动即失败时做一次窄范围结构化诊断，避免只返回首个报错。"""
+        if func_name != "run_terminal" or not arguments.get("background"):
+            return None
+
+        if "服务启动失败" not in result_text and "后台启动失败" not in result_text:
+            return None
+
+        diagnosis = self._diagnose_startup_failure(result_text, all_code)
+        if not diagnosis:
+            return None
+
+        importer_file = diagnosis.get("importer_file", "")
+        provider_file = diagnosis.get("provider_file", "")
+        for file_path in [importer_file, provider_file]:
+            if not file_path:
+                continue
+            file_result = skill_runner.execute("read_file", {"file_path": file_path})
+            logger.info(f"📤 [QA Agent] 启动失败补充读取 {file_path}: {file_result[:120]}")
+            messages.append({
+                "role": "tool",
+                "tool_call_id": f"startup_diag_{file_path}",
+                "content": file_result[:800],
+            })
+
+        status = "❌ 失败"
+        logger.info(f"📋 [QA Agent] 启动失败特判: {status} — {diagnosis.get('feedback', '')[:100]}")
+        global_broadcaster.emit_sync(
+            "QAAgent",
+            "failed",
+            f"❌ QA 判定: {diagnosis.get('feedback', '')[:80]}",
+        )
+        return self._make_result(
+            False,
+            diagnosis["feedback"],
+            diagnosis.get("failed_files", []),
+            error_type=diagnosis.get("error_type", ""),
+            importer_file=diagnosis.get("importer_file", ""),
+            provider_file=diagnosis.get("provider_file", ""),
+            missing_symbols=diagnosis.get("missing_symbols", []),
+            repair_scope=diagnosis.get("repair_scope", []),
+        )
+
+    def _diagnose_startup_failure(self, result_text: str, all_code: Dict[str, str]) -> Dict[str, Any]:
+        """本地解析启动失败结果，提取结构化上下文。"""
+        stderr = result_text
+        if "stderr:" in result_text:
+            stderr = result_text.split("stderr:", 1)[1].strip()
+
+        syntax_match = re.search(
+            r"File [\"'].*?([A-Za-z0-9_./\\\\-]+\.py)[\"'].*?SyntaxError:\s*(.+)",
+            stderr,
+            re.DOTALL,
+        )
+        if syntax_match:
+            importer_file = self._normalize_project_path(syntax_match.group(1), all_code)
+            failed_files = [importer_file] if importer_file else []
+            return {
+                "error_type": "APP_BOOT_SYNTAX_ERROR",
+                "feedback": f"服务启动失败，Python 语法错误：{syntax_match.group(2).strip()}",
+                "failed_files": failed_files,
+                "importer_file": importer_file,
+                "repair_scope": failed_files,
+            }
+
+        import_match = re.search(
+            r"cannot import name ['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]? from ['\"]?([A-Za-z_][A-Za-z0-9_\.]*)['\"]?",
+            stderr,
+        )
+        if not import_match:
+            return {}
+
+        missing_symbol = import_match.group(1).strip()
+        import_module = import_match.group(2).strip()
+        importer_file = self._find_importer_file(all_code, import_module, missing_symbol)
+        provider_file = self._resolve_provider_file(importer_file, import_module, all_code)
+        imported_symbols = self._extract_imported_symbols(
+            all_code.get(importer_file, ""),
+            import_module,
+        ) if importer_file else []
+        provider_symbols = self._extract_defined_symbols(
+            all_code.get(provider_file, "")
+        ) if provider_file else set()
+
+        missing_symbols = [
+            symbol for symbol in imported_symbols
+            if symbol not in provider_symbols
+        ]
+        if missing_symbol and missing_symbol not in missing_symbols:
+            missing_symbols.insert(0, missing_symbol)
+        if not missing_symbols:
+            missing_symbols = [missing_symbol]
+
+        repair_scope = [path for path in [provider_file, importer_file] if path]
+        failed_files = repair_scope or ([importer_file] if importer_file else [])
+
+        feedback = (
+            f"服务启动失败，Python 导入错误：{importer_file or '未知文件'} 从 "
+            f"{provider_file or import_module} 导入缺失符号。"
+            f"缺失集合: {', '.join(missing_symbols)}。"
+        )
+
+        return {
+            "error_type": "IMPORT_SYMBOL_MISSING",
+            "feedback": feedback,
+            "failed_files": failed_files,
+            "importer_file": importer_file,
+            "provider_file": provider_file,
+            "missing_symbols": missing_symbols,
+            "repair_scope": repair_scope,
+        }
+
+    @staticmethod
+    def _normalize_project_path(raw_path: str, all_code: Dict[str, str]) -> str:
+        raw_path = str(raw_path or "").replace("\\", "/")
+        if raw_path in all_code:
+            return raw_path
+        for path in all_code.keys():
+            if raw_path.endswith(path):
+                return path
+        return ""
+
+    def _find_importer_file(self, all_code: Dict[str, str], import_module: str, missing_symbol: str) -> str:
+        ordered_files = [path for path in all_code.keys() if path.endswith(".py")]
+        for path in ordered_files:
+            symbols = self._extract_imported_symbols(all_code.get(path, ""), import_module)
+            if missing_symbol in symbols:
+                return path
+        return ordered_files[0] if ordered_files else ""
+
+    @staticmethod
+    def _resolve_provider_file(importer_file: str, import_module: str, all_code: Dict[str, str]) -> str:
+        module_rel = import_module.replace(".", "/").strip("/")
+        if not module_rel:
+            return ""
+
+        candidates = [
+            f"{module_rel}.py",
+            f"{module_rel}/__init__.py",
+        ]
+        if importer_file:
+            importer_dir = os.path.dirname(importer_file).replace("\\", "/").strip("/")
+            if importer_dir:
+                candidates.extend([
+                    f"{importer_dir}/{module_rel}.py",
+                    f"{importer_dir}/{module_rel}/__init__.py",
+                ])
+
+        seen = set()
+        for candidate in candidates:
+            normalized = os.path.normpath(candidate).replace("\\", "/")
+            if normalized in seen or normalized.startswith("../"):
+                continue
+            seen.add(normalized)
+            if normalized in all_code:
+                return normalized
+        return ""
+
+    @staticmethod
+    def _extract_imported_symbols(importer_code: str, import_module: str) -> List[str]:
+        if not importer_code:
+            return []
+
+        try:
+            tree = ast.parse(importer_code)
+        except SyntaxError:
+            return []
+
+        symbols: List[str] = []
+        module_suffix = f".{import_module}"
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or not node.module:
+                continue
+            if node.module != import_module and not node.module.endswith(module_suffix):
+                continue
+            for alias in node.names:
+                if alias.name != "*" and alias.name not in symbols:
+                    symbols.append(alias.name)
+        return symbols
+
+    @staticmethod
+    def _extract_defined_symbols(provider_code: str) -> set:
+        if not provider_code:
+            return set()
+
+        try:
+            tree = ast.parse(provider_code)
+        except SyntaxError:
+            return set()
+
+        symbols = set()
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                symbols.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        symbols.add(target.id)
+        return symbols

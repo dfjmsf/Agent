@@ -1,6 +1,10 @@
 """
 IntegrationTester v3 — 端到端集成测试专家（模板化架构）
 
+⚠️ [DEPRECATED] 此模块已软弃用。
+新流程请使用 agents/qa_agent.py (QAAgent ReAct Tool Calling 模式)。
+此模块保留仅作紧急回退，计划在 Skill 公共化重构完成后正式移除。
+
 v2 → v3 变更：
 - 核心改动: 不再让 LLM 生成完整测试脚本，改为"固定模板 + LLM 只写断言"
 - 固定模板: 处理服务启动、端口轮询、进程清理（代码级保障，不依赖 LLM）

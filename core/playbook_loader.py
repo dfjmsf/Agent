@@ -10,6 +10,7 @@ PlaybookLoader — Playbook 分层加载器
 """
 
 import os
+import re
 import logging
 from typing import List, Optional
 
@@ -134,17 +135,32 @@ class PlaybookLoader:
     # 公共 API
     # ============================
 
-    def load_for_coder(self, tech_stack: List[str], target_file: str) -> str:
+    # ============================
+    # Playbook 分层预算帽 (Sprint 3-A)
+    # ============================
+    DEFAULT_BUDGET_CHARS = 4000  # 主 playbook 预算帽（不含 patches）
+
+    def load_for_coder(self, tech_stack: List[str], target_file: str,
+                       budget_chars: int = None,
+                       architecture_contract: dict = None) -> str:
         """
-        为 Coder 加载 playbook（分层策略）。
+        为 Coder 加载 playbook（P0/P1/P2 分层 + 预算帽策略）。
+
+        Sprint 3-A 新机制：
+        - 主 playbook 按 <!-- P0:START --> 等标记拆分为三层
+        - P0（铁律）必须全部填入
+        - P1（核心规则）按剩余预算填入
+        - P2（参考示例）在预算充裕时才填入（弹性设计：宁缺勿截断）
+        - Patches 不受预算帽限制（体量小且属于 P1 级）
 
         Args:
-            tech_stack: 项目技术栈列表（如 ["FastAPI", "Vue 3", "SQLite"]）
-            target_file: 当前要编写的文件路径（如 "src/routes.py"）
-
-        Returns:
-            playbook 内容字符串，可能为空字符串
+            tech_stack: 项目技术栈列表
+            target_file: 当前要编写的文件路径
+            budget_chars: 主 playbook 预算帽（不含 patches），None 则使用默认值
         """
+        if budget_chars is None:
+            budget_chars = self.DEFAULT_BUDGET_CHARS
+
         ext = os.path.splitext(target_file)[1].lower()
         parts = []
 
@@ -153,25 +169,24 @@ class PlaybookLoader:
         is_node_backend = any(kw in _all_tech for kw in
                               ("express", "node", "koa", "nestjs", "nest"))
 
-        # 第一层：按文件后缀路由（Node.js 后端的 .js 走 BACKEND_MAP）
+        # === 第一层：按文件后缀路由，加载主 playbook（P0/P1/P2 分层）===
+        raw_pb = None
         if ext in self.BACKEND_EXTS:
-            pb = self._match_and_load(tech_stack, self.BACKEND_MAP,
-                                      "coder", self.DEFAULT_BACKEND)
-            if pb:
-                parts.append(pb)
+            raw_pb = self._match_and_load(tech_stack, self.BACKEND_MAP,
+                                          "coder", self.DEFAULT_BACKEND)
         elif ext in {".js", ".ts"} and is_node_backend:
-            # Node.js 后端 .js/.ts 文件
-            pb = self._match_and_load(tech_stack, self.BACKEND_MAP,
-                                      "coder", "express.md")
-            if pb:
-                parts.append(pb)
+            raw_pb = self._match_and_load(tech_stack, self.BACKEND_MAP,
+                                          "coder", "express.md")
         elif ext in self.FRONTEND_EXTS:
-            pb = self._match_and_load(tech_stack, self.FRONTEND_MAP,
-                                      "coder", self.DEFAULT_FRONTEND)
-            if pb:
-                parts.append(pb)
+            raw_pb = self._match_and_load(tech_stack, self.FRONTEND_MAP,
+                                          "coder", self.DEFAULT_FRONTEND)
 
-        # 第二层：入口文件追加跨栈补丁
+        if raw_pb:
+            # 尝试分层提取
+            trimmed_pb = self._apply_budget(raw_pb, budget_chars)
+            parts.append(trimmed_pb)
+
+        # === 第二层：入口文件追加跨栈补丁（不受预算帽限制）===
         basename = os.path.basename(target_file).lower()
         if basename in self.ENTRY_FILENAMES:
             patch = self._load_file("coder", "_patches", "static_mount.md")
@@ -179,21 +194,28 @@ class PlaybookLoader:
                 parts.append(f"\n\n【跨栈补丁：前端静态文件挂载】\n{patch}")
                 logger.info(f"📎 入口文件 {basename} 追加挂载补丁")
 
-        # 第三层：Addon 补丁（仅当用户明确要求时激活）
-        loaded_addons = set()  # 去重：同一个 .md 不重复加载
-
-        # 上下文检测：是否是 Vite 构建项目（影响 Tailwind 补丁选择）
+        # === 第三层：Addon 补丁（不受预算帽限制）===
+        loaded_addons = set()
         all_tech_lower = " ".join(t.lower() for t in tech_stack)
         is_vite_project = any(kw in all_tech_lower for kw in ["vite", "react", "composition"])
+
+        # v4.4: ORM 模式感知 — architecture_contract.orm_mode 决定加载哪个 ORM 补丁
+        _orm_mode = (architecture_contract or {}).get("orm_mode", "") if architecture_contract else ""
+        if _orm_mode == "flask_sqlalchemy" and ext == ".py":
+            # 强制注入 Flask-SQLAlchemy 补丁，排斥 sqlalchemy_orm.md
+            addon = self._load_file("coder", "_patches", "flask_sqlalchemy.md")
+            if addon:
+                parts.append(f"\n\n【ORM 补丁：Flask-SQLAlchemy（强制）】\n{addon}")
+                loaded_addons.add("flask_sqlalchemy.md")
+                loaded_addons.add("sqlalchemy_orm.md")  # 排斥原生 SQLAlchemy 补丁
+                logger.info(f"🧩 ORM 补丁: Flask-SQLAlchemy（orm_mode 感知）")
 
         for tech in tech_stack:
             tech_lower = tech.lower().strip()
             for keyword, (filename, display_name, allowed_exts) in self.ADDON_PATCHES.items():
                 if keyword in tech_lower and filename not in loaded_addons:
-                    # 检查当前文件是否在允许的后缀集中
                     if allowed_exts is not None and ext not in allowed_exts:
                         continue
-                    # 上下文切换：Vite 项目用 PostCSS 模式代替 CDN 模式
                     actual_filename = filename
                     actual_display = display_name
                     if filename == "tailwind_cdn.md" and is_vite_project:
@@ -202,10 +224,10 @@ class PlaybookLoader:
                     addon = self._load_file("coder", "_patches", actual_filename)
                     if addon:
                         parts.append(f"\n\n【Addon 补丁：{actual_display}】\n{addon}")
-                        loaded_addons.add(filename)  # 用原始 filename 去重
+                        loaded_addons.add(filename)
                         logger.info(f"🧩 Addon 补丁: {actual_display}")
 
-        # 第四层：隐式环境补丁（根据上下文自动推断，不需要 tech_stack 明确指定关键词）
+        # === 第四层：隐式环境补丁（不受预算帽限制）===
         # 4.1 SSR 模板补丁
         if any(kw in all_tech_lower for kw in ["flask", "django"]):
             if "ssr_template.md" not in loaded_addons and ext in {".py", ".html"}:
@@ -224,9 +246,18 @@ class PlaybookLoader:
                     loaded_addons.add("sqlite_native.md")
                     logger.info(f"🧩 环境补丁: SQLite 原生安全规范")
 
+        # 4.3 前端 UI 设计系统补丁（所有前端文件自动注入）
+        if ext in self.FRONTEND_EXTS and "ui_design_system.md" not in loaded_addons:
+            addon = self._load_file("coder", "_patches", "ui_design_system.md")
+            if addon:
+                # 对设计系统也做分层裁剪（受 budget_chars 剩余空间约束）
+                trimmed = self._apply_budget(addon, budget_chars)
+                parts.append(f"\n\n【环境补丁：前端 UI 设计系统】\n{trimmed}")
+                loaded_addons.add("ui_design_system.md")
+                logger.info(f"🧩 环境补丁: 前端 UI 设计系统")
+
         content = "\n\n".join(parts)
         if content:
-            # Phase 1.2: P1 技术规范声明
             content = (
                 "⚠️ 以下是当前技术栈的编码规范（P1 级别），你必须严格遵守！\n"
                 "仅当与项目规划书（Spec）直接矛盾时以 Spec 为准。\n\n"
@@ -355,6 +386,74 @@ class PlaybookLoader:
             except Exception as e:
                 logger.error(f"❌ 读取 Playbook 失败: {filepath}: {e}")
         return None
+
+    def _extract_tier(self, content: str, tier: str) -> str:
+        """
+        提取指定层级的 playbook 内容。
+
+        解析 <!-- P0:START --> ... <!-- P0:END --> 等标记。
+        同一层级可以有多个区块，全部合并返回。
+
+        Args:
+            content: 完整 playbook 文本
+            tier: 层级名，"P0" | "P1" | "P2"
+
+        Returns:
+            该层级的内容（去除首尾空白），无标记则返回空字符串
+        """
+        pattern = rf"<!--\s*{tier}:START\s*-->(.+?)<!--\s*{tier}:END\s*-->"
+        matches = re.findall(pattern, content, re.DOTALL)
+        if not matches:
+            return ""
+        return "\n\n".join(m.strip() for m in matches)
+
+    def _apply_budget(self, raw_content: str, budget_chars: int) -> str:
+        """
+        对主 playbook 施加 P0/P1/P2 分层预算帽。
+
+        策略：
+        1. P0（铁律）：必须全部填入，不受预算限制
+        2. P1（核心规则）：按剩余预算填入（整块填入，不截断）
+        3. P2（参考示例）：预算充裕时才填入（弹性设计：宁缺勿截断）
+        4. 无标记文件：全文视为 P0（向后兼容）
+
+        Args:
+            raw_content: 完整 playbook 原文
+            budget_chars: 字符预算帽
+
+        Returns:
+            裁剪后的 playbook 文本
+        """
+        p0 = self._extract_tier(raw_content, "P0")
+        p1 = self._extract_tier(raw_content, "P1")
+        p2 = self._extract_tier(raw_content, "P2")
+
+        # 无标记文件 → 降级：全文视为 P0（向后兼容，不裁剪）
+        if not p0 and not p1 and not p2:
+            logger.debug("📖 Playbook 无分层标记，全文视为 P0（向后兼容）")
+            return raw_content
+
+        # P0 必须全填
+        result = p0
+
+        # P1（核心规则）也必须全填 — 它是正确实现的基础
+        if p1:
+            result += "\n\n" + p1
+
+        used = len(result)
+
+        # P2 在预算充裕时才填入（整块，宁缺勿截断）
+        if p2:
+            if used + len(p2) <= budget_chars:
+                result += "\n\n" + p2
+                logger.debug(f"📖 P2 填入: {len(p2)} chars (累计 {len(result)})")
+            else:
+                logger.info(f"📖 P2 被预算帽裁剪: {len(p2)} chars 超出剩余 {budget_chars - used}")
+
+        logger.info(f"📖 Playbook 分层裁剪: 原文 {len(raw_content)} → {len(result)} chars "
+                     f"(P0={len(p0)}, P1={len(p1)}, P2={len(p2)}, 预算={budget_chars})")
+        return result
+
 
     @staticmethod
     def _web_common_rules() -> str:
