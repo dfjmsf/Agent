@@ -70,6 +70,42 @@ class CoderAgent:
             return match.group(1).strip()
         lines = [line for line in raw_text.split("\n") if not line.strip().startswith("```")]
         return "\n".join(lines).strip()
+
+    def _extract_slice_code(self, raw_text: str) -> str:
+        """
+        切片模式专用的代码提取。
+        不依赖 XML 标签（切片只输出单个函数体，不需要文件级包裹）。
+
+        优先级：
+        1. Markdown 代码块提取
+        2. XML 标签剥离后的原始内容
+        3. 原文直出（兜底）
+
+        最终都会做一次 XML 标签安全剥离，防止任何残留。
+        """
+        if not raw_text or not raw_text.strip():
+            return ""
+
+        # 1. 尝试提取 Markdown 代码块内容
+        md_pattern = re.compile(
+            r"```(?:python|py|html|css|javascript|js|typescript|ts|jsx|tsx)?\s*\n(.*?)\n\s*```",
+            re.DOTALL | re.IGNORECASE
+        )
+        match = md_pattern.search(raw_text)
+        if match:
+            code = match.group(1)
+        else:
+            code = raw_text
+
+        # 2. 强制剥离任何残留的 astrea_file XML 标签
+        code = re.sub(r'</?astrea_file[^>]*>', '', code)
+
+        # 3. 清理 markdown 围栏残留
+        lines = code.split("\n")
+        cleaned = [line for line in lines if not line.strip().startswith("```")]
+        result = "\n".join(cleaned).strip()
+
+        return result
     
     def _get_coder_prompt(self, target_file: str) -> str:
         """根据文件后缀路由到对应的 Coder prompt"""
@@ -138,6 +174,11 @@ class CoderAgent:
         if global_snapshot:
             memory_hint += f"\n\n【📊 全局快照 — 已完成文件的数据模型与路由（必须对齐）】\n{global_snapshot}"
         
+        # P0-2: 已完成任务账本（跨任务架构感知）
+        completed_context = task_meta.get("completed_context", "") if task_meta else ""
+        if completed_context:
+            memory_hint += f"\n\n{completed_context}"
+        
         return memory_hint
 
     def _build_fix_hint(self, target_file: str, description: str, observer_context: str = "") -> str:
@@ -187,6 +228,11 @@ class CoderAgent:
         global_snapshot = task_meta.get("global_snapshot", "") if task_meta else ""
         if global_snapshot:
             fix_hint += f"\n\n【📊 全局快照 — 已完成文件的数据模型与路由（字段名必须与此对齐）】\n{global_snapshot}"
+        
+        # P0-2: 已完成任务账本（修复时也需要感知兄弟任务状态）
+        completed_context = task_meta.get("completed_context", "") if task_meta else ""
+        if completed_context:
+            fix_hint += f"\n\n{completed_context}"
         
         return fix_hint
 
@@ -632,7 +678,8 @@ class CoderAgent:
             f"1. 只输出修复后的 `{func_name}` 的完整代码（从定义/声明开始到结束）\n"
             f"2. 不要输出文件中其他部分的代码\n"
             f"3. 不要添加任何不相关的新函数\n"
-            f"4. 用 <astrea_file path=\"{target_file}\" action=\"slice\"> 标签包裹\n"
+            f"4. 用 Markdown 代码块包裹（```javascript 或 ```python 等）\n"
+            f"5. 禁止输出 <astrea_file> 等 XML 标签\n"
         )
 
         messages = [
@@ -649,8 +696,8 @@ class CoderAgent:
         )
 
         raw_output = response_msg.content
-        # 提取切片代码
-        sliced_code = self._extract_xml_code(raw_output, target_file)
+        # 提取切片代码（切片模式用精简提取，不依赖 XML 标签）
+        sliced_code = self._extract_slice_code(raw_output)
 
         if not sliced_code or len(sliced_code.strip()) < 5:
             logger.warning("⚠️ [Slice] LLM 输出为空或过短，降级到 Editor 差量编辑")
@@ -892,6 +939,10 @@ class CoderAgent:
                 global_snapshot = (task_meta or {}).get("global_snapshot", "")
                 if global_snapshot:
                     memory_hint += f"\n\n【📊 全局快照 — 已完成文件的数据模型与路由（必须对齐）】\n{global_snapshot}"
+                # P0-2: Fill 模式也注入已完成任务账本
+                completed_context = (task_meta or {}).get("completed_context", "")
+                if completed_context:
+                    memory_hint += f"\n\n{completed_context}"
             else:
                 # 完整记忆（含全局 RAG 3+1 + 项目经验 + TDD 窗口）
                 memory_hint = self._build_memory_hint(target_file, description, task_meta)

@@ -232,7 +232,21 @@ def run_project_thread(prompt: str, out_dir: str, project_id: str, mode: str = "
             engine._phase_mode = True
             pending = [p for p in phases if p["status"] == "pending"]
             engine._is_final_phase = len(pending) <= 1
-            logger.info(f"🔍 Phase 模式已启用: pending={len(pending)}, is_final={engine._is_final_phase}")
+            # 注入当前 Phase 的详细信息，供 Manager 任务过滤
+            current_phase = pending[0] if pending else None
+            if current_phase:
+                engine._current_phase_info = {
+                    "index": current_phase["index"],
+                    "name": current_phase["name"],
+                    "features": current_phase.get("features", []),
+                    "scope_type": current_phase.get("scope_type", "fullstack"),
+                    "total_phases": len(phases),
+                    "completed_phases": [p["name"] for p in phases if p["status"] == "done"],
+                }
+                logger.info(f"🔍 Phase 模式已启用: pending={len(pending)}, is_final={engine._is_final_phase}, "
+                            f"current=P{current_phase['index']}:{current_phase['name']}[{current_phase.get('scope_type', '?')}]")
+            else:
+                logger.info(f"🔍 Phase 模式已启用: pending={len(pending)}, is_final={engine._is_final_phase}")
         success, final_dir = engine.run(prompt, out_dir or None, mode=mode)
         if not success:
             logger.error(f"项目生成失败，输出目录: {final_dir}")
@@ -861,12 +875,21 @@ async def add_custom_provider(req: CustomProviderReq):
 
     data = _load_custom_providers_json()
 
+    # 清洗 base_url：用户容易误填完整 endpoint（如 /v1/chat/completions）
+    # OpenAI SDK 会自动拼接 /chat/completions，需要剥离多余后缀
+    clean_url = req.base_url.strip().rstrip("/")
+    for suffix in ["/chat/completions", "/completions", "/chat"]:
+        if clean_url.lower().endswith(suffix):
+            clean_url = clean_url[:len(clean_url) - len(suffix)]
+            break
+    clean_url = clean_url.rstrip("/")
+
     # 重名检测 → 覆盖
     data = [p for p in data if p.get("name") != req.name]
     data.append({
         "name": req.name,
         "api_key": req.api_key,
-        "base_url": req.base_url,
+        "base_url": clean_url,
         "models": req.models,
     })
 
@@ -875,7 +898,7 @@ async def add_custom_provider(req: CustomProviderReq):
     # 热重载 LLM Provider 列表
     default_llm.reload_providers()
 
-    logger.info(f"✅ 自定义 Provider [{req.name}] 已保存并热重载 (模型: {req.models})")
+    logger.info(f"✅ 自定义 Provider [{req.name}] 已保存并热重载 (base_url={clean_url}, 模型: {req.models})")
     return {"status": "ok", "provider": req.name, "models": req.models}
 
 

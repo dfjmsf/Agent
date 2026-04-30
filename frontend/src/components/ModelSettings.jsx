@@ -25,7 +25,8 @@ export default function ModelSettings() {
   const [config, setConfig] = useState(null);
   const [editedConfig, setEditedConfig] = useState({});
   const [editedThinking, setEditedThinking] = useState({});
-  const [allModels, setAllModels] = useState([]);
+  // 按供应商分组的模型列表: [{ provider: string, models: string[] }]
+  const [groupedModels, setGroupedModels] = useState([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saveResult, setSaveResult] = useState(null); // 'ok' | 'error'
@@ -52,14 +53,14 @@ export default function ModelSettings() {
       setEditedConfig(initialModels);
       setEditedThinking(initialThinking);
 
-      // 聚合所有可用模型
-      const models = new Set();
-      for (const p of data.providers) {
-        for (const m of p.models) {
-          models.add(m);
-        }
-      }
-      setAllModels([...models].sort());
+      // 按供应商分组聚合模型
+      const groups = data.providers
+        .filter(p => p.models.length > 0)
+        .map(p => ({
+          provider: p.name,
+          models: [...p.models].sort(),
+        }));
+      setGroupedModels(groups);
     } catch (e) {
       console.error('Failed to load model config:', e);
     } finally {
@@ -326,8 +327,12 @@ export default function ModelSettings() {
                 value={currentModel}
                 onChange={(e) => handleModelChange(role, e.target.value)}
               >
-                {allModels.map((m) => (
-                  <option key={m} value={m}>{m}</option>
+                {groupedModels.map((group) => (
+                  <optgroup key={group.provider} label={group.provider}>
+                    {group.models.map((m) => (
+                      <option key={`${group.provider}::${m}`} value={m}>{m}</option>
+                    ))}
+                  </optgroup>
                 ))}
               </select>
               <select

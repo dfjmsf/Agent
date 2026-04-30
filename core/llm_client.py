@@ -44,6 +44,10 @@ class LLMClient:
     - 都不匹配 → fallback 到第一个可用的 Provider
     """
 
+    # 原生 Provider 名称集合（支持发送私有思考模式参数）
+    # 第三方代理（硅基流动/OpenRouter 等）不识别这些参数，可能导致请求挂起或报错
+    _NATIVE_THINKING_PROVIDERS = {"DeepSeek", "Qwen", "GPT"}
+
     def __init__(self):
         self.providers: List[LLMProvider] = []
         self._init_providers()
@@ -120,12 +124,26 @@ class LLMClient:
             if not api_key or not models:
                 logger.warning(f"⚠️ 自定义 Provider [{name}] 缺少 api_key 或 models，已跳过")
                 continue
+            # 清洗 base_url：剥离用户误填的 /chat/completions 后缀
+            clean_url = self._clean_base_url(base_url)
             # 避免重名覆盖：如果已有同名 Provider 则跳过
             if any(p.name == name for p in self.providers):
                 logger.info(f"ℹ️ Provider [{name}] 已通过 .env 加载，跳过 JSON 中的重复项")
                 continue
-            self.providers.append(LLMProvider(name, api_key, base_url, models))
+            self.providers.append(LLMProvider(name, api_key, clean_url, models))
             logger.info(f"✅ Provider [{name}] 已从 custom_providers.json 加载 ({len(models)} 个模型)")
+
+    @staticmethod
+    def _clean_base_url(url: str) -> str:
+        """清洗 base_url：剥离用户误填的 /chat/completions 等后缀。
+        OpenAI SDK 会自动拼接 /chat/completions，如果用户填了完整 endpoint 会双拼接导致 404。
+        """
+        clean = (url or "").strip().rstrip("/")
+        for suffix in ["/chat/completions", "/completions", "/chat"]:
+            if clean.lower().endswith(suffix):
+                clean = clean[:len(clean) - len(suffix)]
+                break
+        return clean.rstrip("/")
 
     def reload_providers(self):
         """热重载所有 Provider（供 server.py CRUD 操作后调用）"""
@@ -250,8 +268,11 @@ class LLMClient:
                 kwargs["tool_choice"] = tool_choice
 
         # 思考模式参数：按 Provider 类型分支处理
+        # ⚠️ extra_body 是各厂商私有协议，只对原生 Provider 发送。
+        # 第三方代理（硅基流动/OpenRouter 等）不识别这些参数，可能导致请求挂起或报错。
         thinking_hint = ""
-        if self._model_supports_thinking(model):
+        is_native_provider = provider.name in self._NATIVE_THINKING_PROVIDERS
+        if is_native_provider and self._model_supports_thinking(model):
             if self._is_deepseek_model(model):
                 # DeepSeek V4: thinking.type + reasoning_effort
                 if enable_thinking:
@@ -273,6 +294,10 @@ class LLMClient:
             
             # 更新 Token 账户
             self._update_token_usage(response.usage)
+
+            # 防御：第三方代理可能返回 200 但 choices 为空
+            if not response.choices:
+                raise RuntimeError(f"API 返回空 choices（模型 {model} 可能不支持当前请求格式）")
             
             return response.choices[0].message
             
@@ -330,8 +355,10 @@ class LLMClient:
         }
 
         # 视觉模型思考参数（与 chat_completion 保持一致）
+        # 同样只对原生 Provider 发送私有参数
         thinking_hint = ""
-        if self._model_supports_thinking(target_model):
+        is_native_provider = provider.name in self._NATIVE_THINKING_PROVIDERS
+        if is_native_provider and self._model_supports_thinking(target_model):
             if self._is_deepseek_model(target_model):
                 if enable_thinking:
                     kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
@@ -357,4 +384,3 @@ class LLMClient:
 
 # 默认提供的全局单例
 default_llm = LLMClient()
-

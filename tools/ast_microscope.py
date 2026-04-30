@@ -142,6 +142,75 @@ class ASTMicroscope:
             "context_after": "\n".join(lines[e:ctx_after_end]),
         }
 
+    def requires_scope_expansion(self, source: str, description: str, lang: str) -> bool:
+        """
+        作用域扩展探测器 — 检测任务描述是否要求新增当前代码中不存在的符号。
+
+        原理：从 description 中提取看起来像函数/类/变量名的标识符（snake_case 或 camelCase），
+        与 existing symbols 对比。如果 description 中出现了 2 个以上既有符号中不存在的名称，
+        或出现了明确的"新增"/"添加"/"实现"语义关键词搭配未知函数名，则判定需要扩展作用域。
+
+        场景举例：
+        - description = "添加 get_expense_by_id 和 update_expense 函数"
+        - existing symbols = [get_all_expenses, create_expense]
+        → get_expense_by_id, update_expense 不在 symbols 中 → 返回 True
+        """
+        symbols = self.list_symbols(source, lang)
+        if not symbols:
+            return False  # 无符号表 → 无法判断，不干预
+
+        # 收集既有符号名（小写，含 Class.method 拆分）
+        existing_names = set()
+        for sym in symbols:
+            existing_names.add(sym["name"].lower())
+            # 处理 Class.method 格式
+            if "." in sym["name"]:
+                parts = sym["name"].split(".")
+                for p in parts:
+                    existing_names.add(p.lower())
+
+        # 从 description 中提取候选函数/类名
+        # 规则：3 字符以上的 snake_case 或 camelCase 标识符
+        candidates = set(re.findall(r'[a-zA-Z_][a-zA-Z0-9_]{2,}', description))
+
+        # 过滤掉常见的自然语言词汇和技术关键词（非函数名）
+        NOISE_WORDS = {
+            'the', 'and', 'for', 'with', 'from', 'that', 'this', 'not', 'are', 'was',
+            'will', 'can', 'has', 'have', 'been', 'but', 'all', 'any', 'each', 'into',
+            'def', 'class', 'import', 'return', 'function', 'const', 'let', 'var',
+            'async', 'await', 'export', 'default', 'module', 'require',
+            'str', 'int', 'bool', 'list', 'dict', 'none', 'true', 'false',
+            'file', 'code', 'bug', 'fix', 'add', 'new', 'get', 'set', 'put', 'post',
+            'delete', 'patch', 'update', 'create', 'remove', 'error', 'test',
+            'route', 'model', 'view', 'template', 'api', 'url', 'http', 'json',
+            'request', 'response', 'data', 'type', 'name', 'value', 'key',
+            '添加', '新增', '实现', '修复', '修改', '删除', '函数', '方法',
+        }
+
+        # 筛选出看起来像函数/变量定义名的标识符（含下划线或驼峰结构）
+        new_symbols = set()
+        for candidate in candidates:
+            c_lower = candidate.lower()
+            if c_lower in NOISE_WORDS:
+                continue
+            if c_lower in existing_names:
+                continue
+            # 必须看起来像真正的标识符：含下划线、或含大小写混合（驼峰）
+            is_snake = '_' in candidate
+            is_camel = bool(re.search(r'[a-z][A-Z]', candidate))
+            is_class_like = candidate[0].isupper() and len(candidate) > 3
+            if is_snake or is_camel or is_class_like:
+                new_symbols.add(candidate)
+
+        if new_symbols:
+            logger.info(
+                f"🔍 [Scope Expansion] 描述中发现未知符号: {sorted(new_symbols)} "
+                f"(既有: {sorted(s['name'] for s in symbols[:5])}{'...' if len(symbols) > 5 else ''})"
+            )
+
+        # 判定阈值：1 个以上未知的结构化标识符即认为需要扩展
+        return len(new_symbols) >= 1
+
     def find_relevant_slice(self, source: str, description: str, lang: str,
                             context_lines: int = 10) -> Optional[Dict]:
         """
@@ -155,8 +224,18 @@ class ASTMicroscope:
             return None
 
         desc_lower = description.lower()
-        # 提取 description 中的英文单词和中文关键词
-        keywords = set(re.findall(r'[a-zA-Z_]\w+', desc_lower))
+
+        # 提取 description 中的关键词
+        # 关键修复：先从原始文本中提取驼峰拆分词汇（如 viewSnippet → view, snippet），
+        # 再与小写整词合并。之前只从小写文本提取，viewsnippet 作为一个整词无法匹配。
+        raw_words = set(re.findall(r'[a-zA-Z_]\w+', description))
+        keywords = set()
+        for word in raw_words:
+            keywords.add(word.lower())
+            # 驼峰拆分：viewSnippet → {view, snippet}
+            camel_parts = re.findall(r'[A-Z][a-z]+|[a-z]+', word)
+            for part in camel_parts:
+                keywords.add(part.lower())
 
         best_score = 0
         best_sym = None
@@ -165,7 +244,7 @@ class ASTMicroscope:
             name_lower = sym["name"].lower()
             score = 0
 
-            # 精确包含
+            # 精确包含（完整函数名出现在 description 中）
             if name_lower in desc_lower:
                 score += 10
 

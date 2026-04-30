@@ -96,6 +96,11 @@ def extract_route_contract_handlers_for_target(project_spec: Dict[str, Any], tar
             handler = contract.get("handler") or contract.get("function")
             if not handler or is_non_endpoint_helper(handler):
                 continue
+            # 清洗 LLM 产出的伪 handler：截取 ? 前部分（如 get_records?type=weight → get_records）
+            handler = str(handler).split("?")[0].split("(")[0].strip()
+            # 验证是否为合法 Python 标识符，过滤含 / | = 等非法字符的描述性文本
+            if not handler.isidentifier():
+                continue
             if handler not in handlers:
                 handlers.append(handler)
     return handlers

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion } from 'framer-motion';
 import { FolderTree, GitBranch, Settings, MessageSquare } from 'lucide-react';
 import FileExplorer from './FileExplorer';
 import GitPanel from './GitPanel';
@@ -8,7 +8,9 @@ import PMChat from './PMChat';
 
 /**
  * LabWorkspace - 右侧实验室面板（Tab 式）
- * 替代原 ArtifactExplorer，提供可扩展的功能模块。
+ *
+ * 关键设计：所有 Tab 内容始终挂载（不卸载），通过 CSS display 控制可见性。
+ * 这确保 PMChat 在切换到其他 Tab 时不会丢失正在飞行的 HTTP 响应。
  */
 
 const TABS = [
@@ -20,21 +22,6 @@ const TABS = [
 
 export default function LabWorkspace({ projectFiles, currentProjectId }) {
   const [activeTab, setActiveTab] = useState('files');
-
-  const renderTabContent = () => {
-    switch (activeTab) {
-      case 'files':
-        return <FileExplorer projectFiles={projectFiles} currentProjectId={currentProjectId} />;
-      case 'git':
-        return <GitPanel currentProjectId={currentProjectId} />;
-      case 'settings':
-        return <ModelSettings />;
-      case 'pm':
-        return <PMChat currentProjectId={currentProjectId} />;
-      default:
-        return null;
-    }
-  };
 
   return (
     <motion.div
@@ -71,20 +58,20 @@ export default function LabWorkspace({ projectFiles, currentProjectId }) {
         })}
       </div>
 
-      {/* Tab Content */}
+      {/* Tab Content — 全部预挂载，CSS display 控制可见性 */}
       <div className="lab-content">
-        <AnimatePresence mode="wait">
-          <motion.div
-            key={activeTab}
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -8 }}
-            transition={{ duration: 0.2 }}
-            style={{ height: '100%' }}
-          >
-            {renderTabContent()}
-          </motion.div>
-        </AnimatePresence>
+        <div style={{ height: '100%', display: activeTab === 'files' ? 'block' : 'none' }}>
+          <FileExplorer projectFiles={projectFiles} currentProjectId={currentProjectId} />
+        </div>
+        <div style={{ height: '100%', display: activeTab === 'git' ? 'block' : 'none' }}>
+          <GitPanel currentProjectId={currentProjectId} />
+        </div>
+        <div style={{ height: '100%', display: activeTab === 'settings' ? 'block' : 'none' }}>
+          <ModelSettings />
+        </div>
+        <div style={{ height: '100%', display: activeTab === 'pm' ? 'block' : 'none' }}>
+          <PMChat currentProjectId={currentProjectId} />
+        </div>
       </div>
     </motion.div>
   );

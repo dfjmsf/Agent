@@ -54,7 +54,8 @@ class ReviewerAgent:
                          sandbox_dir: str, expected_symbols: list,
                          project_spec: dict = None,
                          allow_skeleton_placeholders: bool = False,
-                         is_continue_fix: bool = False) -> Tuple[bool, str]:
+                         is_continue_fix: bool = False,
+                         pending_files: set = None) -> Tuple[bool, str]:
         """
         L0 静态检查（HARD/SOFT 分级）：
           HARD: 失败直接阻断（纯 AST 单文件，确定性 ~100%）
@@ -125,10 +126,57 @@ class ReviewerAgent:
             if not vue_pass:
                 return False, vue_error
 
+        # --- [HARD] L0.F 前端本地 import 引用完整性检查 ---
+        _FRONTEND_IMPORT_EXTS = {'.js', '.jsx', '.ts', '.tsx', '.vue'}
+        if sandbox_dir and ext in _FRONTEND_IMPORT_EXTS:
+            lf_pass, lf_error = self._l0_frontend_import_check(
+                target_file, code_content, sandbox_dir,
+                pending_files=pending_files)
+            if not lf_pass:
+                return False, lf_error
+
         # --- [HARD] L0.2 结构检查 ---
         if is_python and expected_symbols and tree:
             defined = self._extract_defined_symbols(tree)
             missing = [s for s in expected_symbols if s not in defined]
+
+            # 框架生命周期符号容忍：startup/shutdown/lifespan 等
+            # 实现方式高度灵活（lifespan ctx manager、@app.on_event、内联初始化等），
+            # 不应作为硬性验收标准
+            _LIFECYCLE_SYMBOLS = {
+                'startup', 'shutdown', 'lifespan', 'on_startup', 'on_shutdown',
+                'before_request', 'after_request', 'teardown_appcontext',
+                'before_first_request', 'errorhandler',
+            }
+            lifecycle_skipped = [s for s in missing if s in _LIFECYCLE_SYMBOLS]
+            if lifecycle_skipped:
+                missing = [s for s in missing if s not in _LIFECYCLE_SYMBOLS]
+                logger.info(
+                    f"✅ [L0.2] 生命周期符号容忍: {lifecycle_skipped} "
+                    f"（实现方式灵活，不强制匹配函数名）"
+                )
+
+            if missing:
+                # 路由降级：handler 名不匹配时，检查路由路径是否已注册
+                # Coder 可能用不同的函数名实现同一路由（如 list_records vs get_records）
+                route_paths = self._extract_route_paths_from_ast(tree)
+                contract_paths = self._extract_contract_paths(project_spec, target_file)
+                if contract_paths and route_paths:
+                    # 对每个 missing handler，检查对应路由路径是否已在代码中注册
+                    still_missing = []
+                    for handler_name in missing:
+                        expected_path = contract_paths.get(handler_name)
+                        if expected_path and any(
+                            self._route_path_matches(expected_path, rp)
+                            for rp in route_paths
+                        ):
+                            logger.info(
+                                f"✅ [L0.2] 降级路由匹配: handler '{handler_name}' "
+                                f"未定义，但路由路径 '{expected_path}' 已注册"
+                            )
+                        else:
+                            still_missing.append(handler_name)
+                    missing = still_missing
             if missing:
                 error = f"[L0.2 结构缺失] {target_file} 缺少规划书中定义的: {', '.join(missing)}"
                 logger.warning(f"❌ {error}")
@@ -311,6 +359,130 @@ class ReviewerAgent:
         logger.info(f"✅ [L0.VUE] SFC 结构检查通过: {target_file}")
         return True, ""
 
+    def _l0_frontend_import_check(self, target_file: str, code_content: str,
+                                  sandbox_dir: str,
+                                  pending_files: set = None) -> Tuple[bool, str]:
+        """
+        L0.F: 前端文件本地 import 引用完整性检查。
+
+        检测 JS/TS/Vue 文件中 import 的本地相对路径文件是否实际存在于沙盒中。
+        防止 Coder 生成 `import './style.css'` 但从未创建该文件的情况，
+        这会导致 Vite 启动时模块解析失败。
+
+        规则：
+        - 只检查本地相对路径引用（以 ./ 或 ../ 开头）
+        - 跳过 node_modules 引用（裸模块名如 'vue', 'axios'）
+        - 支持 Vite 的扩展名省略解析（.js/.ts/.jsx/.tsx/.vue/.json）
+        - 对 .vue 文件只检查 <script> 块内的 import
+        """
+        try:
+            # Vue 文件：只提取 <script> 块内容
+            if target_file.endswith('.vue'):
+                script_match = re.search(
+                    r'<script(?:\s[^>]*)?>(.+?)</script>',
+                    code_content, re.DOTALL | re.IGNORECASE
+                )
+                if not script_match:
+                    return True, ""  # 无 script 块，跳过
+                check_content = script_match.group(1)
+            else:
+                check_content = code_content
+
+            # 提取所有 import 的模块路径
+            # 匹配: import xxx from '...' / import '...' / import("...")
+            import_pattern = re.compile(
+                r"""(?:import\s+.*?\s+from\s+|import\s+)['"]([^'"]+)['"]""",
+                re.MULTILINE
+            )
+            imports = import_pattern.findall(check_content)
+
+            if not imports:
+                return True, ""
+
+            # 只检查本地相对路径引用
+            local_imports = [p for p in imports if p.startswith('./') or p.startswith('../')]
+            if not local_imports:
+                return True, ""
+
+            # 确定当前文件在沙盒中的目录
+            file_dir = os.path.dirname(target_file).replace("\\", "/")
+            abs_base = os.path.join(sandbox_dir, file_dir) if file_dir else sandbox_dir
+
+            # Vite 支持的省略扩展名（按优先级）
+            vite_extensions = ['.js', '.ts', '.jsx', '.tsx', '.vue', '.json', '.mjs', '.cjs']
+
+            missing_imports = []
+            for imp_path in local_imports:
+                # 解析相对路径
+                resolved = os.path.normpath(os.path.join(abs_base, imp_path))
+
+                # 精确路径存在
+                if os.path.isfile(resolved):
+                    continue
+
+                # 作为目录的 index 文件（import './components' → components/index.js）
+                if os.path.isdir(resolved):
+                    found_index = False
+                    for ext in vite_extensions:
+                        if os.path.isfile(os.path.join(resolved, f"index{ext}")):
+                            found_index = True
+                            break
+                    if found_index:
+                        continue
+
+                # 尝试 Vite 扩展名省略解析
+                found = False
+                for ext in vite_extensions:
+                    if os.path.isfile(resolved + ext):
+                        found = True
+                        break
+                if found:
+                    continue
+
+                missing_imports.append(imp_path)
+
+            # DAG 感知容错：过滤掉当前 DAG 中尚未执行但已规划的任务文件
+            # 这些文件将在后续任务中创建，当前 import 是合法的前向引用
+            if missing_imports and pending_files:
+                truly_missing = []
+                for imp in missing_imports:
+                    # 将 import 相对路径解析为项目内的归一化路径
+                    resolved_rel = os.path.normpath(
+                        os.path.join(file_dir, imp) if file_dir else imp
+                    ).replace("\\", "/").lstrip("/")
+                    # 尝试精确匹配和 Vite 扩展名省略匹配
+                    if resolved_rel in pending_files:
+                        logger.info(f"✅ [L0.F] DAG 容错: {imp} → {resolved_rel} 存在于 pending 任务中，跳过")
+                        continue
+                    found_pending = False
+                    for ext in vite_extensions:
+                        if (resolved_rel + ext) in pending_files:
+                            logger.info(f"✅ [L0.F] DAG 容错: {imp} → {resolved_rel + ext} 存在于 pending 任务中，跳过")
+                            found_pending = True
+                            break
+                    if not found_pending:
+                        truly_missing.append(imp)
+                missing_imports = truly_missing
+
+            if missing_imports:
+                missing_list = ", ".join(f"`{m}`" for m in missing_imports)
+                error = (
+                    f"[L0.F 前端引用缺失] {target_file}: "
+                    f"以下本地 import 引用的文件在项目中不存在: {missing_list}。"
+                    f"Vite 启动时会因模块解析失败而报错。"
+                    f"【修复方案】请删除这些 import 语句，或确保对应文件已被创建。"
+                )
+                logger.warning(f"❌ {error}")
+                global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+                return False, error
+
+            logger.info(f"✅ [L0.F] 前端 import 引用完整性通过: {target_file}")
+            return True, ""
+
+        except Exception as e:
+            logger.warning(f"⚠️ [L0.F] 前端 import 检查异常: {e}，跳过")
+            return True, ""
+
     def evaluate_skeleton(self, target_file: str, code_content: str = None,
                           sandbox_dir: str = None,
                           module_interfaces: dict = None,
@@ -396,6 +568,11 @@ class ReviewerAgent:
         
         正确做法：用 Pydantic BaseModel 接收 JSON body。
         """
+        # 守卫：非 FastAPI 项目直接跳过（Flask 等框架的 @app.post 不受此约束）
+        _fastapi_markers = ('from fastapi', 'import fastapi', 'APIRouter', 'FastAPI(')
+        if not any(marker in code_content for marker in _fastapi_markers):
+            return True, ""
+
         def _extract_route_meta(decorator: ast.AST) -> Tuple[str, set]:
             if not isinstance(decorator, ast.Call):
                 return "", set()
@@ -1788,6 +1965,19 @@ class ReviewerAgent:
     def _l0_import_check(self, target_file: str, sandbox_dir: str) -> Tuple[bool, str]:
 
         """L0.3: 在沙盒中尝试 import 模块，超时 10 秒"""
+        # 沙盒健康预检：sandbox_dir 不存在或 venv python 不可用时跳过
+        if not sandbox_dir or not os.path.isdir(sandbox_dir):
+            logger.warning("⚠️ [L0.3] sandbox_dir 不存在，跳过导入检查")
+            return True, ""
+        try:
+            _python_path = sandbox_env.venv_manager.get_or_create_venv(self.project_id)
+            if not os.path.isfile(_python_path):
+                logger.warning(f"⚠️ [L0.3] venv python 不存在: {_python_path}，跳过导入检查")
+                return True, ""
+        except Exception as _venv_err:
+            logger.warning(f"⚠️ [L0.3] venv 健康检查失败: {_venv_err}，跳过导入检查")
+            return True, ""
+
         # 从文件路径提取模块名
         module_name = os.path.splitext(os.path.basename(target_file))[0]
 
@@ -1866,6 +2056,22 @@ except Exception as e:
             if any(p in fail_detail for p in benign_patterns):
                 logger.warning(f"⚠️ [L0.3] 良性导入错误（跳过）: {fail_detail[:200]}")
                 return True, ""
+
+            # NameError 增强：提取缺失符号名，构建精确修复指令
+            name_error_match = re.search(r"name ['\"]([^'\"]+)['\"] is not defined", fail_detail)
+            if name_error_match:
+                missing_name = name_error_match.group(1)
+                error = (
+                    f"[L0.3 导入失败] {target_file}: {fail_detail}\n"
+                    f"【精确修复指令】在文件顶部的 import 区域添加 `{missing_name}` 的导入语句。"
+                    f"请检查代码中使用 `{missing_name}` 的位置，确认它来自哪个包，"
+                    f"然后在文件开头添加正确的 `from xxx import {missing_name}`。"
+                    f"常见来源: fastapi.middleware.cors.CORSMiddleware, "
+                    f"flask_cors.CORS, starlette.middleware.cors.CORSMiddleware 等。"
+                )
+                logger.warning(f"❌ {error}")
+                global_broadcaster.emit_sync("Reviewer", "l0_fail", error)
+                return False, error
 
             error = f"[L0.3 导入失败] {target_file}: {fail_detail}"
             logger.warning(f"❌ {error}")
@@ -1952,6 +2158,72 @@ except Exception as e:
                     if isinstance(target, ast.Name):
                         defined.add(target.id)
         return defined
+
+    @staticmethod
+    def _extract_route_paths_from_ast(tree) -> list:
+        """从 AST 中提取所有路由装饰器的路径（如 /api/records, /api/weight）。
+        用于 L0.2 路由路径匹配兜底。"""
+        paths = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for deco in node.decorator_list:
+                if not isinstance(deco, ast.Call):
+                    continue
+                func = deco.func
+                if not isinstance(func, ast.Attribute):
+                    continue
+                if func.attr not in ('get', 'post', 'put', 'delete', 'patch', 'route'):
+                    continue
+                # 提取第一个位置参数（路由路径）
+                if deco.args:
+                    first_arg = deco.args[0]
+                    if isinstance(first_arg, ast.Constant) and isinstance(first_arg.value, str):
+                        paths.append(first_arg.value)
+        return paths
+
+    @staticmethod
+    def _extract_contract_paths(project_spec: dict, target_file: str) -> dict:
+        """从 route_contracts 提取 handler_name → route_path 映射。
+        用于 L0.2 降级路由匹配：当 handler 名不匹配时，用路由路径做兜底。"""
+        if not isinstance(project_spec, dict):
+            return {}
+        mapping = {}
+        for field in ("route_contracts", "effective_route_manifest"):
+            for contract in project_spec.get(field, []) or []:
+                if not isinstance(contract, dict):
+                    continue
+                handler = contract.get("handler") or contract.get("function") or ""
+                # 清洗 handler（与 route_topology.py 一致）
+                handler = str(handler).split("?")[0].split("(")[0].strip()
+                if not handler or not handler.isidentifier():
+                    continue
+                path = (contract.get("effective_path")
+                        or contract.get("path")
+                        or contract.get("url")
+                        or contract.get("endpoint")
+                        or "")
+                if path:
+                    mapping[handler] = str(path).strip()
+        return mapping
+
+    @staticmethod
+    def _route_path_matches(expected: str, actual: str) -> bool:
+        """归一化比较两个路由路径（忽略尾部斜杠和前缀差异）。
+        如 '/api/records' 匹配 '/records' 或 '/api/records/'。"""
+        def normalize(p: str) -> str:
+            p = p.strip().rstrip("/")
+            # 取最后的有意义部分（忽略 /api 等通用前缀）
+            return p.lower()
+        ne = normalize(expected)
+        na = normalize(actual)
+        if ne == na:
+            return True
+        # 兜底：一方是另一方的后缀（如 /records 匹配 /api/records）
+        if ne.endswith(na) or na.endswith(ne):
+            return True
+        return False
+
 
     @staticmethod
     def _extract_expected_symbols(target_file: str,
@@ -2708,7 +2980,8 @@ except Exception as e:
                        code_content: str = None, sandbox_dir: str = None,
                        module_interfaces: dict = None,
                        project_spec: dict = None,
-                       task_id: str = "") -> Tuple[bool, str]:
+                       task_id: str = "",
+                       pending_files: set = None) -> Tuple[bool, str]:
         """
         评估文件草稿（v3 L0+L0C+L1 管线）
 
@@ -2737,7 +3010,8 @@ except Exception as e:
         expected_symbols = self._extract_expected_symbols(target_file, module_interfaces, project_spec)
         l0_pass, l0_error = self._l0_static_check(
             target_file, code_content, sandbox_dir, expected_symbols,
-            project_spec=project_spec, is_continue_fix=is_continue_fix)
+            project_spec=project_spec, is_continue_fix=is_continue_fix,
+            pending_files=pending_files)
 
         if not l0_pass:
             logger.warning(f"❌ Reviewer L0 驳回: {l0_error[:200]}")

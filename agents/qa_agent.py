@@ -24,7 +24,9 @@ from core.ws_broadcaster import global_broadcaster
 
 logger = logging.getLogger("QAAgent")
 
-MAX_STEPS = 16       # ReAct 循环最大步数（per-endpoint 模式需要更多步数）
+MAX_STEPS = 16       # ReAct 循环默认最大步数（可被动态覆盖）
+MAX_STEPS_MIN = 10   # 动态计算下限
+MAX_STEPS_MAX = 25   # 动态计算上限
 FUSE_THRESHOLD = 3   # 连续相同错误 N 次 → 熔断
 
 
@@ -91,14 +93,18 @@ class QAAgent:
 
         tool_schemas = skill_runner.get_tool_schemas()
         last_errors = []  # 用于连续错误检测
-
         no_tool_count = 0  # 连续无 tool_call 计数
 
-        for step in range(1, MAX_STEPS + 1):
-            remaining = MAX_STEPS - step
-            logger.info(f"🔄 [QA Agent] Step {step}/{MAX_STEPS} (剩余 {remaining} 步)")
+        # v5.3: 动态 MAX_STEPS — 根据端点数量弹性计算
+        estimated_endpoints = len(focus_endpoints) if focus_endpoints else self._estimate_endpoint_count(all_code)
+        dynamic_max = max(MAX_STEPS_MIN, min(MAX_STEPS_MAX, 6 + estimated_endpoints * 2))
+        logger.info(f"📊 [QA Agent] 动态步数上限: {dynamic_max} (预估 {estimated_endpoints} 端点)")
+
+        for step in range(1, dynamic_max + 1):
+            remaining = dynamic_max - step
+            logger.info(f"🔄 [QA Agent] Step {step}/{dynamic_max} (剩余 {remaining} 步)")
             global_broadcaster.emit_sync("QAAgent", "step",
-                f"🔄 QA 测试 Step {step}/{MAX_STEPS}")
+                f"🔄 QA 测试 Step {step}/{dynamic_max}")
 
             # 临近上限时，强制要求 report_result
             if remaining <= 2:
@@ -222,9 +228,9 @@ class QAAgent:
                         last_errors.clear()
 
         # 超过 MAX_STEPS — 做最后一次尝试从历史中提取判定
-        logger.warning(f"🔥 [QA Agent] 达到最大步数 {MAX_STEPS}，尝试提取判定...")
+        logger.warning(f"🔥 [QA Agent] 达到最大步数 {dynamic_max}，尝试提取判定...")
         global_broadcaster.emit_sync("QAAgent", "fused",
-            f"🔥 QA Agent 达到最大步数 {MAX_STEPS}，提取判定中...")
+            f"🔥 QA Agent 达到最大步数 {dynamic_max}，提取判定中...")
 
         # 从最后几条消息提取可能的判定
         last_text = ""
@@ -240,7 +246,7 @@ class QAAgent:
             return self._extract_result_from_text(last_text)
 
         return self._make_result(
-            False, f"QA Agent 熔断: 达到最大步数 {MAX_STEPS}，未能完成测试",
+            False, f"QA Agent 熔断: 达到最大步数 {dynamic_max}，未能完成测试",
             warning=True,
         )
 
@@ -345,28 +351,92 @@ class QAAgent:
 {project_spec[:3000] if project_spec else '(无规划书)'}
 """
 
-    def _build_user_prompt(self, all_code: Dict[str, str]) -> str:
-        """构建首轮 user 消息"""
-        # 只展示关键文件的代码摘要
-        key_files = []
-        for fname in sorted(all_code.keys()):
-            if fname.endswith((".py", ".js")):
-                code = all_code[fname]
-                if code:
-                    key_files.append(f"=== {fname} ===\n{code[:1000]}")
+        # v5.3: 检测 Vite 前端代理层
+        vite_proxy_hint = ""
+        has_vite = any(
+            fname in ("vite.config.js", "vite.config.ts",
+                      "vite.config.mjs", "vite.config.mts")
+            for fname in all_code.keys()
+        )
+        if has_vite:
+            vite_port = 5173  # Vite 默认端口
+            for vname in ("vite.config.js", "vite.config.ts", "vite.config.mjs", "vite.config.mts"):
+                if vname in all_code:
+                    vite_code = all_code[vname]
+                    port_match = re.search(r'port\s*[:=]\s*(\d{4,5})', vite_code)
+                    if port_match:
+                        vite_port = int(port_match.group(1))
+                    break
+            vite_proxy_hint = (
+                f"\n\n【⚠️ Vite 前端代理层检测到】\n"
+                f"本项目包含 Vite 前端，开发服务器端口: {vite_port}\n"
+                f"后端 API 通过 Vite 代理转发。请额外验证:\n"
+                f"  - run_terminal(command='npx vite --port {vite_port}', background=true)\n"
+                f"  - check_port(port={vite_port}) 确认 Vite 就绪\n"
+                f"  - http_request(url='http://127.0.0.1:{vite_port}/') 测试前端页面\n"
+                f"  - 对比直连后端 ({port}) 和 Vite 代理 ({vite_port}) 的 API 响应是否一致"
+            )
 
-        code_summary = "\n\n".join(key_files[:5])  # 最多展示 5 个文件
+        return prompt + vite_proxy_hint
+
+    def _build_user_prompt(self, all_code: Dict[str, str]) -> str:
+        """构建首轮 user 消息 — v5.3: 入口/路由文件优先完整展示"""
+        # 按优先级分类文件
+        entry_names = {"app.py", "main.py", "server.py", "run.py", "wsgi.py"}
+        route_names = {"routes.py", "views.py", "api.py", "urls.py"}
+
+        priority_files = []   # 入口 + 路由：完整展示
+        secondary_files = []  # 其他代码文件：截断展示
+
+        for fname in sorted(all_code.keys()):
+            if not fname.endswith((".py", ".js")):
+                continue
+            code = all_code[fname]
+            if not code:
+                continue
+            basename = os.path.basename(fname)
+            if basename in entry_names or basename in route_names:
+                # 入口/路由文件：最多 3000 字符（确保路由定义不被截断）
+                priority_files.append(f"=== {fname} (完整) ===\n{code[:3000]}")
+            else:
+                secondary_files.append(f"=== {fname} ===\n{code[:800]}")
+
+        # 优先级文件最多 3 个，其余文件最多 3 个
+        parts = priority_files[:3] + secondary_files[:3]
+        code_summary = "\n\n".join(parts)
 
         return f"""项目代码已就绪，请开始 QA 验收测试。
 
 【关键文件预览】
-{code_summary[:5000]}
+{code_summary[:8000]}
 
 请从启动服务开始，按照标准测试流程逐步验证。"""
 
     # ============================================================
     # 辅助方法
     # ============================================================
+
+    @staticmethod
+    def _estimate_endpoint_count(all_code: Dict[str, str]) -> int:
+        """从代码中预估 HTTP 端点数量（用于动态 MAX_STEPS 计算）"""
+        count = 0
+        # Flask/FastAPI 路由装饰器模式
+        route_patterns = [
+            r'@\w+\.route\(',        # Flask: @app.route(...)
+            r'@\w+\.get\(',          # FastAPI: @app.get(...)
+            r'@\w+\.post\(',         # FastAPI: @app.post(...)
+            r'@\w+\.put\(',          # FastAPI: @app.put(...)
+            r'@\w+\.delete\(',       # FastAPI: @app.delete(...)
+            r'@\w+\.patch\(',        # FastAPI: @app.patch(...)
+        ]
+        combined = '|'.join(route_patterns)
+        for fname, code in all_code.items():
+            if not fname.endswith('.py') or not code:
+                continue
+            matches = re.findall(combined, code)
+            count += len(matches)
+        # 最少返回 3（首页 + 基本 CRUD），避免低估
+        return max(3, count)
 
     @staticmethod
     def _detect_entry_file(all_code: Dict[str, str]) -> str:

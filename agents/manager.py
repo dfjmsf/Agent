@@ -344,10 +344,11 @@ class ManagerAgent:
 
     def plan_tasks(self, user_requirement: str, project_spec: dict = None,
                    manager_playbook: str = "", complex_files_hint: str = "",
-                   plan_md: str = None) -> dict:
+                   plan_md: str = None, phase_constraint: dict = None) -> dict:
         """
         步骤 2: 基于规划书拆解任务列表。
         plan_md: 用户确认过的 plan.md，作为 P0.5 合同约束
+        phase_constraint: Phase 模式下的范围约束 {index, name, features, scope_type, ...}
         """
         logger.info("🧠 Manager 正在基于规划书拆解任务...")
         
@@ -401,13 +402,45 @@ class ManagerAgent:
             )
             logger.info("📜 plan.md 合同已注入 Manager Plan Prompt")
 
-        # 5. 组装 system_prompt（按优先级排列：P0.5 plan.md > 规则 > P1 规划书 > 环境 > P2 经验）
+        # 4.6 构建 Phase 约束文本（P0 级，最高优先）
+        phase_constraint_text = ""
+        if phase_constraint:
+            p_name = phase_constraint.get("name", "")
+            p_scope = phase_constraint.get("scope_type", "fullstack")
+            p_features = phase_constraint.get("features", [])
+            p_completed = phase_constraint.get("completed_phases", [])
+            scope_file_hint = {
+                "backend": "只允许创建后端相关文件（.py 服务/模型/路由 + .html 模板文件如 Jinja2）。严禁创建纯前端文件（.jsx/.tsx/.vue/.svelte/.css/.js 等独立前端组件）。",
+                "frontend": "只允许创建前端文件（.html/.js/.css/.jsx/.tsx/.vue 等）。后端 .py 文件已在前序阶段完成，只允许 weld 修改入口文件以挂载前端路由。",
+                "fullstack": "本阶段同时涉及前后端，无文件类型限制。",
+            }
+            phase_constraint_text = (
+                f"\n\n═══ P0 — Phase 范围引导（高优先级）═══\n"
+                f"当前正在执行 Phase {phase_constraint.get('index', '?')}: {p_name}\n"
+                f"阶段范围: {p_scope}\n"
+                f"{scope_file_hint.get(p_scope, scope_file_hint['fullstack'])}\n\n"
+                f"本阶段只允许规划以下功能范围内的文件：\n"
+                + "\n".join(f"  - {feat}" for feat in p_features)
+                + f"\n\n⚠️ 范围提示：\n"
+                f"1. 优先规划属于「{p_name}」范围的文件\n"
+                f"2. 其他阶段的独立功能可暂不规划，但共用的配置文件和模板可以包含\n"
+                f"3. 确保输出的 tasks 能让本阶段的功能独立运行\n"
+            )
+            if p_completed:
+                phase_constraint_text += (
+                    f"\n已完成的阶段: {', '.join(p_completed)}\n"
+                    f"这些阶段的产出文件已存在，如需引用可在 dependencies 中声明\n"
+                )
+            logger.info(f"📋 Phase P0 约束已注入 Prompt: {p_name}[{p_scope}]")
+
+        # 5. 组装 system_prompt（按优先级排列：P0 Phase > P0.5 plan.md > 规则 > P1 规划书 > 环境 > P2 经验）
         manager_system = Prompts.MANAGER_SYSTEM.format(
             manager_playbook=manager_playbook,
             complex_files_hint=complex_files_hint or ""
         )
         system_prompt = (
-            plan_md_context  # P0.5: plan.md 合同最高优先
+            phase_constraint_text  # P0: Phase 硬约束最高优先
+            + plan_md_context  # P0.5: plan.md 合同
             + manager_system
             + spec_context  # P1: 规划书紧跟规则之后
             + f"\n\n{env_context}"  # 环境信息
@@ -456,7 +489,11 @@ class ManagerAgent:
             if len(deduped_tasks) < len(plan["tasks"]):
                 logger.warning(f"⚠️ Manager 去重: {len(plan['tasks'])} → {len(deduped_tasks)} 个 task")
             plan["tasks"] = deduped_tasks
-                
+
+            # Phase 后置过滤：确定性剔除不属于当前阶段的文件
+            if phase_constraint:
+                plan["tasks"] = self._filter_tasks_by_phase(plan["tasks"], phase_constraint)
+
             logger.info(f"✅ 任务拆解完成: {plan.get('project_name')}")
             global_broadcaster.emit_sync("Manager", "plan_ready", f"成功拆解任务: {plan.get('project_name')}", {"plan": plan})
             
@@ -468,6 +505,66 @@ class ManagerAgent:
         except Exception as e:
             logger.error(f"Manager 拆解任务时发生异常: {e}")
             return {"project_name": "Error_Project", "architecture_summary": "API异常", "tasks": []}
+
+
+    # ============================================================
+    # Phase 感知：确定性任务过滤
+    # ============================================================
+
+    def _filter_tasks_by_phase(self, tasks: list, phase_constraint: dict) -> list:
+        """确定性过滤：根据 Phase 的 scope_type 剔除越界 task。
+
+        规则：
+        - backend: 剔除前端文件（.html/.js/.css/.jsx/.tsx/.vue/.svelte）
+        - frontend: 剔除纯后端文件（.py），但保留入口文件的 weld 修改
+        - fullstack: 不过滤
+        """
+        scope_type = phase_constraint.get('scope_type', 'fullstack')
+        if scope_type == 'fullstack':
+            return tasks
+
+        backend_exts = {'.py'}
+        # .html 不在此列表：Flask/Jinja2 SSR 中模板属于后端
+        frontend_exts = {'.css', '.js', '.jsx', '.ts', '.tsx', '.vue', '.svelte', '.scss', '.less'}
+        config_exts = {'.txt', '.toml', '.cfg', '.ini', '.json', '.yaml', '.yml', '.env', '.md'}
+
+        filtered = []
+        for task in tasks:
+            target = task.get('target_file', '')
+            ext = os.path.splitext(target)[1].lower()
+
+            # 配置文件永远放行
+            if ext in config_exts or not ext:
+                filtered.append(task)
+                continue
+
+            if scope_type == 'backend' and ext in frontend_exts:
+                logger.warning(f'\u26a0\ufe0f [Phase 过滤] 剔除前端文件: {target}')
+                global_broadcaster.emit_sync(
+                    'Manager', 'phase_filter',
+                    f'\u26a0\ufe0f Phase 过滤: 剔除非本阶段文件 {target}'
+                )
+                continue
+            if scope_type == 'frontend' and ext in backend_exts:
+                # 前端阶段允许 weld 入口文件（挂载前端路由）
+                if task.get('task_type') == 'weld':
+                    filtered.append(task)
+                    continue
+                logger.warning(f'\u26a0\ufe0f [Phase 过滤] 剔除后端文件: {target}')
+                global_broadcaster.emit_sync(
+                    'Manager', 'phase_filter',
+                    f'\u26a0\ufe0f Phase 过滤: 剔除非本阶段文件 {target}'
+                )
+                continue
+            filtered.append(task)
+
+        if len(filtered) < len(tasks):
+            logger.info(f'\U0001f50d [Phase 过滤] {len(tasks)} \u2192 {len(filtered)} 个 task (scope={scope_type})')
+            global_broadcaster.emit_sync(
+                'Manager', 'phase_filter_summary',
+                f'\U0001f50d Phase 过滤: {len(tasks)} \u2192 {len(filtered)} 个任务 (scope={scope_type})'
+            )
+        return filtered
 
     # ============================================================
     # 两阶段规划（Phase 0.1: 20+ 文件大项目）
@@ -588,13 +685,34 @@ class ManagerAgent:
             logger.error(f"❌ [两阶段] Stage 2 [{group_id}] 失败: {e}")
             return []
 
+    @staticmethod
+    def _clean_tech_lead_filename(raw: str) -> str:
+        """清理 TechLead 输出中的中文/英文括号注释。
+        例如 'index.html（缺失文件，需新建）' → 'index.html'
+        例如 'index.html (missing)' → 'index.html'
+        """
+        import re
+        # 中文全角括号
+        cleaned = re.sub(r'\uff08[^\uff09]*\uff09', '', raw)
+        # 英文括号（仅清理末尾的注释性括号，不清理路径中的合法括号）
+        cleaned = re.sub(r'\s*\([^)]*\)\s*$', '', cleaned)
+        return cleaned.strip()
+
     def _normalize_patch_target_file(self, base_dir: str, raw_file: Any,
-                                     existing_files: set) -> str:
-        """将 TechLead verdict 中的文件路径归一化为项目内相对路径。"""
+                                     existing_files: set,
+                                     allow_new: bool = False) -> str:
+        """将 TechLead verdict 中的文件路径归一化为项目内相对路径。
+        
+        Args:
+            allow_new: 若为 True，允许返回不存在于 existing_files 中的文件路径
+                      （用于 Patch Mode 创建缺失文件场景）
+        """
         if not raw_file:
             return ""
 
         text = str(raw_file).strip().strip("`\"'")
+        # 清理 TechLead 输出中的中文括号注释
+        text = self._clean_tech_lead_filename(text)
         if not text:
             return ""
 
@@ -630,8 +748,16 @@ class ManagerAgent:
             return ""
         if existing_files and rel not in existing_files:
             lower_map = {path.lower(): path for path in existing_files}
-            rel = lower_map.get(rel.lower(), "")
+            matched = lower_map.get(rel.lower(), "")
+            if matched:
+                return matched
+            # 文件不存在但 allow_new=True → 允许创建新文件
+            if allow_new:
+                return rel
+            return ""
         elif not existing_files and not os.path.isfile(os.path.join(base_abs, rel)):
+            if allow_new:
+                return rel
             return ""
         return rel
 
@@ -650,19 +776,54 @@ class ManagerAgent:
         confidence = tech_lead_diagnosis.get("confidence", 0.0)
         recommended = tech_lead_diagnosis.get("recommended_target_files", []) or []
 
-        # TechLead 已给出有罪文件时，Patch 快车道只生成一个写任务。
-        # recommended_target_files 只能作为只读上下文，避免把单点修复扩散到无关组件。
+        # 构建写目标列表：guilty_file 为主目标，
+        # recommended_target_files 中被 fix_instruction 明确引用的文件也升级为写目标。
+        # 防扩散逻辑：只有文件名出现在 fix_instruction 中才升级，避免无关文件被误修改。
         if guilty_file:
             raw_targets = [guilty_file]
+            # 检查 recommended 中是否有文件被 fix_instruction 明确引用
+            if recommended and fix_instruction:
+                fix_text_lower = fix_instruction.lower()
+                recommended_list = [recommended] if isinstance(recommended, str) else list(recommended)
+                for rec_file in recommended_list:
+                    if not rec_file or rec_file == guilty_file:
+                        continue
+                    # 文件名（含路径或仅 basename）出现在修复指令中 → 需要修改
+                    rec_basename = os.path.basename(str(rec_file))
+                    if (str(rec_file).lower() in fix_text_lower
+                            or rec_basename.lower() in fix_text_lower):
+                        raw_targets.append(rec_file)
+                if len(raw_targets) > 1:
+                    logger.info(
+                        "[Patch Mode] TechLead 快车道扩展写目标: %s → %s (fix_instruction 引用)",
+                        guilty_file, raw_targets,
+                    )
         elif isinstance(recommended, str):
             raw_targets = [recommended]
         else:
             raw_targets = list(recommended)
 
+        # 判断是否可能需要创建新文件
+        root_cause_type = str(tech_lead_diagnosis.get("root_cause_type", "")).strip()
+        is_missing_file = root_cause_type in ("missing_export", "missing_file", "missing_module")
+
         targets = []
+        new_file_targets = set()  # 记录需要新建的文件
         seen = set()
         for raw_target in raw_targets:
+            # 先尝试严格匹配已有文件
             target = self._normalize_patch_target_file(base_dir, raw_target, existing_set)
+            if not target and is_missing_file:
+                # 文件不存在但属于 missing_file 类根因 → 允许创建
+                target = self._normalize_patch_target_file(
+                    base_dir, raw_target, existing_set, allow_new=True
+                )
+                if target:
+                    new_file_targets.add(target)
+                    logger.info(
+                        "[Patch Mode] TechLead 快车道: 允许创建缺失文件 %s (root_cause_type=%s)",
+                        target, root_cause_type,
+                    )
             if target and target not in seen:
                 seen.add(target)
                 targets.append(target)
@@ -674,17 +835,18 @@ class ManagerAgent:
             )
             return None
 
+        # targets_set 用于判断哪些 recommended 文件是写目标、哪些是只读上下文
+        targets_set = set(targets)
+
         tasks = []
         for idx, target_file in enumerate(targets, start=1):
             readonly_context = ""
-            if guilty_file and recommended:
-                if isinstance(recommended, str):
-                    recommended_list = [recommended]
-                else:
-                    recommended_list = list(recommended)
+            if recommended:
+                recommended_list = [recommended] if isinstance(recommended, str) else list(recommended)
                 context_files = [
                     item for item in recommended_list
-                    if item and self._normalize_patch_target_file(base_dir, item, existing_set) != target_file
+                    if item
+                    and self._normalize_patch_target_file(base_dir, item, existing_set) not in targets_set
                 ]
                 if context_files:
                     readonly_context = (
@@ -692,25 +854,39 @@ class ManagerAgent:
                         f"{', '.join(context_files)}\n"
                         "这些文件不得作为本轮写目标。"
                     )
-            description = (
-                "【Patch Mode TechLead 快车道】\n"
-                f"用户需求:\n{user_requirement}\n\n"
-                f"TechLead 置信度: {confidence:.0%}\n"
-                f"有罪文件: {guilty_file}\n\n"
-                f"【根因】\n{root_cause}\n\n"
-                f"【精确修复指令】\n{fix_instruction}\n\n"
-                f"{readonly_context}"
-                f"只允许修改 `{target_file}`。必须优先使用 Editor 的 "
-                "`start_line/end_line` 行号定位完成局部修复；禁止全量重建项目。"
-            )
+
+            is_new = target_file in new_file_targets
+            if is_new:
+                description = (
+                    "【Patch Mode TechLead 快车道 — 新建缺失文件】\n"
+                    f"用户需求:\n{user_requirement}\n\n"
+                    f"TechLead 置信度: {confidence:.0%}\n\n"
+                    f"【根因】\n{root_cause}\n\n"
+                    f"【精确创建指令】\n{fix_instruction}\n\n"
+                    f"{readonly_context}"
+                    f"请创建文件 `{target_file}`，内容必须严格遵循上述指令。"
+                )
+            else:
+                description = (
+                    "【Patch Mode TechLead 快车道】\n"
+                    f"用户需求:\n{user_requirement}\n\n"
+                    f"TechLead 置信度: {confidence:.0%}\n"
+                    f"有罪文件: {guilty_file}\n\n"
+                    f"【根因】\n{root_cause}\n\n"
+                    f"【精确修复指令】\n{fix_instruction}\n\n"
+                    f"{readonly_context}"
+                    f"只允许修改 `{target_file}`。必须优先使用 Editor 的 "
+                    "`start_line/end_line` 行号定位完成局部修复；禁止全量重建项目。"
+                )
             tasks.append({
                 "task_id": f"patch_tl_{idx}",
                 "target_file": target_file,
                 "description": description,
                 "dependencies": [],
-                "task_type": "weld",
-                "draft_action": "modify",
+                "task_type": "new_file" if is_new else "weld",
+                "draft_action": "create" if is_new else "modify",
                 "write_targets": [target_file],
+                "tech_lead_invoked": True,
             })
 
         plan = {
@@ -1431,105 +1607,48 @@ class ManagerAgent:
             )
 
             json_str = raw_response.content
+            # 记录 LLM 原始输出前 500 字符（事后诊断用）
+            logger.info("[Extend Mode] LLM 原始输出预览: %s", json_str[:500])
             if "```json" in json_str:
                 json_str = json_str.split("```json")[1].split("```")[0].strip()
             elif "```" in json_str:
                 json_str = json_str.split("```")[1].split("```")[0].strip()
 
-            plan = json.loads(json_str)
-        except json.JSONDecodeError:
-            logger.error(f"[Extend Mode] Manager 返回非 JSON: {getattr(raw_response, 'content', '')[:200]}")
-            return {"project_name": self.project_id, "architecture_summary": "新增模块规划失败", "tasks": []}
+            try:
+                plan = json.loads(json_str)
+            except json.JSONDecodeError:
+                # 截断 JSON 自动修复（复用 Patch Mode 的修复链路）
+                logger.warning("[Extend Mode] JSON 解析失败，尝试截断修复...")
+                repaired = self._repair_truncated_json(json_str)
+                if repaired:
+                    plan = repaired
+                    logger.info("[Extend Mode] 截断 JSON 修复成功")
+                else:
+                    logger.error(
+                        "[Extend Mode] Manager 返回非法 JSON，截断修复也失败。原始输出:\n%s",
+                        json_str[:1000],
+                    )
+                    return {"project_name": self.project_id, "architecture_summary": "新增模块规划失败（JSON 解析失败）", "tasks": []}
         except Exception as e:
             logger.error(f"[Extend Mode] Manager 规划异常: {e}")
             return {"project_name": self.project_id, "architecture_summary": "新增模块规划失败", "tasks": []}
 
+        # 方案 A: 归一化职责完全交给 extend.py 的 _normalize_extend_plan
+        # manager 只设置 project_name 和 route_blacklist，不修改 tasks/dependencies/task_id
         plan["project_name"] = self.project_id
         extend_context = dict(plan.get("extend_context") or {})
         extend_context["route_blacklist"] = route_blacklist
+        plan["extend_context"] = extend_context
 
         raw_tasks = plan.get("tasks") or []
-        normalized_tasks: List[Dict[str, Any]] = []
-        new_files: List[str] = []
-        weld_targets: List[str] = []
-        new_task_ids: List[str] = []
-        seen_task_targets = set()
-
-        for idx, task in enumerate(raw_tasks, start=1):
-            if not isinstance(task, dict):
-                continue
-            target_file = str(task.get("target_file", "")).replace("\\", "/").lstrip("/")
-            if not target_file or target_file in seen_task_targets:
-                continue
-
-            seen_task_targets.add(target_file)
-            item = dict(task)
-            item["task_id"] = str(item.get("task_id") or f"ext_{idx}")
-            item["target_file"] = target_file
-            item["dependencies"] = [str(dep) for dep in (item.get("dependencies") or []) if dep]
-
-            if target_file in existing_files:
-                item["task_type"] = "weld"
-                item["draft_action"] = "modify"
-                item["write_targets"] = [target_file]
-                if target_file not in weld_targets:
-                    weld_targets.append(target_file)
-            else:
-                item["task_type"] = "new_file"
-                item.pop("draft_action", None)
-                item["write_targets"] = [target_file]
-                if target_file not in new_files:
-                    new_files.append(target_file)
-                new_task_ids.append(item["task_id"])
-
-            normalized_tasks.append(item)
-
-        if new_task_ids:
-            for item in normalized_tasks:
-                if item.get("task_type") != "weld":
-                    continue
-                deps = []
-                for dep in list(item.get("dependencies") or []) + new_task_ids:
-                    if dep and dep not in deps:
-                        deps.append(dep)
-                item["dependencies"] = deps
-
-        normalized_routes: List[Dict[str, str]] = []
-        seen_routes = set()
-        for item in extend_context.get("new_routes") or []:
-            if not isinstance(item, dict):
-                continue
-            path = str(item.get("path", "")).strip()
-            if not path:
-                continue
-            method = str(item.get("method", "GET") or "GET").upper()
-            route_file = str(item.get("file", "") or "").replace("\\", "/").lstrip("/")
-            route_key = (method, path, route_file)
-            if route_key in seen_routes:
-                continue
-            seen_routes.add(route_key)
-            normalized_routes.append({
-                "method": method,
-                "path": path,
-                "file": route_file,
-            })
-
-        extend_context["new_files"] = new_files
-        extend_context["weld_targets"] = weld_targets
-        extend_context["new_routes"] = normalized_routes
-        plan["extend_context"] = extend_context
-        plan["tasks"] = normalized_tasks
-
         logger.info(
-            "[Extend Mode] 规划完成: %s 个任务, new_files=%s, weld_targets=%s",
-            len(normalized_tasks),
-            new_files,
-            weld_targets,
+            "[Extend Mode] LLM 原始规划: %s 个任务",
+            len(raw_tasks),
         )
         global_broadcaster.emit_sync(
             "Manager",
             "extend_plan_ready",
-            f"Extend Mode: {len(normalized_tasks)} 个任务",
+            f"Extend Mode: {len(raw_tasks)} 个原始任务（待 extend.py 归一化）",
             {"plan": plan},
         )
         return plan

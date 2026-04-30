@@ -358,6 +358,8 @@ class Blackboard:
                 write_targets=t.get("write_targets", []),
                 sub_tasks=t.get("sub_tasks", []),
                 draft_action=t.get("draft_action"),
+                tech_lead_invoked=t.get("tech_lead_invoked", False),
+                tech_lead_feedback=t.get("tech_lead_feedback", ""),
             )
             task_items.append(item)
         self._state.tasks = task_items
@@ -382,13 +384,18 @@ class Blackboard:
         # v4.1: 收集已有 task_id，防止 ID 冲突导致死循环
         existing_ids = {t.task_id for t in self._state.tasks}
 
+        # v5.3: 记录重命名映射，用于级联更新 dependencies
+        rename_map: Dict[str, str] = {}
+
         new_items: List[TaskItem] = []
         for t in tasks:
             raw_id = t.get("task_id", f"task_{len(self._state.tasks)+len(new_items)+1}")
             # 冲突检测：若 ID 已存在，加 group 前缀确保唯一
             if raw_id in existing_ids:
                 prefix = (group_id or "appended").replace(":", "_")
-                raw_id = f"{prefix}_{raw_id}"
+                new_id = f"{prefix}_{raw_id}"
+                rename_map[raw_id] = new_id
+                raw_id = new_id
             existing_ids.add(raw_id)
 
             item = TaskItem(
@@ -407,6 +414,23 @@ class Blackboard:
                 draft_action=t.get("draft_action"),
             )
             new_items.append(item)
+
+        # v5.3: 级联更新 dependencies 中被重命名的 task_id 引用
+        # 防止 Extend 任务的依赖指向 Round 1 的同名历史任务导致跨轮次死锁
+        if rename_map:
+            renamed_count = 0
+            for item in new_items:
+                updated_deps = [rename_map.get(dep, dep) for dep in item.dependencies]
+                if updated_deps != item.dependencies:
+                    renamed_count += 1
+                    item.dependencies = updated_deps
+            if renamed_count:
+                logger.info(
+                    "🔗 [append_tasks] 级联更新 %d 个任务的 dependencies (重命名: %s)",
+                    renamed_count,
+                    ", ".join(f"{k}→{v}" for k, v in rename_map.items()),
+                )
+
         self._state.tasks.extend(new_items)
         if dag_metadata:
             if not self._state.dag_metadata:

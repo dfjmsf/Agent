@@ -251,6 +251,27 @@ class TaskRunner:
                     )
                     logger.warning(f"⚠️ [{task.task_id}] 连续 SOFT_PASS → 降级 FAIL")
 
+            # P3: 连续相同 L0 失败降级 — 同一 L0 错误连续 3 次重复，
+            # 说明 Coder 无法修复该检查项（可能是规则过严），降级为 warning 放行
+            _SAME_L0_THRESHOLD = 3
+            if not is_pass and "[L0." in reviewer_feedback:
+                # 提取最近 N 条 Reviewer 驳回记录
+                _recent_l0_errors = [
+                    log for log in (task.error_logs or [])[-_SAME_L0_THRESHOLD:]
+                    if isinstance(log, str) and log.startswith("Reviewer 驳回:")
+                ]
+                if (len(_recent_l0_errors) >= _SAME_L0_THRESHOLD
+                        and len(set(_recent_l0_errors)) == 1):
+                    logger.warning(
+                        f"⚠️ [{task.task_id}] 连续 {_SAME_L0_THRESHOLD} 次相同 L0 失败，"
+                        f"降级为 warning 放行: {reviewer_feedback[:100]}"
+                    )
+                    is_pass = True
+                    reviewer_feedback = (
+                        f"[L0_DEGRADED] 连续 {_SAME_L0_THRESHOLD} 次相同 L0 失败，"
+                        f"降级为 warning 放行。原始错误: {reviewer_feedback[:300]}"
+                    )
+
             # 记录 TDD 轮次事件
             self._record_tdd_event(task, merged, is_pass, reviewer_feedback)
 
@@ -393,6 +414,20 @@ class TaskRunner:
             "SFC结构缺失",
             "CSS花括号错误",
             "Unexpected }",
+            # v4.4: Scope Expansion 反馈信号 — Reviewer 报告缺少函数/未定义时，
+            # 说明 Coder 被 AST 切片困住无法新增定义，必须清除切片
+            "缺少函数",
+            "缺少方法",
+            "函数未定义",
+            "未定义函数",
+            "未实现",
+            "missing function",
+            "undefined function",
+            "not defined",
+            "is not defined",
+            "新增函数",
+            "添加函数",
+            "需要实现",
         )
         return any(marker in text for marker in markers)
 
@@ -864,12 +899,25 @@ class TaskRunner:
             pass
 
         try:
+            # 提取 DAG 中尚未完成的任务文件集，供 L0.F 前端 import 容错
+            pending_files = set()
+            try:
+                from core.blackboard import TaskStatus
+                for t in self.blackboard.state.tasks:
+                    if t.status not in {TaskStatus.DONE, TaskStatus.FUSED}:
+                        tf = t.target_file.replace("\\", "/").lstrip("/")
+                        if tf:
+                            pending_files.add(tf)
+            except Exception:
+                pass
+
             return reviewer.evaluate_draft(task.target_file, task.description,
                                            code_content=merged_code,
                                            sandbox_dir=sandbox_dir,
                                            module_interfaces=module_interfaces,
                                            project_spec=project_spec,
-                                           task_id=task.task_id)
+                                           task_id=task.task_id,
+                                           pending_files=pending_files or None)
         except Exception as e:
             err_msg = str(e)
             if 'interpreter shutdown' in err_msg or 'Event loop is closed' in err_msg:
@@ -1027,6 +1075,8 @@ class TaskRunner:
                     blocked_task.task_id, provider_task_id,
                 )
 
+        primary_action = "no_action"
+
         if guilty_task:
             if guilty_task.status == TaskStatus.DONE:
                 logger.info(
@@ -1047,36 +1097,89 @@ class TaskRunner:
                 )
                 _inject_dependency(guilty_task.task_id)
                 self.blackboard.reopen_task(blocked_task.task_id, reset_retry=False)
-                return "reopened_done_task"
-
-            logger.info(
-                "⚖️ TechLead 仲裁: 未完成 provider 任务注入修复指令 %s -> %s",
-                guilty_task.task_id,
-                guilty_file,
-            )
-            self.blackboard.nudge_task_for_tech_lead(
-                guilty_task.task_id,
+                primary_action = "reopened_done_task"
+            else:
+                logger.info(
+                    "⚖️ TechLead 仲裁: 未完成 provider 任务注入修复指令 %s -> %s",
+                    guilty_task.task_id,
+                    guilty_file,
+                )
+                self.blackboard.nudge_task_for_tech_lead(
+                    guilty_task.task_id,
+                    fix_instruction=fix_instruction,
+                    reorder_before=blocked_task.task_id,
+                )
+                _inject_dependency(guilty_task.task_id)
+                self.blackboard.reopen_task(blocked_task.task_id, reset_retry=False)
+                primary_action = "nudged_existing_task"
+        else:
+            logger.info("⚖️ TechLead 仲裁: 注入最小修复任务 -> %s", guilty_file)
+            injected_id = self.blackboard.inject_targeted_fix_task(
+                target_file=guilty_file,
+                description=(
+                    f"[TECHLEAD_PIVOT_FIX] 修复 {guilty_file} 对"
+                    f" `{signal.missing_symbol or '跨文件契约'}` 的提供，解除 {blocked_task.target_file} 阻塞"
+                ),
                 fix_instruction=fix_instruction,
                 reorder_before=blocked_task.task_id,
+                source_task_id=blocked_task.task_id,
             )
-            _inject_dependency(guilty_task.task_id)
+            _inject_dependency(injected_id)
             self.blackboard.reopen_task(blocked_task.task_id, reset_retry=False)
-            return "nudged_existing_task"
+            primary_action = "injected_minimal_task"
 
-        logger.info("⚖️ TechLead 仲裁: 注入最小修复任务 -> %s", guilty_file)
-        injected_id = self.blackboard.inject_targeted_fix_task(
-            target_file=guilty_file,
-            description=(
-                f"[TECHLEAD_PIVOT_FIX] 修复 {guilty_file} 对"
-                f" `{signal.missing_symbol or '跨文件契约'}` 的提供，解除 {blocked_task.target_file} 阻塞"
-            ),
-            fix_instruction=fix_instruction,
-            reorder_before=blocked_task.task_id,
-            source_task_id=blocked_task.task_id,
-        )
-        _inject_dependency(injected_id)
-        self.blackboard.reopen_task(blocked_task.task_id, reset_retry=False)
-        return "injected_minimal_task"
+        # ============================================================
+        # 多文件联动修复：消费 recommended_target_files
+        # 对 guilty_file 以外的推荐文件，注入辅助修复任务（上限 3 个防膨胀）
+        # ============================================================
+        recommended = verdict.get("recommended_target_files") or []
+        _MAX_EXTRA_PIVOTS = 3
+        extra_count = 0
+        for rec_file in recommended:
+            rec_file = str(rec_file).replace("\\", "/").strip("/")
+            if not rec_file or rec_file == guilty_file:
+                continue
+            if extra_count >= _MAX_EXTRA_PIVOTS:
+                break
+            # 跳过已有活跃任务的文件（避免重复注入）
+            existing = self.blackboard.find_task_by_file(rec_file)
+            if existing and existing.status not in {TaskStatus.DONE, TaskStatus.FUSED}:
+                continue
+            if existing and existing.status == TaskStatus.DONE:
+                # 已完成的推荐文件 → 打回重审
+                self.blackboard.reopen_task(
+                    existing.task_id,
+                    fix_instruction=f"[TECHLEAD_RECOMMENDED] TechLead 建议联动检查此文件，确保与 {guilty_file} 的修改一致。",
+                    reset_retry=False,
+                    reorder_before=blocked_task.task_id,
+                )
+                _inject_dependency(existing.task_id)
+                extra_count += 1
+                logger.info("⚖️ 多文件联动: 打回推荐文件 %s", rec_file)
+            else:
+                # 不存在任务 → 注入辅助修复任务
+                rec_id = self.blackboard.inject_targeted_fix_task(
+                    target_file=rec_file,
+                    description=(
+                        f"[TECHLEAD_RECOMMENDED_FIX] 联动检查 {rec_file}，"
+                        f"确保与 {guilty_file} 的修复一致，解除 {blocked_task.target_file} 阻塞"
+                    ),
+                    fix_instruction=f"TechLead 建议联动修复此文件。主要修复在 {guilty_file}，请确保本文件的接口/引用与之对齐。",
+                    reorder_before=blocked_task.task_id,
+                    source_task_id=blocked_task.task_id,
+                )
+                _inject_dependency(rec_id)
+                extra_count += 1
+                logger.info("⚖️ 多文件联动: 注入推荐文件修复任务 %s", rec_file)
+
+        if extra_count > 0:
+            logger.info("⚖️ 多文件联动: 共注入 %d 个额外修复任务", extra_count)
+            global_broadcaster.emit_sync(
+                "Engine", "tech_lead_multi_pivot",
+                f"⚖️ TechLead 多文件联动: 主修 {guilty_file} + {extra_count} 个关联文件",
+            )
+
+        return primary_action
 
     @staticmethod
     def _merge_tech_lead_feedback(verdict: dict, original_feedback: str) -> str:

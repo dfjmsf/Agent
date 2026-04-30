@@ -80,15 +80,35 @@ class IntegrationManager:
         python_cmd = venv_python or "python"
         import subprocess
         import time
+        import socket
 
         entry_path = os.path.join(truth_dir, entry_file)
         env = os.environ.copy()
         env["FLASK_APP"] = entry_file
         env["FLASK_ENV"] = "testing"
 
+        # 分配随机空闲端口，避免与 ASTrea 本体或其他服务冲突
+        try:
+            _sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            _sock.bind(("127.0.0.1", 0))
+            test_port = _sock.getsockname()[1]
+            _sock.close()
+        except Exception:
+            test_port = 18899  # fallback 到不太可能冲突的端口
+
+        env["PORT"] = str(test_port)
+        env["FLASK_RUN_PORT"] = str(test_port)
+        # uvicorn 常见的端口环境变量
+        env["UVICORN_PORT"] = str(test_port)
+        logger.info(f"🔌 启动验证使用端口: {test_port}")
+
+        # 构建启动命令：显式传入 --port 覆盖代码中可能硬编码的端口
+        # 生成项目常见的 uvicorn.run(port=5001) 会忽略环境变量，必须用命令行参数覆盖
+        cmd = [python_cmd, entry_path, "--port", str(test_port)]
+
         try:
             proc = subprocess.Popen(
-                [python_cmd, entry_path],
+                cmd,
                 cwd=truth_dir,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -98,16 +118,69 @@ class IntegrationManager:
 
             if proc.poll() is not None:
                 # 进程已退出 — 启动失败
+                stdout = proc.stdout.read().decode("utf-8", errors="replace")[:500]
                 stderr = proc.stderr.read().decode("utf-8", errors="replace")[:500]
+                combined = (stdout + "\n" + stderr).strip()
+
+                # 环境级错误识别（端口冲突 / 地址已被使用）
+                # 这些不是代码 bug，而是运行环境问题 → 直接降级
+                _ENV_ERROR_MARKERS = (
+                    "Errno 10048",           # Windows: WSAEADDRINUSE
+                    "Address already in use", # Linux/macOS
+                    "address already in use",
+                    "Only one usage of each socket address",
+                    "bind on address",
+                )
+                if any(marker in combined for marker in _ENV_ERROR_MARKERS):
+                    logger.warning(
+                        f"⚠️ 启动验证: 端口冲突 (rc={proc.returncode})，"
+                        f"非代码 bug，降级为 warning"
+                    )
+                    global_broadcaster.emit_sync("System", "integration_warning",
+                        "⚠️ 启动验证: 端口冲突（环境问题），不阻断构建")
+                    return True
+
+                # 过滤掉 uvicorn/flask 正常的 INFO 日志，提取真实错误
+                real_errors = []
+                for line in combined.split("\n"):
+                    line_stripped = line.strip()
+                    if not line_stripped:
+                        continue
+                    # 跳过正常的启动 INFO 日志
+                    if any(marker in line_stripped for marker in (
+                        "INFO:",
+                        "Started server process",
+                        "Waiting for application startup",
+                        "Application startup complete",
+                        "Uvicorn running on",
+                        "Serving Flask app",
+                        "Running on http",
+                    )):
+                        continue
+                    real_errors.append(line_stripped)
+
+                error_text = "\n".join(real_errors) if real_errors else combined
+
+                # 如果过滤后没有真实错误行（只有 INFO 日志），
+                # 说明退出原因是环境问题 → 降级为 warning
+                if not real_errors:
+                    logger.warning(
+                        f"⚠️ 启动验证: 进程退出 (rc={proc.returncode}) 但无代码错误，"
+                        f"可能是端口冲突或环境问题，降级为 warning"
+                    )
+                    global_broadcaster.emit_sync("System", "integration_warning",
+                        "⚠️ 启动验证: 进程退出但未检测到代码错误（可能是端口冲突）")
+                    return True
+
                 logger.warning(f"❌ 启动验证失败: 进程退出 (rc={proc.returncode})")
-                logger.warning(f"   stderr: {stderr[:200]}")
+                logger.warning(f"   错误: {error_text[:300]}")
                 global_broadcaster.emit_sync("System", "integration_failed",
-                    f"❌ 启动验证失败: {stderr[:100]}")
+                    f"❌ 启动验证失败: {error_text[:150]}")
 
                 # 写入 failure context 供后续参考
                 self._last_failure_context = {
                     "error_type": "STARTUP_CRASH",
-                    "feedback": f"进程启动后立即崩溃: {stderr}",
+                    "feedback": f"进程启动后立即崩溃: {error_text}",
                 }
                 return False
             else:

@@ -454,6 +454,43 @@ class ProjectObserver:
         return ""
 
     # ============================================================
+    # P0-2: 已完成任务上下文聚合
+    # ============================================================
+
+    def _build_completed_tasks_context(self, current_task: TaskItem) -> str:
+        """
+        从 Blackboard 的 completed_tasks 账本聚合已完成任务的语义摘要。
+
+        设计原则：
+        - 排除当前 task_id（避免自引用）
+        - 截断至最近 15 条（防止 context 膨胀，~300 tokens）
+        - 单行格式 "✅ file.py — description"（token 效率优先）
+        """
+        records = self.blackboard.state.completed_tasks
+        if not records:
+            return ""
+
+        # 过滤当前任务 + 截断
+        filtered = [
+            r for r in records
+            if r.task_id != current_task.task_id
+        ]
+        if not filtered:
+            return ""
+
+        # 最近 15 条（按完成时间倒序取，再正序输出）
+        recent = filtered[-15:]
+
+        lines = []
+        for r in recent:
+            lines.append(f"  ✅ {r.target_file} — {r.description}")
+
+        return (
+            "【📋 已完成任务账本（兄弟任务的架构决策已落地，你必须与它们对齐）】\n"
+            + "\n".join(lines)
+        )
+
+    # ============================================================
     # 一站式上下文组装（核心方法）
     # ============================================================
 
@@ -541,6 +578,9 @@ class ProjectObserver:
             {"task_id": t.task_id, "target_file": t.target_file, "description": t.description}
             for t in self.blackboard.state.tasks
         ]
+        # (4.1) 聚合已完成任务上下文 — P0-2 核心锚点
+        completed_context = self._build_completed_tasks_context(task)
+
         task_meta = {
             "project_spec": self.blackboard.state.spec_text,
             "dependencies": task.dependencies,
@@ -556,6 +596,7 @@ class ProjectObserver:
             "global_snapshot": self.blackboard.get_global_snapshot_text(),
             "retry_count": task.retry_count,
             "user_rules_block": user_rules_block,
+            "completed_context": completed_context,
         }
         is_fill_task = bool(task.sub_tasks and task.current_sub_task_index >= 1)
         feedback_text = feedback or ""
@@ -598,25 +639,63 @@ class ProjectObserver:
                 logger.info(
                     f"⏭️ [Patch] {task.target_file} 是前端结构类局部修复，跳过 AST 切片，强制 Editor 行号编辑"
                 )
-            elif True:
+            elif task.tech_lead_invoked:
+                # TechLead 定向修复跳过 AST 切片
+                # 原因：TechLead 修复指令通常涉及多个函数（如 viewSnippet + editSnippet），
+                # AST 切片只能选一个且关键词匹配易选错。
+                # Coder 需要看到全文件 + TechLead 精确指令，用 Editor 差量编辑多个函数。
+                logger.info(
+                    f"⏭️ [TechLead] {task.target_file} 是 TechLead 定向修复任务，跳过 AST 切片，强制 Editor 全文件编辑"
+                )
+            else:
+                # v4.4: Scope Expansion 检测 — 任务需要新增函数时跳过 AST 切片
+                # 根因：AST 切片假设"修改已有函数"，将 Coder 锁入单函数视窗。
+                # 当任务描述要求新增 get_expense_by_id / update_expense 等不存在的函数时，
+                # Coder 被困在 get_all_expenses 切片里无法创建新定义 → Reviewer 驳回 → 熔断。
+                # 解法：在切片前用符号表对比检测，命中则给 Coder 全文件上下文 + Editor 差量编辑。
+                _skip_for_scope_expansion = False
                 try:
                     from tools.ast_microscope import ASTMicroscope, detect_lang
                     lang = detect_lang(task.target_file)
                     if lang != "unknown":
                         scope = ASTMicroscope()
-                        ast_slice = scope.find_relevant_slice(
-                            existing_code, task.description, lang, context_lines=10
-                        )
-                        if ast_slice:
-                            task_meta["ast_slice"] = ast_slice
-                            task_meta["ast_full_code"] = existing_code
+                        slice_query = task.description
+                        if task.tech_lead_feedback:
+                            slice_query += "\n" + task.tech_lead_feedback
+                        if scope.requires_scope_expansion(existing_code, slice_query, lang):
+                            _skip_for_scope_expansion = True
                             logger.info(
-                                f"🔬 AST 显微镜切片: {ast_slice['name']} "
-                                f"L{ast_slice['start_line']}-{ast_slice['end_line']} "
-                                f"({len(ast_slice['code'])} chars)"
+                                f"⏭️ [Scope Expansion] {task.target_file} 任务需要新增符号，"
+                                f"跳过 AST 切片，强制 Editor 全文件编辑"
                             )
                 except Exception as e:
-                    logger.warning(f"⚠️ AST 显微镜切片失败: {e}")
+                    logger.warning(f"⚠️ Scope Expansion 检测异常: {e}")
+
+                if not _skip_for_scope_expansion:
+                    try:
+                        from tools.ast_microscope import ASTMicroscope, detect_lang
+                        lang = detect_lang(task.target_file)
+                        if lang != "unknown":
+                            scope = ASTMicroscope()
+                            # 合并 description + tech_lead_feedback 用于 AST 切片匹配
+                            # Mini QA 修复任务的 description 是短描述，
+                            # TechLead 指定的精确函数名在 tech_lead_feedback 中
+                            slice_query = task.description
+                            if task.tech_lead_feedback:
+                                slice_query += "\n" + task.tech_lead_feedback
+                            ast_slice = scope.find_relevant_slice(
+                                existing_code, slice_query, lang, context_lines=10
+                            )
+                            if ast_slice:
+                                task_meta["ast_slice"] = ast_slice
+                                task_meta["ast_full_code"] = existing_code
+                                logger.info(
+                                    f"🔬 AST 显微镜切片: {ast_slice['name']} "
+                                    f"L{ast_slice['start_line']}-{ast_slice['end_line']} "
+                                    f"({len(ast_slice['code'])} chars)"
+                                )
+                    except Exception as e:
+                        logger.warning(f"⚠️ AST 显微镜切片失败: {e}")
 
         # (6) 前端路由清单注入
         FRONTEND_EXTS = {'.html', '.htm', '.vue', '.svelte', '.jsx', '.tsx'}

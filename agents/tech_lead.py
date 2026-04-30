@@ -31,7 +31,7 @@ from core.ws_broadcaster import global_broadcaster
 
 logger = logging.getLogger("TechLead")
 
-MAX_INVESTIGATE_STEPS = 8   # 排障模式最大 ReAct 步数
+MAX_INVESTIGATE_STEPS = 14  # 排障模式硬顶（动态计算时的上界）
 MAX_AUDIT_STEPS = 25        # 审查模式最大 ReAct 步数（加入防雪球后安全上调至25）
 
 
@@ -70,7 +70,10 @@ class TechLeadAgent:
             失败时返回 None
         """
         if max_steps is None:
-            max_steps = MAX_INVESTIGATE_STEPS
+            # 动态步数：候选文件数 + 5 步基础动作 (list_files + grep + read_log + verdict + 余量)
+            # 下限 8（简单单文件 bug 足够），上限 MAX_INVESTIGATE_STEPS=14（防沉迷）
+            scope_size = len(target_scope.candidate_files) if target_scope and target_scope.candidate_files else 0
+            max_steps = min(max(scope_size + 5, 8), MAX_INVESTIGATE_STEPS)
 
         logger.info(f"🔍 TechLead 排障调查启动 (max_steps={max_steps})")
         global_broadcaster.emit_sync("TechLead", "investigate_start",
@@ -364,20 +367,27 @@ class TechLeadAgent:
                 # 记录动作类别
                 action_counts[func_name] = action_counts.get(func_name, 0) + 1
 
-                # === 物理级防死扣拦截器（仅审计模式生效，排障模式需要自由精读） ===
-                if mode == "audit":
-                    if func_name == "read_file":
-                        file_path = args.get("file_path", "unknown")
-                        file_read_counts[file_path] = file_read_counts.get(file_path, 0) + 1
-                        if file_read_counts[file_path] > 1:
-                            logger.warning(f"🛡️ [TechLead] 拦截重复读取 {file_path} (第 {file_read_counts[file_path]} 次)")
-                            intercept_msg = f"该文件已读取过，无需重复查阅。请审查其他文件或调用 emit_verdict 结案。"
-                            messages.append({"role": "tool", "tool_call_id": tc.id,
-                                             "name": func_name, "content": intercept_msg})
-                            global_broadcaster.emit_sync("TechLead", "intercepted",
-                                f"🛡️ 拦截: {file_path} 已达查阅上限")
-                            continue
+                # === 物理级防死扣拦截器 ===
+                if func_name == "read_file":
+                    file_path = args.get("file_path", "unknown")
+                    file_read_counts[file_path] = file_read_counts.get(file_path, 0) + 1
+                    # 审计模式：同文件只允许读 1 次
+                    # 排障模式：允许 2 次（全量 + 一次精读），第 3 次起拦截
+                    max_reads = 1 if mode == "audit" else 2
+                    if file_read_counts[file_path] > max_reads:
+                        logger.warning(f"🛡️ [TechLead] 拦截重复读取 {file_path} (第 {file_read_counts[file_path]} 次)")
+                        intercept_msg = (
+                            f"该文件已完整读取过 {max_reads} 次，内容在上下文中。"
+                            "请直接从记忆中分析，不要反复重读同一文件！"
+                            "如果已有足够信息请立即调用 emit_verdict 结案。"
+                        )
+                        messages.append({"role": "tool", "tool_call_id": tc.id,
+                                         "name": func_name, "content": intercept_msg})
+                        global_broadcaster.emit_sync("TechLead", "intercepted",
+                            f"🛡️ 拦截: {file_path} 已达查阅上限")
+                        continue
 
+                if mode == "audit":
                     if func_name == "grep_project" and action_counts.get("grep_project", 0) > 3:
                         logger.warning(f"🛡️ [TechLead] 拦截 grep_project (第 {action_counts['grep_project']} 次)")
                         intercept_msg = "搜索次数已达上限。请根据已有信息推理，并调用 emit_verdict 结案。"
@@ -412,10 +422,10 @@ class TechLeadAgent:
                 else:
                     result_text = f"未知工具: {func_name}"
 
-                # 截断过长的结果（审计模式允许更大的结果，配合 AuditFileReaderSkill）
-                max_result_len = 12000 if mode == "audit" else 4000
+                # 截断过长的结果（1M 上下文窗口足够承载，仅做极端防护）
+                max_result_len = 20000
                 if len(result_text) > max_result_len:
-                    result_text = result_text[:max_result_len] + "\n... (为保护推理速度已截断)"
+                    result_text = result_text[:max_result_len] + "\n... (超过 20000 字符已截断)"
 
                 # 动态进度贴片 + 已读文件列表（防骑驴找驴）
                 header = f"[进度: 第 {step+1}步/总{max_steps}步]\n"
@@ -448,7 +458,32 @@ class TechLeadAgent:
         else:
             logger.warning(f"⚠️ [TechLead] ReAct 循环结束但未产出判定 (mode={mode})")
             global_broadcaster.emit_sync("TechLead", "timeout",
-                "⚠️ TechLead 调查超时，未能得出结论")
+                "⚠️ TechLead 调查超时，尝试合成降级判定...")
+
+            # === 降级兜底：从历史上下文中合成低置信度判定 ===
+            if mode == "investigate":
+                # 收集线索：已读文件 + 最后一条 assistant 思考
+                read_files = list(file_read_counts.keys())
+                last_thinking = ""
+                for msg in reversed(messages):
+                    role = msg.get("role") if isinstance(msg, dict) else getattr(msg, "role", "")
+                    content = msg.get("content", "") if isinstance(msg, dict) else getattr(msg, "content", "")
+                    if role == "assistant" and content and len(content) > 20:
+                        last_thinking = content[:500]
+                        break
+
+                if read_files or last_thinking:
+                    verdict_result = {
+                        "root_cause": f"TechLead 调查超时未能明确收敛。已检查文件: {', '.join(read_files[:5])}。最后思考: {last_thinking[:300]}",
+                        "root_cause_type": "wrong_target",
+                        "fix_instruction": f"请 Coder 重点检查以下文件中与用户报告问题相关的逻辑: {', '.join(read_files[:3])}",
+                        "guilty_file": read_files[0] if read_files else "",
+                        "recommended_target_files": read_files[1:4],
+                        "confidence": 0.2,
+                    }
+                    logger.info(f"🔄 [TechLead] 降级判定已合成 (guilty={verdict_result['guilty_file']})")
+                    global_broadcaster.emit_sync("TechLead", "fallback_verdict",
+                        f"🔄 TechLead 降级判定: {verdict_result['guilty_file'] or '无明确嫌疑文件'}")
 
         return verdict_result
 

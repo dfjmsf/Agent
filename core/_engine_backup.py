@@ -463,7 +463,7 @@ class AstreaEngine:
         tech_lead_diagnosis = getattr(self, '_pm_tech_lead_diagnosis', None)
 
         if tech_lead_diagnosis:
-            # PM 阶段已完成 TechLead 调查，直接复用
+            # PM 阶段已完成 TechLead 调查，直接复用（不做置信度淘汰，避免二次浪费）
             confidence = tech_lead_diagnosis.get("confidence", 0.0)
             logger.info(
                 "✅ [Patch Mode] 复用 PM 阶段的 TechLead 缓存 (confidence=%.2f): %s",
@@ -474,14 +474,12 @@ class AstreaEngine:
                 "TechLead", "patch_investigate_cached",
                 f"♻️ 复用 PM 阶段的 TechLead 调查结果 (confidence={confidence:.0%})"
             )
-            if confidence < 0.3:
-                logger.warning("⚠️ [Patch Mode] 缓存置信度过低 (%.2f)，降级为纯 PM 分析", confidence)
-                tech_lead_diagnosis = None
             self._pm_tech_lead_diagnosis = None  # 一次性消费
         else:
-            # 无缓存 — 启动本地 TechLead 调查
+            # 无缓存 — 启动本地 TechLead 调查（仅在 PM 未做调查时发生）
             try:
                 from agents.tech_lead import TechLeadAgent
+                from core.techlead_scope import resolve_target_scope
 
                 task_context = f"【用户修改请求】\n{user_req_clean}\n"
                 if pm_analysis:
@@ -492,6 +490,11 @@ class AstreaEngine:
                     "重点关注：函数签名是否匹配、模板变量是否存在、路由路径是否正确。"
                 )
 
+                # 定向范围
+                engine_scope = resolve_target_scope(final_dir, user_req_clean)
+                if not engine_scope.is_resolved():
+                    engine_scope = None
+
                 logger.info("🔍 [Patch Mode] TechLead 前置调查启动...")
                 global_broadcaster.emit_sync(
                     "TechLead", "patch_investigate_start",
@@ -501,7 +504,7 @@ class AstreaEngine:
                 tech_lead_diagnosis = tech_lead.investigate(
                     project_dir=final_dir,
                     task_context=task_context,
-                    max_steps=10,
+                    target_scope=engine_scope,
                 )
                 if tech_lead_diagnosis:
                     confidence = tech_lead_diagnosis.get("confidence", 0.0)
@@ -510,9 +513,6 @@ class AstreaEngine:
                         confidence,
                         tech_lead_diagnosis.get("root_cause", "")[:120],
                     )
-                    if confidence < 0.3:
-                        logger.warning("⚠️ [Patch Mode] TechLead 置信度过低 (%.2f)，降级为纯 PM 分析", confidence)
-                        tech_lead_diagnosis = None
                 else:
                     logger.warning("⚠️ [Patch Mode] TechLead 调查未产出判定，降级为纯 PM 分析")
             except Exception as e:
@@ -771,6 +771,10 @@ class AstreaEngine:
                 qa_plan=qa_plan,
                 changed_files=changed_files,
             )
+            # 优先使用 TechLead 的 guilty_file 作为修复目标
+            tl_guilty = (tech_lead_diagnosis or {}).get("guilty_file", "")
+            if tl_guilty and os.path.isfile(os.path.join(final_dir, tl_guilty)):
+                target = tl_guilty
             if not target:
                 self.blackboard.record_failure_context(
                     "patch_mini_qa_no_target",
@@ -779,13 +783,27 @@ class AstreaEngine:
                 )
                 return False, False
 
+            # 将 TechLead 的精确修复指令注入 Coder（而非只告诉它"QA 失败了"）
+            tl_fix = (tech_lead_diagnosis or {}).get("fix_instruction", "")
+            tl_root_cause = (tech_lead_diagnosis or {}).get("root_cause", "")
             fix_instruction = (
                 "【Patch Mini QA 失败】\n"
                 f"{feedback}\n\n"
                 "【必须修复到通过的局部交互断言】\n"
                 f"{json.dumps(qa_plan, ensure_ascii=False)}\n\n"
-                "请只修改当前目标文件，确保浏览器中执行点击后目标元素真实可见。"
             )
+            if tl_fix:
+                fix_instruction += (
+                    "【TechLead 精确修复指令（已验证，必须严格执行）】\n"
+                    f"{tl_fix}\n\n"
+                )
+            if tl_root_cause:
+                fix_instruction += (
+                    "【TechLead 根因分析】\n"
+                    f"{tl_root_cause}\n\n"
+                )
+            fix_instruction += "请只修改当前目标文件，确保浏览器中执行点击后目标元素真实可见。"
+
             self.blackboard.inject_targeted_fix_task(
                 target_file=target,
                 description=f"[PATCH_MINI_QA_FIX] 修复 Patch Mini QA 失败: {feedback[:180]}",
@@ -1730,7 +1748,15 @@ class AstreaEngine:
         manager = self._get_manager()
 
         # Step 0.5: 读取 plan.md（如果存在，由 PlannerLite 在 PM 确认阶段生成）
-        plan_md_content = self._read_plan_md()
+        # ⚠️ Phase 模式下跳过：磁盘 plan.md 是完整版（含所有阶段），
+        #    而 user_requirement 已经是 PM 裁剪后的 Phase 工单，
+        #    注入完整 plan 会导致 Spec/Manager 看到非本阶段的技术栈和模块。
+        has_phases = getattr(self, '_phase_mode', False)
+        if has_phases:
+            plan_md_content = None
+            logger.info("📋 [Phase 模式] 跳过磁盘 plan.md，使用 PM 编译的 Phase 工单作为唯一输入")
+        else:
+            plan_md_content = self._read_plan_md()
         if plan_md_content:
             logger.info(f"plan.md 已读取 ({len(plan_md_content)} 字符)，将作为合同约束注入 Manager")
 
@@ -1837,6 +1863,12 @@ class AstreaEngine:
         _tech_stack = (project_spec or {}).get("tech_stack", [])
         manager_playbook = _pb_loader.load_for_manager(_tech_stack)
 
+        # Step 2.0: 构建 Phase 约束（如果处于 Phase 模式）
+        phase_constraint = getattr(self, '_current_phase_info', None)
+        if phase_constraint:
+            logger.info(f"📋 Phase 约束已注入: P{phase_constraint.get('index')}:{phase_constraint.get('name')} "
+                        f"[{phase_constraint.get('scope_type', '?')}]")
+
         # Step 2.1: 预估文件数，判断是否启用两阶段规划
         estimated_files = ProjectObserver.estimate_file_count(project_spec)
         TWO_STAGE_THRESHOLD = 12
@@ -1856,8 +1888,32 @@ class AstreaEngine:
                 user_requirement, project_spec=project_spec,
                 manager_playbook=manager_playbook,
                 complex_files_hint=complex_hint,
-                plan_md=plan_md_content
+                plan_md=plan_md_content,
+                phase_constraint=phase_constraint,
             )
+
+        # 防御：plan_tasks 返回 0 tasks → 自动重试一次（应对 LLM 间歇性 JSON 解析失败）
+        if not plan.get("tasks"):
+            logger.warning(
+                "⚠️ plan_tasks 首次返回 0 tasks (plan=%s)，自动重试一次...",
+                {k: v for k, v in plan.items() if k != "project_spec"},
+            )
+            global_broadcaster.emit_sync(
+                "Engine", "plan_retry",
+                "⚠️ 任务拆解首次为空，正在重试...",
+            )
+            complex_hint = ProjectObserver.build_complex_files_hint(project_spec)
+            plan = manager.plan_tasks(
+                user_requirement, project_spec=project_spec,
+                manager_playbook=manager_playbook,
+                complex_files_hint=complex_hint,
+                plan_md=plan_md_content,
+                phase_constraint=phase_constraint,
+            )
+            if plan.get("tasks"):
+                logger.info(f"✅ 重试成功: {len(plan['tasks'])} 个 tasks")
+            else:
+                logger.error("❌ 重试仍为 0 tasks，将触发规划失败")
 
         plan["project_spec"] = project_spec
 

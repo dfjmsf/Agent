@@ -142,6 +142,17 @@ def get_expenses():
     rows = conn.execute("SELECT * FROM expenses").fetchall()
     return rows  # [(1, '餐饮', 50.0, ...)] → {{ expense.category }} 报错！
 ```
+
+**关键**：既然禁止了 WTForms，就不存在 `.strftime()` 调用的问题。`request.form['date']` 拿到的是字符串，直接存进 SQLite TEXT 字段即可。
+
+## 13. 🚨 端口铁律：严禁使用 8000 端口！
+
+- 8000 端口已被 ASTrea 系统后端占用，生成的项目使用 8000 会导致启动失败！
+- **必须使用 `port=5001`**：
+```python
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5001, debug=True)
+```
 <!-- P0:END -->
 
 ---

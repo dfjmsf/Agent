@@ -13,6 +13,9 @@ logger = logging.getLogger("PatchMiniQA")
 
 FRONTEND_SOURCE_EXTS = (".html", ".htm", ".js", ".jsx", ".ts", ".tsx", ".vue", ".css")
 
+# Vite 配置文件名（用于检测 Vite 项目）
+_VITE_CONFIG_NAMES = ("vite.config.js", "vite.config.ts", "vite.config.mjs")
+
 
 def build_patch_mini_qa_plan(
     user_requirement: str,
@@ -104,6 +107,18 @@ def run_patch_mini_qa(
     qa_plan = _normalize_qa_plan(qa_plan)
     if not qa_plan:
         return {"passed": True, "skipped": True, "feedback": "无 Patch Mini QA 计划"}
+
+    # Vite 前后端分离项目检测：当前不支持同时启动 Vite dev server + Python 后端，
+    # 静态服务器无法处理 Vite 的 ESM 模块化 import → Vue 不会挂载 → 所有选择器必定 not_found。
+    # 跳过 Mini QA 避免误杀正确代码，后端 API 验证由 IntegrationTester 负责。
+    vite_info = _detect_vite_project(project_dir)
+    if vite_info:
+        reason = (
+            f"Vite 前后端分离项目（{vite_info}），"
+            "Mini QA 当前不支持同时启动 Vite dev server + Python 后端，跳过浏览器验证"
+        )
+        logger.info("⏭️ [Patch Mini QA] %s", reason)
+        return {"passed": True, "skipped": True, "feedback": reason}
 
     server = _start_local_server(project_dir, project_id, timeout_seconds=timeout_seconds)
     if not server.get("ok"):
@@ -427,3 +442,54 @@ def _read_text(path: str) -> str:
     except UnicodeDecodeError:
         with open(path, "r", encoding="utf-8", errors="replace") as handle:
             return handle.read()
+
+
+def _detect_vite_project(project_dir: str) -> str:
+    """
+    检测项目是否为 Vite 前后端分离架构。
+
+    判定规则：项目中（含一级子目录）存在 vite.config.js/ts，
+    且同时存在 Python Web 入口文件（Flask/FastAPI/uvicorn）。
+    这意味着需要同时启动两个独立服务（Vite dev server + Python 后端），
+    当前 Mini QA 无法支持。
+
+    Returns:
+        空字符串表示非 Vite 项目；非空表示检测到的 Vite 配置路径描述。
+    """
+    vite_config_path = ""
+
+    # 检查根目录
+    for name in _VITE_CONFIG_NAMES:
+        if os.path.isfile(os.path.join(project_dir, name)):
+            vite_config_path = name
+            break
+
+    # 检查一级子目录（如 frontend/、client/、web/）
+    if not vite_config_path:
+        try:
+            for entry in os.listdir(project_dir):
+                sub = os.path.join(project_dir, entry)
+                if not os.path.isdir(sub) or entry.startswith(".") or entry in (
+                    "node_modules", "__pycache__", ".venv", "venv", ".git", ".sandbox"
+                ):
+                    continue
+                for name in _VITE_CONFIG_NAMES:
+                    if os.path.isfile(os.path.join(sub, name)):
+                        vite_config_path = f"{entry}/{name}"
+                        break
+                if vite_config_path:
+                    break
+        except OSError:
+            pass
+
+    if not vite_config_path:
+        return ""
+
+    # 确认是否同时有 Python 后端（前后端分离标志）
+    has_python_backend = bool(_detect_python_web_entry(project_dir))
+    if not has_python_backend:
+        # 纯 Vite 前端项目（无 Python 后端），同样无法用 python http.server 启动
+        # 因为 index.html 中的 ESM import 需要 Vite 编译处理
+        return vite_config_path
+
+    return vite_config_path

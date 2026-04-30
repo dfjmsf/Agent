@@ -1477,6 +1477,24 @@ body {
 .ms-model-select option {
   background: #1a1a2e;
   color: var(--text-main);
+  padding: 4px 8px;
+}
+
+.ms-model-select optgroup {
+  background: #12121f;
+  color: #3bc7c7;
+  font-family: 'Inter', sans-serif;
+  font-size: 11px;
+  font-weight: 700;
+  font-style: normal;
+  letter-spacing: 0.5px;
+  padding: 6px 0 2px;
+}
+
+.ms-model-select optgroup option {
+  color: var(--text-main);
+  font-weight: 400;
+  padding-left: 12px;
 }
 
 .ms-footer {

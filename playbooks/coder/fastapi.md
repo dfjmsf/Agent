@@ -83,6 +83,14 @@
      - 同级目录：`from models import ...`
      - 包导入：`from backend.models import ...`（当 main.py 在 backend/ 外时不推荐）
    - **禁止** `sys.path.append()` 操作，FastAPI 项目不需要手动修改搜索路径
+
+9. **🚨 端口铁律：严禁使用 8000 端口！**
+   - 8000 端口已被 ASTrea 系统后端占用，生成的项目使用 8000 会导致启动失败！
+   - **必须使用 `port=5001`**：
+   ```python
+   if __name__ == "__main__":
+       uvicorn.run(app, host="0.0.0.0", port=5001)
+   ```
 <!-- P0:END -->
 
 <!-- P1:START -->
@@ -98,13 +106,12 @@
    )
    ```
 
-4. **启动方式**
+4. **启动方式**（端口铁律见 P0 第 9 条）
    ```python
    import uvicorn
    if __name__ == "__main__":
        uvicorn.run(app, host="0.0.0.0", port=5001)
    ```
-   注意：不要使用 8000 端口（已被系统后端占用），推荐 5001、5002。
 
 9. **SQLite 初始化（FastAPI 生命周期）**
    - 必须在启动时调用 `init_db()`，推荐使用 `lifespan`：

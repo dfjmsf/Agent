@@ -274,6 +274,11 @@ class TaskDagBuilder:
         根因：Reviewer L0.6-C 检查 render_template() 传入的变量名是否与模板变量一致，
         但如果模板先于路由文件生成，sandbox 中没有 routes.py，L0.6-C 直接跳过 →
         模板使用了路由未传入的变量 → QA 阶段 Jinja2 UndefinedError。
+
+        注意：对 weld 类型（已存在于磁盘）的 route 节点跳过注入。
+        Extend 模式下 weld route 文件（如 app.py）应该在 new templates 之后执行
+        （先创建模板，后焊接注册），而 Reviewer L0.6-C 可以直接读磁盘已有版本做检查。
+        强制注入 weld route → new template 边会与 LLM 声明的反向依赖形成环。
         """
         ROUTE_BASENAMES = {'routes.py', 'views.py', 'app.py'}
         route_nodes = [
@@ -284,11 +289,18 @@ class TaskDagBuilder:
             return
 
         injected = 0
+        skipped_weld = 0
         for node_key in self.nodes_by_key:
             if not node_key.endswith('.html'):
                 continue
             for route_key in route_nodes:
                 if route_key == node_key:
+                    continue
+                # weld 类型的 route 节点：已存在文件的修改任务（Extend 模式焊接步骤）。
+                # 不注入 route→template 边，避免与 LLM 声明的反向依赖形成环。
+                route_node = self.nodes_by_key[route_key]
+                if route_node.get("task_type") == "weld":
+                    skipped_weld += 1
                     continue
                 edge_key = (route_key, node_key)
                 if edge_key not in self.edge_records:
@@ -301,6 +313,8 @@ class TaskDagBuilder:
 
         if injected:
             logger.info(f"🔗 [SSR 规则] 注入 {injected} 条模板→路由依赖边")
+        if skipped_weld:
+            logger.info(f"🔗 [SSR 规则] 跳过 {skipped_weld} 条 weld route→template 边（Extend 模式兼容）")
 
     def _topological_sort(self) -> Tuple[List[str], List[List[str]]]:
         indegree = {node_key: len(self.incoming_by_node.get(node_key, set())) for node_key in self.nodes_by_key}
@@ -497,8 +511,49 @@ class TaskDagBuilder:
 
     @staticmethod
     def _node_category_priority(target_file: str) -> int:
+        """节点文件类型优先级（数值越小越先执行）。
+
+        优先级分层：
+          -3  包管理清单（package.json 等）
+          -2  构建/工具链配置（vite.config.js, tailwind.config.js 等）
+          -1  样式文件（*.css / *.scss / *.less）
+           0  数据层（model / schema / migration）
+           1  服务层（service / repository / util）
+           2  路由层（route / api / controller）
+           3  客户端层（client / request / fetch）
+           4  视图层（page / view / template / component）
+           5  测试/文档
+           6  其他
+        """
         path = target_file.lower()
         basename = path.rsplit("/", 1)[-1]
+
+        # ── 前端工程化文件（basename 精确匹配，先于 path token 模糊匹配）──
+
+        # 包管理器清单 / 锁文件
+        if basename in ('package.json', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'):
+            return -3
+
+        # 构建 / 工具链配置文件（去掉最末扩展名后匹配）
+        _bare = basename
+        for _ext in ('.js', '.ts', '.mjs', '.cjs', '.json'):
+            if _bare.endswith(_ext):
+                _bare = _bare[:-len(_ext)]
+                break
+        _CONFIG_STEMS = {
+            'vite.config', 'tailwind.config', 'postcss.config', 'tsconfig',
+            'babel.config', 'webpack.config', 'next.config', 'nuxt.config',
+            'svelte.config', 'astro.config', 'eslint.config',
+        }
+        if _bare in _CONFIG_STEMS:
+            return -2
+
+        # 样式文件
+        _STYLE_EXTS = ('.css', '.scss', '.less', '.sass', '.styl')
+        if any(basename.endswith(ext) for ext in _STYLE_EXTS):
+            return -1
+
+        # ── 现有逻辑（path token 模糊匹配）──
 
         if any(token in path for token in ("model", "schema", "entity", "migration", "db", "types")):
             return 0
